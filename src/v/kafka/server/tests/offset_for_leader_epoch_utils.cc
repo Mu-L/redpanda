@@ -9,13 +9,13 @@
  */
 #include "kafka/server/tests/offset_for_leader_epoch_utils.h"
 
+#include "base/vlog.h"
 #include "kafka/client/transport.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/offset_for_leader_epoch.h"
 #include "kafka/protocol/schemata/offset_for_leader_epoch_request.h"
 #include "kafka/protocol/schemata/offset_for_leader_epoch_response.h"
 #include "kafka/protocol/types.h"
-#include "vlog.h"
 
 #include <seastar/util/log.hh>
 
@@ -30,7 +30,7 @@ kafka_offset_for_epoch_transport::offsets_for_leaders(
         t.partitions.emplace_back(kafka::offset_for_leader_partition{
           .partition = pid,
           .current_leader_epoch = kafka::leader_epoch{-1},
-          .leader_epoch = kafka::leader_epoch{term()},
+          .leader_epoch = kafka::leader_epoch(term()),
         });
     }
     req.data.topics.emplace_back(std::move(t));

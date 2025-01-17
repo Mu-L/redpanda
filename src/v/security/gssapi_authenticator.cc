@@ -9,6 +9,7 @@
  */
 #include "security/gssapi_authenticator.h"
 
+#include "base/vlog.h"
 #include "bytes/bytes.h"
 #include "kafka/protocol/wire.h"
 #include "security/acl.h"
@@ -17,13 +18,14 @@
 #include "security/krb5.h"
 #include "security/logger.h"
 #include "ssx/thread_worker.h"
-#include "vlog.h"
+#include "thirdparty/krb5/gssapi.h"
+#include "thirdparty/krb5/gssapi_ext.h"
+
+#include <seastar/core/lowres_clock.hh>
 
 #include <boost/outcome/basic_outcome.hpp>
 #include <boost/outcome/success_failure.hpp>
 #include <fmt/ranges.h>
-#include <gssapi/gssapi.h>
-#include <gssapi/gssapi_ext.h>
 
 #include <array>
 #include <sstream>
@@ -33,7 +35,7 @@
 namespace security {
 
 std::ostream&
-operator<<(std::ostream& os, gssapi_authenticator::state const s) {
+operator<<(std::ostream& os, const gssapi_authenticator::state s) {
     using state = gssapi_authenticator::state;
     switch (s) {
     case state::init:
@@ -62,7 +64,11 @@ static void display_status_1(std::string_view m, OM_uint32 code, int type) {
             vlog(seclog.info, "gss status from {}", m);
             break;
         } else {
-            vlog(seclog.info, "GSS_API error {}: {}", m, msg);
+            vlog(
+              seclog.info,
+              "GSS_API error {}: {}",
+              m,
+              msg.operator std::string_view());
         }
 
         if (!msg_ctx) {
@@ -128,12 +134,16 @@ public:
       std::vector<gssapi_rule> rules)
       : _krb_service_primary{std::move(krb_service_primary)}
       , _keytab{std::move(keytab)}
-      , _rules{std::move(rules)} {}
+      , _rules{std::move(rules)}
+      , _rp_audit_user() {}
 
     state_result<bytes> authenticate(bytes auth_bytes);
     const security::acl_principal& principal() const {
         return _rp_user_principal;
     }
+    const audit::user& audit_user() const { return _rp_audit_user; }
+
+    std::optional<std::chrono::seconds> lifetime() const { return _lifetime_s; }
 
     void reset() {
         _context.reset();
@@ -163,17 +173,20 @@ private:
     ss::sstring _keytab;
     const std::vector<gssapi_rule> _rules;
     security::acl_principal _rp_user_principal;
+    std::optional<std::chrono::seconds> _lifetime_s;
+    audit::user _rp_audit_user;
     state _state{state::init};
     gss::cred_id _server_creds;
     gss::ctx_id _context;
 };
 
 gssapi_authenticator::gssapi_authenticator(
-  ssx::thread_worker& thread_worker,
+  ssx::singleton_thread_worker& thread_worker,
   std::vector<gssapi_rule> rules,
   ss::sstring principal,
   ss::sstring keytab)
   : _worker{thread_worker}
+  , _audit_user()
   , _impl{std::make_unique<impl>(
       std::move(principal), std::move(keytab), std::move(rules))} {}
 
@@ -201,18 +214,29 @@ ss::future<result<bytes>> gssapi_authenticator::authenticate(bytes auth_bytes) {
       });
 
     _state = res.state;
+    _audit_user = co_await _worker.submit(
+      [this]() { return _impl->audit_user(); });
     if (_state == state::complete) {
-        _principal = co_await _worker.submit([this]() {
+        std::optional<std::chrono::seconds> lifetime;
+        std::tie(_principal, lifetime) = co_await _worker.submit([this]() {
             auto principal = _impl->principal();
+            auto lifetime = _impl->lifetime();
             // Clear the gssapi members, as they're no longer required.
             _impl->reset();
-            return principal;
+            return std::make_pair(principal, lifetime);
         });
+        if (lifetime.has_value()) {
+            _session_expiry.emplace(clock_type::now() + lifetime.value());
+        } else {
+            _session_expiry.reset();
+        }
+
         // Clear the impl struct, as it's no longer required.
         _impl.reset();
     } else if (_state == state::failed) {
         co_await _worker.submit([this]() { _impl->reset(); });
     }
+
     co_return std::move(res.result);
 }
 
@@ -458,6 +482,9 @@ gssapi_authenticator::impl::check() {
           _state);
         return {_state, errc::invalid_scram_state};
     }
+    if (lifetime_rec != GSS_C_INDEFINITE) {
+        _lifetime_s.emplace(std::chrono::seconds(lifetime_rec));
+    }
 
     auto target_buf = target.display_name_buffer();
     std::string_view target_name{target_buf};
@@ -511,6 +538,8 @@ void gssapi_authenticator::impl::fail_impl(
 
 acl_principal gssapi_authenticator::impl::get_principal_from_name(
   std::string_view source_name) {
+    _rp_audit_user.uid = ss::sstring{source_name};
+
     auto krb5_ctx = krb5::context::create();
     if (!krb5_ctx) {
         vlog(
@@ -544,6 +573,9 @@ acl_principal gssapi_authenticator::impl::get_principal_from_name(
         return {};
     }
 
+    _rp_audit_user.uid = fmt::format("{}", parsed_name.value());
+    _rp_audit_user.domain = parsed_name.value().realm();
+
     auto mapped_name = gssapi_principal_mapper::apply(
       std::string_view{default_realm.assume_value()}, *parsed_name, _rules);
 
@@ -553,6 +585,8 @@ acl_principal gssapi_authenticator::impl::get_principal_from_name(
     }
 
     vlog(seclog.debug, "Mapped '{}' to '{}'", source_name, *mapped_name);
+    _rp_audit_user.name = _rp_user_principal.name();
+    _rp_audit_user.type_id = audit::user::type::user;
     return {principal_type::user, *mapped_name};
 }
 

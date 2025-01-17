@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include "cluster/tx_protocol_types.h"
 #include "cluster/types.h"
 #include "compat/begin_tx_generator.h"
 #include "compat/check.h"
@@ -46,10 +47,10 @@ struct compat_check<cluster::begin_tx_request> {
         return obj;
     }
     static std::vector<compat_binary> to_binary(cluster::begin_tx_request obj) {
-        return compat_binary::serde_and_adl(obj);
+        return {compat_binary::serde(obj)};
     }
     static void check(cluster::begin_tx_request obj, compat_binary test) {
-        verify_adl_or_serde(obj, std::move(test));
+        verify_serde_only(obj, std::move(test));
     }
 };
 
@@ -76,10 +77,10 @@ struct compat_check<cluster::begin_tx_reply> {
         return obj;
     }
     static std::vector<compat_binary> to_binary(cluster::begin_tx_reply obj) {
-        return compat_binary::serde_and_adl(obj);
+        return {compat_binary::serde(obj)};
     }
     static void check(cluster::begin_tx_reply obj, compat_binary test) {
-        verify_adl_or_serde(obj, std::move(test));
+        verify_serde_only(obj, std::move(test));
     }
 };
 

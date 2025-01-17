@@ -12,17 +12,14 @@
 #include "cluster/controller.h"
 #include "cluster/ephemeral_credential_frontend.h"
 #include "cluster/members_table.h"
-#include "net/unresolved_address.h"
-#include "pandaproxy/api/api-doc/rest.json.h"
-#include "pandaproxy/auth_utils.h"
-#include "pandaproxy/config_utils.h"
+#include "cluster/security_frontend.h"
+#include "config/configuration.h"
+#include "kafka/client/config_utils.h"
+#include "pandaproxy/api/api-doc/rest.json.hh"
 #include "pandaproxy/logger.h"
-#include "pandaproxy/parsing/exceptions.h"
-#include "pandaproxy/parsing/from_chars.h"
 #include "pandaproxy/rest/configuration.h"
 #include "pandaproxy/rest/handlers.h"
 #include "security/ephemeral_credential_store.h"
-#include "utils/gate_guard.h"
 
 #include <seastar/core/future-util.hh>
 #include <seastar/core/memory.hh>
@@ -45,8 +42,8 @@ public:
 
     ss::future<server::reply_t>
     operator()(server::request_t rq, server::reply_t rp) const {
-        auto units = co_await _os();
-        auto guard = gate_guard(_g);
+        co_await _os();
+        auto guard = _g.hold();
         co_return co_await _h(std::move(rq), std::move(rp));
     }
 
@@ -112,9 +109,11 @@ proxy::proxy(
   cluster::controller* controller)
   : _config(config)
   , _mem_sem(max_memory, "pproxy/mem")
+  , _inflight_sem(config::shard_local_cfg().max_in_flight_pandaproxy_requests_per_shard(), "pproxy/inflight")
+  , _inflight_config_binding(config::shard_local_cfg().max_in_flight_pandaproxy_requests_per_shard.bind())
   , _client(client)
   , _client_cache(client_cache)
-  , _ctx{{{{}, _mem_sem, {}, smp_sg}, *this},
+  , _ctx{{{{}, max_memory, _mem_sem, _inflight_config_binding(), _inflight_sem, {}, smp_sg}, *this},
         {config::always_true(), config::shard_local_cfg().superusers.bind(), controller},
         _config.pandaproxy_api.value()}
   , _server(
@@ -126,7 +125,13 @@ proxy::proxy(
       _ctx,
       json::serialization_format::application_json)
   , _ensure_started{[this]() { return do_start(); }}
-  , _controller(controller) {}
+  , _controller(controller) {
+    _inflight_config_binding.watch([this]() {
+        const size_t capacity = _inflight_config_binding();
+        _inflight_sem.set_capacity(capacity);
+        _ctx.max_inflight = capacity;
+    });
+}
 
 ss::future<> proxy::start() {
     _server.routes(get_proxy_routes(_gate, _ensure_started));
@@ -151,7 +156,7 @@ ss::future<> proxy::do_start() {
     if (_is_started) {
         co_return;
     }
-    auto guard = gate_guard(_gate);
+    auto guard = _gate.hold();
     try {
         co_await configure();
         vlog(plog.info, "Pandaproxy successfully initialized");
@@ -167,14 +172,14 @@ ss::future<> proxy::do_start() {
 }
 
 ss::future<> proxy::configure() {
-    auto config = co_await pandaproxy::create_client_credentials(
+    auto config = co_await kafka::client::create_client_credentials(
       *_controller,
       config::shard_local_cfg(),
       _client.local().config(),
       principal);
-    co_await set_client_credentials(*config, _client);
+    co_await kafka::client::set_client_credentials(*config, _client);
 
-    auto const& store = _controller->get_ephemeral_credential_store().local();
+    const auto& store = _controller->get_ephemeral_credential_store().local();
     bool has_ephemeral_credentials = store.has(store.find(principal));
     co_await container().invoke_on_all(
       _ctx.smp_sg, [has_ephemeral_credentials](proxy& p) {
@@ -210,7 +215,7 @@ ss::future<> proxy::mitigate_error(std::exception_ptr eptr) {
     }
     vlog(plog.debug, "mitigate_error: {}", eptr);
     return ss::make_exception_future<>(eptr).handle_exception_type(
-      [this, eptr](kafka::client::broker_error const& ex) {
+      [this, eptr](const kafka::client::broker_error& ex) {
           if (
             ex.error == kafka::error_code::sasl_authentication_failed
             && _has_ephemeral_credentials) {

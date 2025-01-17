@@ -24,8 +24,9 @@ namespace cloud_storage_clients::util {
 /// cloud provider (e.g. connection error).
 /// \param current_exception is the current exception thrown by the client
 /// \param logger is the logger to use
+template<typename Logger>
 error_outcome handle_client_transport_error(
-  std::exception_ptr current_exception, ss::logger& logger);
+  std::exception_ptr current_exception, Logger& logger);
 
 /// \brief: Drain the reponse stream pointed to by the 'resp' handle into an
 /// iobuf
@@ -46,5 +47,10 @@ void log_buffer_with_rate_limiting(
   const char* msg, iobuf& buf, ss::logger& logger);
 
 bool has_abort_or_gate_close_exception(const ss::nested_exception& ex);
+
+/// \brief: Given a file system like path, generate the full list
+/// of valid prefix paths. For instance, if the input is: a/b/log.txt,
+/// return a, a/b, a/b/log.txt
+std::vector<object_key> all_paths_to_file(const object_key& path);
 
 } // namespace cloud_storage_clients::util

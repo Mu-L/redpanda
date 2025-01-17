@@ -11,12 +11,15 @@ package topic
 
 import (
 	"context"
+	"errors"
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/kafka"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
+	"github.com/twmb/franz-go/pkg/kerr"
+	"go.uber.org/zap"
 )
 
 func newDeleteCommand(fs afero.Fs, p *config.Params) *cobra.Command {
@@ -48,9 +51,9 @@ For example,
 `,
 
 		Args: cobra.MinimumNArgs(1),
-		Run: func(cmd *cobra.Command, topics []string) {
+		Run: func(_ *cobra.Command, topics []string) {
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
 
 			adm, err := kafka.NewAdmin(fs, p)
 			out.MaybeDie(err, "unable to initialize kafka client: %v", err)
@@ -69,6 +72,12 @@ For example,
 				msg := "OK"
 				if t.Err != nil {
 					msg = t.Err.Error()
+					if t.ErrMessage != "" {
+						zap.L().Sugar().Debugf("redpanda returned error message: %v", t.ErrMessage)
+						if ke := (*kerr.Error)(nil); errors.As(t.Err, &ke) {
+							msg = ke.Message + ": " + t.ErrMessage
+						}
+					}
 				}
 				tw.Print(t.Topic, msg)
 			}

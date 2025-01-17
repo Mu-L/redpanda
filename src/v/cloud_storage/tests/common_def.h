@@ -18,10 +18,10 @@
 #include "model/record_batch_types.h"
 #include "model/tests/random_batch.h"
 #include "storage/parser.h"
-#include "storage/segment_appender_utils.h"
+#include "storage/record_batch_utils.h"
 #include "storage/tests/utils/disk_log_builder.h"
 
-#include <boost/test/tools/interface.hpp>
+#include <boost/numeric/conversion/cast.hpp>
 
 namespace cloud_storage {
 static const auto manifest_namespace = model::kafka_namespace;  // NOLINT
@@ -32,7 +32,7 @@ static const auto manifest_ntp = model::ntp(                    // NOLINT
   manifest_topic,
   manifest_partition);
 static const auto manifest_revision = model::initial_revision_id(0); // NOLINT
-static const auto archiver_term = model::term_id{123};
+inline const auto archiver_term = model::term_id{123};
 static const ss::sstring manifest_url = ssx::sformat( // NOLINT
   "10000000/meta/{}_{}/manifest.json",
   manifest_ntp.path(),
@@ -56,10 +56,11 @@ inline iobuf iobuf_deep_copy(const iobuf& i) {
 };
 
 inline iobuf generate_segment(model::offset base_offset, int count) {
-    auto buff = model::test::make_random_batches(base_offset, count, false);
+    auto buff
+      = model::test::make_random_batches(base_offset, count, false).get();
     iobuf result;
     for (auto&& batch : buff) {
-        auto hdr = storage::disk_header_to_iobuf(batch.header());
+        auto hdr = storage::batch_header_to_disk_iobuf(batch.header());
         result.append(std::move(hdr));
         result.append(iobuf_deep_copy(batch.data()));
     }
@@ -73,6 +74,7 @@ struct batch_t {
     /// Set to true to completely erase the batch from the segment
     /// to check compacted segments.
     bool hole{false};
+    std::optional<model::timestamp> timestamp{std::nullopt};
 };
 
 /// \returns generated batches and committed offset + 1
@@ -90,9 +92,11 @@ make_random_batches(model::offset o, const std::vector<batch_t>& batches) {
           batch.num_records,
           false,
           batch.type,
-          batch.record_sizes.size() != batch.num_records
+          batch.record_sizes.size()
+              != boost::numeric_cast<size_t>(batch.num_records)
             ? std::nullopt
-            : std::make_optional(batch.record_sizes));
+            : std::make_optional(batch.record_sizes),
+          batch.timestamp);
         o = b.last_offset() + model::offset(1);
         b.set_term(model::term_id(0));
         ret.push_back(std::move(b));
@@ -106,7 +110,7 @@ inline std::pair<iobuf, model::offset> generate_segment(
     auto [buff, next_offset] = make_random_batches(base_offset, batches);
     iobuf result;
     for (auto&& batch : buff) {
-        auto hdr = storage::disk_header_to_iobuf(batch.header());
+        auto hdr = storage::batch_header_to_disk_iobuf(batch.header());
         result.append(std::move(hdr));
         result.append(iobuf_deep_copy(batch.data()));
     }

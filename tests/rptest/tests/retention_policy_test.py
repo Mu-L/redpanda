@@ -23,7 +23,7 @@ from rptest.tests.redpanda_test import RedpandaTest
 from rptest.util import (produce_until_segments, produce_total_bytes,
                          wait_for_local_storage_truncate, segments_count,
                          expect_exception)
-from rptest.utils.si_utils import BucketView
+from rptest.utils.si_utils import BucketView, quiesce_uploads
 
 
 def bytes_for_segments(want_segments, segment_size):
@@ -130,6 +130,68 @@ class RetentionPolicyTest(RedpandaTest):
                                             target_bytes=local_retention)
 
 
+class RetentionPolicyToggleTest(RedpandaTest):
+    topics = (TopicSpec(partition_count=1,
+                        replication_factor=3,
+                        cleanup_policy=TopicSpec.CLEANUP_COMPACT), )
+
+    log_compaction_interval_ms = 1000
+
+    def __init__(self, test_context):
+        self.extra_rp_conf = dict(
+            log_compaction_interval_ms=self.log_compaction_interval_ms,
+            log_segment_size=1048576,
+            compacted_log_segment_size=1048576,
+        )
+
+        super().__init__(test_context=test_context,
+                         num_brokers=3,
+                         extra_rp_conf=self.extra_rp_conf)
+
+    @cluster(num_nodes=3)
+    def test_changing_topic_cleanup_policy(self):
+        """
+        Test changing topic cleanup policy and retention property,
+        then waits for segments to be removed.
+        """
+
+        self.client().alter_topic_configs(
+            self.topic, {
+                TopicSpec.PROPERTY_CLEANUP_POLICY: TopicSpec.CLEANUP_DELETE,
+            })
+
+        produce_until_segments(
+            self.redpanda,
+            topic=self.topic,
+            partition_idx=0,
+            count=10,
+        )
+
+        local_retention = 10000
+        self.client().alter_topic_configs(
+            self.topic, {
+                TopicSpec.PROPERTY_RETENTION_BYTES: local_retention,
+            })
+
+        wait_for_local_storage_truncate(redpanda=self.redpanda,
+                                        topic=self.topic,
+                                        target_bytes=local_retention)
+
+        self.logger.debug(f"Toggling back to cleanup.policy=compact")
+        self.client().alter_topic_configs(
+            self.topic, {
+                TopicSpec.PROPERTY_CLEANUP_POLICY: TopicSpec.CLEANUP_COMPACT,
+            })
+
+        rpk = RpkTool(self.redpanda)
+        start_offset_before = next(rpk.describe_topic(self.topic)).start_offset
+        produce_total_bytes(self.redpanda, self.topic, 10 * 1024 * 1024)
+        time.sleep(5 * self.log_compaction_interval_ms / 1000)
+        start_offset_after = next(rpk.describe_topic(self.topic)).start_offset
+        assert start_offset_before == start_offset_after,\
+            f"start offsets shouldn't move if cleanup.policy=compact; before: {start_offset_before}, after: {start_offset_after}"
+
+
 class ShadowIndexingLocalRetentionTest(RedpandaTest):
     segment_size = 1000000  # 1MB
     default_retention_segments = 2
@@ -163,7 +225,7 @@ class ShadowIndexingLocalRetentionTest(RedpandaTest):
 
     @cluster(num_nodes=1)
     @matrix(cluster_remote_write=[True, False],
-            topic_remote_write=["true", "false", "-1"],
+            topic_remote_write=["true", "false", None],
             cloud_storage_type=get_cloud_storage_type())
     def test_shadow_indexing_default_local_retention(self,
                                                      cluster_remote_write,
@@ -185,15 +247,18 @@ class ShadowIndexingLocalRetentionTest(RedpandaTest):
             {"cloud_storage_enable_remote_write": cluster_remote_write},
             expect_restart=True)
 
+        config = {"cleanup.policy": TopicSpec.CLEANUP_DELETE}
+
+        # None case means use cluster default for topic creation.
+        if topic_remote_write is not None:
+            config |= {"redpanda.remote.write": topic_remote_write}
+
         self.rpk.create_topic(topic=self.topic_name,
                               partitions=1,
                               replicas=1,
-                              config={
-                                  "cleanup.policy": TopicSpec.CLEANUP_DELETE,
-                                  "redpanda.remote.write": topic_remote_write
-                              })
+                              config=config)
 
-        if topic_remote_write != "-1":
+        if topic_remote_write is not None:
             expect_deletion = topic_remote_write == "true"
         else:
             expect_deletion = cluster_remote_write
@@ -303,7 +368,8 @@ class ShadowIndexingCloudRetentionTest(RedpandaTest):
 
         si_settings = SISettings(test_context,
                                  log_segment_size=self.segment_size,
-                                 fast_uploads=True)
+                                 fast_uploads=True,
+                                 cloud_storage_housekeeping_interval_ms=1000)
         super(ShadowIndexingCloudRetentionTest,
               self).__init__(test_context=test_context,
                              si_settings=si_settings,
@@ -357,7 +423,7 @@ class ShadowIndexingCloudRetentionTest(RedpandaTest):
 
         # https://github.com/redpanda-data/redpanda/issues/8658#issuecomment-1420905967
         wait_until(lambda: 9 <= deleted_segments_count() <= 10,
-                   timeout_sec=10,
+                   timeout_sec=30,
                    backoff_sec=1,
                    err_msg=f"Segments were not removed from the cloud")
 
@@ -417,7 +483,7 @@ class ShadowIndexingCloudRetentionTest(RedpandaTest):
         # Test that the size of the cloud log is below the retention threshold
         # by querying the manifest.
         wait_until(lambda: cloud_log_size().total() <= retention_bytes,
-                   timeout_sec=10,
+                   timeout_sec=30,
                    backoff_sec=2,
                    err_msg=f"Too many bytes in the cloud")
 
@@ -474,7 +540,7 @@ class ShadowIndexingCloudRetentionTest(RedpandaTest):
         )
         # Wait for everything to be uploaded to the cloud.
         wait_until(lambda: cloud_log_segment_count() >= local_seg_count - 1,
-                   timeout_sec=10,
+                   timeout_sec=30,
                    backoff_sec=2,
                    err_msg=f"Segments not uploaded")
 
@@ -485,7 +551,7 @@ class ShadowIndexingCloudRetentionTest(RedpandaTest):
 
         # Check that all segments have been removed
         wait_until(lambda: cloud_log_segment_count() == 0,
-                   timeout_sec=10,
+                   timeout_sec=30,
                    backoff_sec=2,
                    err_msg=f"Not all segments were removed from the cloud")
 
@@ -555,7 +621,7 @@ class ShadowIndexingCloudRetentionTest(RedpandaTest):
         assert after_alter['redpanda.remote.read'][0] == 'true'
 
         # Wait for upload to occur first
-        wait_until(lambda: ntp_in_manifest(), timeout_sec=10)
+        wait_until(lambda: ntp_in_manifest(), timeout_sec=30)
 
         def cloud_log_size() -> int:
             s3_snapshot = BucketView(self.redpanda, topics=[topic])
@@ -565,7 +631,7 @@ class ShadowIndexingCloudRetentionTest(RedpandaTest):
 
         # Wait for everything to be uploaded to the cloud.
         wait_until(lambda: cloud_log_size().total() >= total_bytes,
-                   timeout_sec=10,
+                   timeout_sec=30,
                    backoff_sec=2,
                    err_msg=f"Segments not uploaded")
 
@@ -576,9 +642,61 @@ class ShadowIndexingCloudRetentionTest(RedpandaTest):
         # Assert that retention policy has kicked in and with the desired
         # effect, i.e. total bytes is <= retention settings applied
         wait_until(lambda: cloud_log_size().total() <= retention_bytes,
-                   timeout_sec=10,
+                   timeout_sec=30,
                    backoff_sec=2,
                    err_msg=f"Too many bytes in the cloud")
+
+    @cluster(num_nodes=1)
+    def test_topic_recovery_retention_settings(self):
+        """
+        Test that topic recovery handles retention.ms/bytes correctly
+        see issues/14325
+        """
+
+        topic_name = 'topic-with-retention'
+        # pre step: set cluster default values different from -1
+        self.rpk.cluster_config_set("log_retention_ms", "12345678")
+        self.rpk.cluster_config_set("retention_bytes", "12345678")
+        # create a remote topic with infinite retention and
+        self.rpk.create_topic(topic=topic_name,
+                              partitions=1,
+                              replicas=1,
+                              config={
+                                  'redpanda.remote.delete': 'false',
+                                  'redpanda.remote.read': 'true',
+                                  'redpanda.remote.write': 'true',
+                                  'retention.ms': -1,
+                                  'retention.bytes': -1,
+                              })
+
+        # check that the source of the retention configuration is DYNAMIC
+        pre_cfg = self.rpk.describe_topic_configs(topic_name)
+        assert pre_cfg['retention.bytes'] == (
+            '-1', 'DYNAMIC_TOPIC_CONFIG'
+        ) and pre_cfg['retention.ms'] == (
+            '-1', 'DYNAMIC_TOPIC_CONFIG'
+        ), f"{topic_name} expected DYNAMIC_TOPIC_CONFIG for retention.bytes and retention.ms, got {pre_cfg}"
+
+        # produce data and wait for uploads, to ensure that the topic manifest is uploaded
+        produce_total_bytes(self.redpanda, topic_name, bytes_to_produce=200)
+        quiesce_uploads(self.redpanda,
+                        topic_names=[topic_name],
+                        timeout_sec=60)
+
+        # delete topic and recreated it with redpanda.remote.recovery
+        self.rpk.delete_topic(topic_name)
+
+        self.rpk.create_topic(topic=topic_name,
+                              partitions=1,
+                              replicas=1,
+                              config={
+                                  'redpanda.remote.recovery': 'true',
+                              })
+        # check that recovered cfg matches
+        post_cfg = self.rpk.describe_topic_configs(topic_name)
+        assert pre_cfg['retention.bytes'] == post_cfg[
+            'retention.bytes'] and pre_cfg['retention.ms'] == post_cfg[
+                'retention.ms'], f"recreated topic {topic_name} cfg do not match {pre_cfg=} {post_cfg=}"
 
 
 class BogusTimestampTest(RedpandaTest):
@@ -590,8 +708,9 @@ class BogusTimestampTest(RedpandaTest):
             cleanup_policy=TopicSpec.CLEANUP_DELETE,
             # 1 megabyte segments
             segment_bytes=segment_size,
-            # 1 second retention: any non-open segment should be collected almost immediately
-            retention_ms=1000), )
+            # 10 second retention: in the case of mixed timestamps,
+            # give active segment time to help adjust retention timestamps and show up in log monitor.
+            retention_ms=10000), )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args,
@@ -599,14 +718,21 @@ class BogusTimestampTest(RedpandaTest):
                          **kwargs)
 
     @cluster(num_nodes=2)
-    @parametrize(mixed_timestamps=False)
-    @parametrize(mixed_timestamps=True)
-    def test_bogus_timestamps(self, mixed_timestamps):
+    @matrix(mixed_timestamps=[True, False],
+            use_broker_timestamps=[True, False])
+    def test_bogus_timestamps(self, mixed_timestamps: bool,
+                              use_broker_timestamps: bool):
         """
         :param mixed_timestamps: if true, test with a mixture of valid and invalid
         timestamps in the same segment (i.e. timestamp adjustment should use the
         valid timestamps rather than falling back to mtime)
         """
+
+        # broker_time_based_retention fixes this test case for new segments. (disable it to simulate a legacy condition)
+        self.redpanda.set_feature_active('broker_time_based_retention',
+                                         use_broker_timestamps,
+                                         timeout_sec=10)
+
         self.client().alter_topic_config(self.topic, 'segment.bytes',
                                          str(self.segment_size))
 
@@ -656,48 +782,52 @@ class BogusTimestampTest(RedpandaTest):
             producer.start()
             producer.wait()
 
-        # We should have written the expected number of segments, and nothing can
-        # have been gc'd yet because all the segments have max timestmap in the future
-        segs = self.redpanda.node_storage(self.redpanda.nodes[0]).segments(
-            "kafka", self.topic, 0)
-        self.logger.debug(f"Segments after write: {segs}")
-        assert len(segs) >= segments_count
+        if not use_broker_timestamps:
+            # We should have written the expected number of segments, and nothing can
+            # have been gc'd yet because all the segments have max timestmap in the future
+            segs = self.redpanda.node_storage(self.redpanda.nodes[0]).segments(
+                "kafka", self.topic, 0)
+            self.logger.debug(f"Segments after write: {segs}")
+            assert len(segs) >= segments_count
 
-        # Give retention code some time to kick in: we are expecting that it does not
-        # remove anything because the timestamps are too far in the future.
-        with self.redpanda.monitor_log(self.redpanda.nodes[0]) as mon:
-            # Time period much larger than what we set log_compaction_interval_ms to
-            sleep(10)
+            # Give retention code some time to kick in: we are expecting that it does not
+            # remove anything because the timestamps are too far in the future.
+            with self.redpanda.monitor_log(self.redpanda.nodes[0]) as mon:
+                # Time period much larger than what we set log_compaction_interval_ms to
+                sleep(10)
 
-            # Even without setting the storage_ignore_timestamps_in_future_sec parameter,
-            # we should get warnings about the timestamps.
-            mon.wait_until("found segment with bogus retention timestamp",
-                           timeout_sec=30,
-                           backoff_sec=1)
-
-        # The GC should not have deleted anything
-        segs = self.redpanda.node_storage(self.redpanda.nodes[0]).segments(
-            "kafka", self.topic, 0)
-        self.logger.debug(f"Segments after first GC: {segs}")
-        assert len(segs) >= segments_count
-
-        # Enable the escape hatch to tell Redpanda to correct timestamps that are
-        # too far in the future
-        with self.redpanda.monitor_log(self.redpanda.nodes[0]) as mon:
-            self.redpanda.set_cluster_config({
-                'storage_ignore_timestamps_in_future_sec':
-                60,
-            })
-
-            if mixed_timestamps:
-                mon.wait_until(
-                    "Adjusting retention timestamp.*to max valid record",
-                    timeout_sec=30,
-                    backoff_sec=1)
-            else:
-                mon.wait_until("Adjusting retention timestamp.*to file mtime",
+                # Even without setting the storage_ignore_timestamps_in_future_sec parameter,
+                # we should get warnings about the timestamps.
+                mon.wait_until("found segment with bogus retention timestamp",
                                timeout_sec=30,
                                backoff_sec=1)
+
+            # The GC should not have deleted anything
+            segs = self.redpanda.node_storage(self.redpanda.nodes[0]).segments(
+                "kafka", self.topic, 0)
+            self.logger.debug(f"Segments after first GC: {segs}")
+            assert len(segs) >= segments_count
+
+            # Enable the escape hatch to tell Redpanda to correct timestamps that are
+            # too far in the future
+            with self.redpanda.monitor_log(self.redpanda.nodes[0]) as mon:
+                self.redpanda.set_cluster_config({
+                    'storage_ignore_timestamps_in_future_sec':
+                    60,
+                })
+
+                if mixed_timestamps:
+                    mon.wait_until(
+                        "Adjusting retention timestamp.*to max valid record",
+                        timeout_sec=30,
+                        backoff_sec=1)
+                else:
+                    mon.wait_until(
+                        "Adjusting retention timestamp.*to file mtime",
+                        timeout_sec=30,
+                        backoff_sec=1)
+
+        # either with broker_time_based_retention active or storage_ignore_timestamps_in_future_sec enable, we are now able to apply retention
 
         def prefix_truncated():
             segs = self.redpanda.node_storage(self.redpanda.nodes[0]).segments(

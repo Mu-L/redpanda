@@ -11,11 +11,13 @@
 
 #pragma once
 #include "model/metadata.h"
+#include "raft/fundamental.h"
 #include "reflection/adl.h"
-#include "serde/envelope.h"
-#include "utils/to_string.h"
+#include "serde/rw/vector.h"
 
 #include <boost/range/join.hpp>
+
+#include <optional>
 
 namespace raft {
 
@@ -24,35 +26,8 @@ struct broker_revision {
     model::revision_id rev;
 };
 
-static constexpr model::revision_id no_revision{};
-class vnode
-  : public serde::envelope<vnode, serde::version<0>, serde::compat_version<0>> {
-public:
-    constexpr vnode() = default;
+inline constexpr model::revision_id no_revision{};
 
-    constexpr vnode(model::node_id nid, model::revision_id rev)
-      : _node_id(nid)
-      , _revision(rev) {}
-
-    bool operator==(const vnode& other) const = default;
-    bool operator!=(const vnode& other) const = default;
-
-    friend std::ostream& operator<<(std::ostream& o, const vnode& r);
-
-    template<typename H>
-    friend H AbslHashValue(H h, const vnode& node) {
-        return H::combine(std::move(h), node._node_id, node._revision);
-    }
-
-    constexpr model::node_id id() const { return _node_id; }
-    constexpr model::revision_id revision() const { return _revision; }
-
-    auto serde_fields() { return std::tie(_node_id, _revision); }
-
-private:
-    model::node_id _node_id;
-    model::revision_id _revision;
-};
 /**
  * Enum describing configuration state.
  *
@@ -87,7 +62,8 @@ enum class configuration_state : uint8_t { simple, transitional, joint };
 
 std::ostream& operator<<(std::ostream& o, configuration_state t);
 
-struct group_nodes {
+struct group_nodes
+  : serde::envelope<group_nodes, serde::version<0>, serde::compat_version<0>> {
     std::vector<vnode> voters;
     std::vector<vnode> learners;
 
@@ -97,15 +73,22 @@ struct group_nodes {
 
     friend std::ostream& operator<<(std::ostream&, const group_nodes&);
     friend bool operator==(const group_nodes&, const group_nodes&) = default;
+
+    auto serde_fields() { return std::tie(voters, learners); }
 };
 
 struct configuration_update
   : serde::envelope<
       configuration_update,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     std::vector<vnode> replicas_to_add;
     std::vector<vnode> replicas_to_remove;
+    /**
+     * If set, this field will instruct raft to initialize learner log with an
+     * offset that may be greater than the leader start offset.
+     */
+    std::optional<model::offset> learner_start_offset;
 
     bool is_to_add(const vnode&) const;
     bool is_to_remove(const vnode&) const;
@@ -115,13 +98,18 @@ struct configuration_update
       = default;
 
     auto serde_fields() {
-        return std::tie(replicas_to_add, replicas_to_remove);
+        return std::tie(
+          replicas_to_add, replicas_to_remove, learner_start_offset);
     }
 
     friend std::ostream& operator<<(std::ostream&, const configuration_update&);
 };
 
-class group_configuration final {
+class group_configuration
+  : public serde::envelope<
+      group_configuration,
+      serde::version<7>,
+      serde::compat_version<6>> {
 public:
     using version_t
       = named_type<int8_t, struct raft_group_configuration_version>;
@@ -132,7 +120,14 @@ public:
     static constexpr version_t v_4{4};
     // simplified configuration, not serializing brokers field
     static constexpr version_t v_5{5};
-    static constexpr version_t current_version = v_5;
+
+    // serde serialized configuration
+    static constexpr version_t v_6{6};
+
+    // version with symmetric cancellations (configuration_change_strategy_v6)
+    static constexpr version_t v_7{7};
+
+    static constexpr version_t current_version = v_7;
 
     /**
      * creates a configuration where all provided brokers are current
@@ -150,6 +145,11 @@ public:
      * This is preferred constructor for group configuration
      */
     group_configuration(std::vector<vnode>, model::revision_id);
+
+    group_configuration(
+      std::vector<vnode> voters,
+      std::vector<vnode> learners,
+      model::revision_id);
     /**
      * creates joint configuration, version 4, with brokers
      */
@@ -167,7 +167,8 @@ public:
       group_nodes,
       model::revision_id,
       std::optional<configuration_update>,
-      std::optional<group_nodes> = std::nullopt);
+      std::optional<group_nodes> = std::nullopt,
+      version_t version = current_version);
 
     group_configuration(const group_configuration&) = default;
     group_configuration(group_configuration&&) = default;
@@ -206,9 +207,10 @@ public:
      */
     void update(model::broker);
 
-    void add(vnode, model::revision_id);
+    void add(vnode, model::revision_id, std::optional<model::offset>);
     void remove(vnode, model::revision_id);
-    void replace(std::vector<vnode>, model::revision_id);
+    void replace(
+      std::vector<vnode>, model::revision_id, std::optional<model::offset>);
 
     /**
      * Discards the old configuration, after this operation joint configuration
@@ -344,9 +346,13 @@ public:
           = 0;
         virtual void remove_broker(model::node_id) = 0;
 
-        virtual void add(vnode, model::revision_id) = 0;
+        virtual void
+          add(vnode, model::revision_id, std::optional<model::offset>)
+          = 0;
         virtual void remove(vnode, model::revision_id) = 0;
-        virtual void replace(std::vector<vnode>, model::revision_id) = 0;
+        virtual void replace(
+          std::vector<vnode>, model::revision_id, std::optional<model::offset>)
+          = 0;
 
         /**
          * Discards the old configuration, after this operation joint
@@ -382,6 +388,12 @@ public:
      **/
     bool is_with_brokers() const { return _version < v_5; }
 
+    void serde_write(iobuf& out);
+    void serde_write_v6(iobuf& out);
+
+    static group_configuration
+    serde_direct_read(iobuf_parser&, const serde::header&);
+
 private:
     friend class configuration_change_strategy_v3;
 
@@ -389,11 +401,14 @@ private:
 
     friend class configuration_change_strategy_v5;
 
+    friend class configuration_change_strategy_v6;
+
     std::vector<vnode> unique_voter_ids() const;
     std::vector<vnode> unique_learner_ids() const;
     std::unique_ptr<configuration_change_strategy> make_change_strategy();
-
-    version_t _version = current_version;
+    // initialize version to the v_6 in order to correctly handle
+    // deserialization when version field is missing
+    version_t _version = v_6;
     std::vector<model::broker> _brokers;
     group_nodes _current;
     std::optional<configuration_update> _configuration_update;
@@ -401,8 +416,10 @@ private:
     model::revision_id _revision;
 };
 
-namespace details {
+void tag_invoke(
+  serde::tag_t<serde::write_tag>, iobuf& out, group_configuration t);
 
+namespace details {
 template<typename ValueProvider, typename Range>
 auto quorum_match(ValueProvider&& f, Range&& range) {
     using ret_t = std::invoke_result_t<ValueProvider, vnode>;
@@ -537,5 +554,10 @@ template<>
 struct adl<raft::configuration_update> {
     void to(iobuf&, raft::configuration_update);
     raft::configuration_update from(iobuf_parser&);
+};
+template<>
+struct adl<raft::group_nodes> {
+    void to(iobuf&, raft::group_nodes);
+    raft::group_nodes from(iobuf_parser&);
 };
 } // namespace reflection

@@ -11,11 +11,15 @@
 
 #pragma once
 
-#include "cluster/types.h"
+#include "cluster/version.h"
 #include "feature_state.h"
 #include "model/fundamental.h"
 #include "security/license.h"
-#include "serde/serde.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/named_type.h"
+#include "serde/rw/optional.h"
+#include "serde/rw/sstring.h"
+#include "serde/rw/vector.h"
 
 namespace features {
 
@@ -37,6 +41,10 @@ struct feature_state_snapshot
     feature_state::state state;
 
     auto serde_fields() { return std::tie(name, state); }
+
+    friend bool
+    operator==(const feature_state_snapshot&, const feature_state_snapshot&)
+      = default;
 };
 
 /**
@@ -68,6 +76,10 @@ struct feature_table_snapshot
 
     /// Key for storing the snapshot in the shard 0 kvstore.
     static bytes kvstore_key();
+
+    friend bool
+    operator==(const feature_table_snapshot&, const feature_table_snapshot&)
+      = default;
 };
 
 } // namespace features

@@ -6,29 +6,34 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
-import dataclasses
 import json
 import random
 import re
 import time
 from collections import defaultdict
+from datetime import datetime, timedelta
+from typing import Optional
 
 from ducktape.mark import matrix
 from ducktape.tests.test import TestContext
 from ducktape.utils.util import wait_until
+from requests.exceptions import HTTPError
 
-from rptest.tests.redpanda_test import RedpandaTest
 from rptest.clients.kafka_cli_tools import KafkaCliTools
+from rptest.clients.rpk import RpkException
 from rptest.clients.rpk import RpkTool
 from rptest.clients.types import TopicSpec
 from rptest.services.action_injector import random_process_kills
 from rptest.services.admin import Admin
 from rptest.services.cluster import cluster
-from rptest.services.kgo_verifier_services import KgoVerifierConsumerGroupConsumer, KgoVerifierProducer, KgoVerifierRandomConsumer, KgoVerifierSeqConsumer
+from rptest.services.kgo_verifier_services import KgoVerifierConsumerGroupConsumer, KgoVerifierProducer, \
+    KgoVerifierRandomConsumer, KgoVerifierSeqConsumer
 from rptest.services.metrics_check import MetricCheck
-from rptest.services.redpanda import SISettings, get_cloud_storage_type, make_redpanda_service, CHAOS_LOG_ALLOW_LIST, MetricsEndpoint
+from rptest.services.redpanda import SISettings, get_cloud_storage_type, make_redpanda_service, CHAOS_LOG_ALLOW_LIST, \
+    MetricsEndpoint
 from rptest.tests.end_to_end import EndToEndTest
 from rptest.tests.prealloc_nodes import PreallocNodesTest
+from rptest.tests.redpanda_test import RedpandaTest
 from rptest.util import Scale, wait_until_segments
 from rptest.util import (
     produce_until_segments,
@@ -36,7 +41,13 @@ from rptest.util import (
     wait_for_local_storage_truncate,
 )
 from rptest.utils.mode_checks import skip_debug_mode
-from rptest.utils.si_utils import nodes_report_cloud_segments, BucketView, NTP
+from rptest.utils.si_utils import nodes_report_cloud_segments, BucketView, NTP, quiesce_uploads
+
+# This is allowed because manifest reset test disables remote.write dynamically which may race with
+# ntp_archiver startup/shutdown
+REST_LOG_ALLOW_LIST = [
+    "Adjacent segment merging refusing to run on topic with remote.write disabled"
+]
 
 
 class EndToEndShadowIndexingBase(EndToEndTest):
@@ -60,6 +71,18 @@ class EndToEndShadowIndexingBase(EndToEndTest):
             environment = {'__REDPANDA_TOPIC_REC_DL_CHECK_MILLIS': 5000}
         self.test_context = test_context
         self.topic = self.s3_topic_name
+
+        conf = dict(
+            enable_cluster_metadata_upload_loop=True,
+            cloud_storage_cluster_metadata_upload_interval_ms=1000,
+            # Tests may configure spillover manually.
+            cloud_storage_spillover_manifest_size=None,
+            controller_snapshot_max_age_sec=1)
+        if extra_rp_conf:
+            for k, v in conf.items():
+                extra_rp_conf[k] = v
+        else:
+            extra_rp_conf = conf
 
         self.si_settings = SISettings(
             test_context,
@@ -85,10 +108,6 @@ class EndToEndShadowIndexingBase(EndToEndTest):
         for topic in self.topics:
             self.kafka_tools.create_topic(topic)
 
-    def tearDown(self):
-        assert self.redpanda and self.redpanda.cloud_storage_client
-        self.redpanda.cloud_storage_client.empty_bucket(self.s3_bucket_name)
-
 
 def num_manifests_uploaded(test_self):
     s = test_self.redpanda.metric_sum(
@@ -108,36 +127,40 @@ def num_manifests_downloaded(test_self):
     return s
 
 
+def all_uploads_done(rpk, topic, redpanda, logger):
+    topic_description = rpk.describe_topic(topic)
+    partition = next(topic_description)
+
+    hwm = partition.high_watermark
+
+    manifest = None
+    try:
+        bucket = BucketView(redpanda)
+        manifest = bucket.manifest_for_ntp(topic, partition.id)
+    except Exception as e:
+        logger.info(f"Exception thrown while retrieving the manifest: {e}")
+        return False
+
+    top_segment = max(manifest['segments'].values(),
+                      key=lambda seg: seg['base_offset'])
+    uploaded_raft_offset = top_segment['committed_offset']
+    uploaded_kafka_offset = uploaded_raft_offset - top_segment[
+        'delta_offset_end']
+    logger.info(
+        f"Remote HWM {uploaded_kafka_offset} (raft {uploaded_raft_offset}), local hwm {hwm}"
+    )
+
+    # -1 because uploaded offset is inclusive, hwm is exclusive
+    if uploaded_kafka_offset < (hwm - 1):
+        return False
+
+    return True
+
+
 class EndToEndShadowIndexingTest(EndToEndShadowIndexingBase):
     def _all_uploads_done(self):
-        topic_description = self.rpk.describe_topic(self.topic)
-        partition = next(topic_description)
-
-        hwm = partition.high_watermark
-
-        manifest = None
-        try:
-            bucket = BucketView(self.redpanda)
-            manifest = bucket.manifest_for_ntp(self.topic, partition.id)
-        except Exception as e:
-            self.logger.info(
-                f"Exception thrown while retrieving the manifest: {e}")
-            return False
-
-        top_segment = max(manifest['segments'].values(),
-                          key=lambda seg: seg['base_offset'])
-        uploaded_raft_offset = top_segment['committed_offset']
-        uploaded_kafka_offset = uploaded_raft_offset - top_segment[
-            'delta_offset_end']
-        self.logger.info(
-            f"Remote HWM {uploaded_kafka_offset} (raft {uploaded_raft_offset}), local hwm {hwm}"
-        )
-
-        # -1 because uploaded offset is inclusive, hwm is exclusive
-        if uploaded_kafka_offset < (hwm - 1):
-            return False
-
-        return True
+        return all_uploads_done(self.rpk, self.topic, self.redpanda,
+                                self.logger)
 
     @cluster(num_nodes=4)
     @matrix(cloud_storage_type=get_cloud_storage_type())
@@ -227,15 +250,23 @@ class EndToEndShadowIndexingTest(EndToEndShadowIndexingBase):
         assert consumer.consumer_status.validator.invalid_reads == 0
         assert consumer.consumer_status.validator.valid_reads >= msg_count_before_reset + msg_count_after_reset
 
-    @cluster(num_nodes=4)
+    @cluster(num_nodes=4, log_allow_list=REST_LOG_ALLOW_LIST)
     @matrix(cloud_storage_type=get_cloud_storage_type())
     def test_reset_spillover(self, cloud_storage_type):
+        """
+        Test the unsafe_reset_metadata endpoint for situations when
+        then partition manifest includes spillover entries. The test
+        waits for the cloud log to stabilise and then removes the first
+        entry from the spillover list from the downloaded manifest.
+        That's followed by a reupload and a check that the start offset
+        for the partition has been updated accordingly.
+        """
         msg_size = 2056
         self.redpanda.set_cluster_config({
             "cloud_storage_housekeeping_interval_ms":
             10000,
             "cloud_storage_spillover_manifest_max_segments":
-            10
+            10,
         })
         msg_per_segment = self.segment_size // msg_size
         msg_count_before_reset = 50 * msg_per_segment
@@ -255,14 +286,52 @@ class EndToEndShadowIndexingTest(EndToEndShadowIndexingBase):
         producer.wait(timeout_sec=60)
         producer.free()
 
-        wait_until(lambda: self._all_uploads_done() == True,
+        wait_until(lambda: self._all_uploads_done(),
                    timeout_sec=60,
                    backoff_sec=5)
 
-        s3_snapshot = BucketView(self.redpanda, topics=self.topics)
-        manifest = s3_snapshot.manifest_for_ntp(self.topic, 0)
-        spillover_manifests = s3_snapshot.get_spillover_manifests(
-            NTP("kafka", self.topic, 0))
+        class Manifests:
+            def __init__(self, test_instance):
+                self.test_instance = test_instance
+                self.manifest = None
+                self.spillover_manifests = None
+
+            def cloud_log_stable(self) -> bool:
+                s3_snapshot = BucketView(self.test_instance.redpanda,
+                                         topics=self.test_instance.topics)
+                self.manifest = s3_snapshot.manifest_for_ntp(
+                    self.test_instance.topic, 0)
+                self.spillover_manifests = s3_snapshot.get_spillover_manifests(
+                    NTP("kafka", self.test_instance.topic, 0))
+                if not self.spillover_manifests or len(
+                        self.spillover_manifests) < 2:
+                    return False
+                manifest_keys = set(self.manifest['segments'].keys())
+                spillover_keys = set()
+                for sm in self.spillover_manifests.values():
+                    for key in sm['segments'].keys():
+                        spillover_keys.add(key)
+                overlap = manifest_keys & spillover_keys
+                if overlap:
+                    self.test_instance.logger.debug(
+                        f'overlap in manifest and spillovers: {overlap}')
+                return not overlap
+
+            def has_data(self) -> bool:
+                return self.manifest and self.spillover_manifests
+
+        manifests = Manifests(self)
+        wait_until(
+            lambda: manifests.cloud_log_stable(),
+            backoff_sec=1,
+            timeout_sec=120,
+            err_msg='Could not find suitable manifest and spillover combination'
+        )
+
+        assert manifests.has_data(
+        ), 'Manifests were not loaded from cloud storage'
+        manifest = manifests.manifest
+        spill_metas = manifest["spillover"]
         # Enable aggressive local retention to remove local copy of the data
         self.rpk.alter_topic_config(self.topic, 'retention.local.target.bytes',
                                     self.segment_size * 5)
@@ -277,60 +346,27 @@ class EndToEndShadowIndexingTest(EndToEndShadowIndexingBase):
                                     'false')
         time.sleep(1)
 
-        # collect all spillover manifests
-        all_spillover_manifests = []
-        for manifest_meta, sm in spillover_manifests.items():
-            all_spillover_manifests.append(sm)
+        # sort the list of spillover manifest metadata
+        spill_metas = sorted(spill_metas, key=lambda sm: sm['base_offset'])
 
-        # sorted list containing spillover manifest metadata
-        all_spillover_manifests = sorted(all_spillover_manifests,
-                                         key=lambda sm: sm['start_offset'])
-
-        first_left = None
-        manifest['spillover'] = []
-
-        # drop all the segments from first manifest
         self.logger.info(
-            f"Dropping first {all_spillover_manifests[0]} spillover manifest")
+            f"Removing {spill_metas[0]} from the spillover manifest list")
 
-        for s_manifest in all_spillover_manifests[1:]:
-            # sorted tuples (name, meta)
-            segments = sorted(s_manifest['segments'].items(),
-                              key=lambda e: e[1]['base_offset'])
-            if first_left is None:
-                first_left = segments[0][1]
+        manifest['spillover'] = spill_metas[1:]
 
-            total_size = sum([s['size_bytes'] for _, s in segments])
-            first_segment_meta = segments[0][1]
-            last_segment_meta = segments[-1][1]
-            spillover_manifest_meta = {}
+        # Adjust archive fields: the start archive start offsets move forward to
+        # the new first spillover manifset and the archive size decreases by
+        # the size of the removed spillover manifest.
+        manifest['archive_start_offset'] = manifest['spillover'][0][
+            'base_offset']
+        manifest['archive_clean_offset'] = manifest['spillover'][0][
+            'base_offset']
+        manifest['archive_start_offset_delta'] = manifest['spillover'][0][
+            'delta_offset']
+        manifest['archive_size_bytes'] -= spill_metas[0]['size_bytes']
 
-            # fill spillover manifest meta with data from first segment
-            spillover_manifest_meta['ntp_revision'] = first_segment_meta[
-                'ntp_revision']
-            spillover_manifest_meta['base_offset'] = first_segment_meta[
-                'base_offset']
-            spillover_manifest_meta['base_timestamp'] = first_segment_meta[
-                'base_timestamp']
-            spillover_manifest_meta['delta_offset'] = first_segment_meta[
-                'delta_offset']
-
-            # override offsets with data from the last segment
-            spillover_manifest_meta['committed_offset'] = last_segment_meta[
-                'committed_offset']
-            spillover_manifest_meta['delta_offset_end'] = last_segment_meta[
-                'delta_offset_end']
-            spillover_manifest_meta['max_timestamp'] = last_segment_meta[
-                'max_timestamp']
-            spillover_manifest_meta['size_bytes'] = total_size
-            manifest['spillover'].append(spillover_manifest_meta)
-
-        # adjust archive fields
-        manifest['archive_start_offset'] = first_left['base_offset']
-        manifest['archive_clean_offset'] = first_left['base_offset']
-        manifest['archive_start_offset_delta'] = first_left['delta_offset']
-        for _, segment in all_spillover_manifests[0]['segments'].items():
-            manifest['archive_size_bytes'] -= segment['size_bytes']
+        expected_new_kafka_start_offset = BucketView.kafka_start_offset(
+            manifest)
 
         json_man = json.dumps(manifest)
         self.logger.info(f"Re-setting manifest to:{json_man}")
@@ -355,15 +391,14 @@ class EndToEndShadowIndexingTest(EndToEndShadowIndexingBase):
         producer.free()
 
         # wait for uploads from first
-        wait_until(lambda: self._all_uploads_done() == True,
+        wait_until(lambda: self._all_uploads_done(),
                    timeout_sec=60,
                    backoff_sec=5)
         rpk = RpkTool(self.redpanda)
         partitions = list(rpk.describe_topic(self.topic))
-        assert partitions[0].start_offset == (
-            first_left['base_offset'] - first_left['delta_offset']
-        ), f"Partition start offset must be equal to the reset start offset. \
-            expected: {first_left['base_offset']}, delta: {first_left['delta_offset']} current: {partitions[0].start_offset}"
+        assert partitions[0].start_offset == expected_new_kafka_start_offset \
+        , f"Partition start offset must be equal to the reset start offset. \
+            expected: {expected_new_kafka_start_offset} current: {partitions[0].start_offset}"
 
         # Read the whole partition once, consumer must not be able to consume data from removed spillover manifests
         consumer = KgoVerifierConsumerGroupConsumer(self.test_context,
@@ -394,6 +429,91 @@ class EndToEndShadowIndexingTest(EndToEndShadowIndexingBase):
         assert consumer.consumer_status.validator.invalid_reads == 0
         # validate that messages from the manifests that were removed from the manifest are not readable
         assert consumer.consumer_status.validator.valid_reads == messages_to_read
+
+    @cluster(
+        num_nodes=4,
+        log_allow_list=["Applying the cloud manifest would cause data loss"])
+    @matrix(cloud_storage_type=get_cloud_storage_type())
+    def test_reset_from_cloud(self, cloud_storage_type):
+        """
+        Test the unsafe_reset_metadata_from_cloud endpoint by repeatedly
+        calling it to re-set the manifest from the uploaded one while
+        producing to the partition. Once the produce finishes, wait for
+        all uploads to complete and do a full read of the log to bubble
+        up any inconsistencies.
+        """
+        msg_size = 2056
+        self.redpanda.set_cluster_config({
+            "cloud_storage_housekeeping_interval_ms":
+            10000,
+            "cloud_storage_spillover_manifest_max_segments":
+            10
+        })
+
+        # Set a very low local retetion to race manifest resets wih retention
+        self.rpk.alter_topic_config(self.topic, 'retention.local.target.bytes',
+                                    self.segment_size * 1)
+
+        msg_per_segment = self.segment_size // msg_size
+        total_messages = 250 * msg_per_segment
+        producer = KgoVerifierProducer(self.test_context,
+                                       self.redpanda,
+                                       self.topic,
+                                       msg_size=msg_size,
+                                       msg_count=total_messages,
+                                       rate_limit_bps=1024 * 1024 * 5)
+
+        producer.start()
+
+        resets_done = 0
+        resets_refused = 0
+        resets_failed = 0
+
+        seconds_between_reset = 10
+        next_reset = datetime.now() + timedelta(seconds=seconds_between_reset)
+
+        # Repeatedly reset the manifest while producing to the partition
+        while not producer.is_complete():
+            now = datetime.now()
+            if now >= next_reset:
+                try:
+                    self.redpanda._admin.unsafe_reset_metadata_from_cloud(
+                        namespace="kafka", topic=self.topic, partition=0)
+                    resets_done += 1
+                except HTTPError as ex:
+                    if "would cause data loss" in ex.response.text:
+                        resets_refused += 1
+                    else:
+                        resets_failed += 1
+                    self.logger.info(f"Reset from cloud failed: {ex}")
+                next_reset = now + timedelta(seconds=seconds_between_reset)
+
+            time.sleep(2)
+
+        producer.wait(timeout_sec=120)
+        producer.free()
+
+        self.logger.info(
+            f"Producer workload complete: {resets_done=}, {resets_refused=}, {resets_failed=}"
+        )
+
+        assert resets_done + resets_refused > 0, "No resets done during the test"
+        assert resets_failed == 0, f"{resets_failed} resets failed during the test"
+
+        # Wait for all uploads to complete and read the log in full.
+        # This should highlight any data consistency issues.
+        # Note that we are re-using the node where the producer ran,
+        # which allows for validation of the consumed offests.
+        quiesce_uploads(self.redpanda, [self.topic], timeout_sec=120)
+
+        consumer = KgoVerifierSeqConsumer(self.test_context,
+                                          self.redpanda,
+                                          self.topic,
+                                          debug_logs=True,
+                                          trace_logs=True)
+
+        consumer.start()
+        consumer.wait(timeout_sec=120)
 
     @cluster(num_nodes=5)
     @matrix(cloud_storage_type=get_cloud_storage_type())
@@ -561,6 +681,15 @@ class EndToEndShadowIndexingTest(EndToEndShadowIndexingBase):
         assert response[0].error_msg == '', f"Err msg: {response[0].error_msg}"
         assert new_lwm == response[0].new_start_offset, response[
             0].new_start_offset
+
+        def topic_info_populated():
+            return len(list(rpk.describe_topic(self.topic))) == 1
+
+        wait_until(topic_info_populated,
+                   timeout_sec=60,
+                   backoff_sec=1,
+                   err_msg=f"topic info not available for {self.topic}")
+
         topics_info = list(rpk.describe_topic(self.topic))
         assert len(topics_info) == 1
         assert topics_info[0].start_offset == new_lwm, topics_info
@@ -588,6 +717,11 @@ class EndToEndShadowIndexingTest(EndToEndShadowIndexingBase):
         wait_until(lambda: len(set(rpk.list_topics())) == 1,
                    timeout_sec=30,
                    backoff_sec=1)
+
+        wait_until(topic_info_populated,
+                   timeout_sec=60,
+                   backoff_sec=1,
+                   err_msg=f"topic info not available for {self.topic}")
         topics_info = list(rpk.describe_topic(self.topic))
         assert len(topics_info) == 1
         assert topics_info[0].start_offset == new_lwm, topics_info
@@ -814,7 +948,7 @@ class ShadowIndexingInfiniteRetentionTest(EndToEndShadowIndexingBase):
             s3_snapshot = BucketView(self.redpanda, topics=self.topics)
             manifest = s3_snapshot.manifest_for_ntp(self.infinite_topic_name,
                                                     0)
-            return "segments" in manifest
+            return len(manifest.get("segments", {})) > 0
 
         wait_until(manifest_has_segments, timeout_sec=10, backoff_sec=1)
 
@@ -844,7 +978,8 @@ class ShadowIndexingManyPartitionsTest(PreallocNodesTest):
             test_context,
             log_segment_size=self.small_segment_size,
             cloud_storage_cache_size=20 * 2**30,
-            cloud_storage_segment_max_upload_interval_sec=1)
+            cloud_storage_segment_max_upload_interval_sec=1,
+        )
         super().__init__(
             test_context,
             node_prealloc_count=1,
@@ -854,9 +989,14 @@ class ShadowIndexingManyPartitionsTest(PreallocNodesTest):
                 "cloud_storage_enable_segment_merging": False,
                 'log_segment_size_min': 1024,
                 'cloud_storage_cache_chunk_size': self.chunk_size,
+                'cloud_storage_cluster_metadata_upload_interval_ms': 1000,
+                'enable_cluster_metadata_upload_loop': True,
+                'controller_snapshot_max_age_sec': 1,
             },
             environment={'__REDPANDA_TOPIC_REC_DL_CHECK_MILLIS': 5000},
-            si_settings=si_settings)
+            si_settings=si_settings,
+            # These tests write many objects; set a higher scrub timeout.
+            cloud_storage_scrub_timeout_s=120)
         self.kafka_tools = KafkaCliTools(self.redpanda)
 
     def setUp(self):
@@ -880,13 +1020,15 @@ class ShadowIndexingManyPartitionsTest(PreallocNodesTest):
                                        self.topic,
                                        msg_size=1024,
                                        msg_count=10 * 1000 * 1000,
+                                       rate_limit_bps=256 *
+                                       self.small_segment_size,
                                        custom_node=self.preallocated_nodes)
         producer.start()
         try:
             wait_until(
                 lambda: nodes_report_cloud_segments(self.redpanda, 128 * 200),
-                timeout_sec=120,
-                backoff_sec=3)
+                timeout_sec=300,
+                backoff_sec=5)
         finally:
             producer.stop()
             producer.wait()
@@ -912,6 +1054,8 @@ class ShadowIndexingManyPartitionsTest(PreallocNodesTest):
                                        self.topic,
                                        msg_size=1024,
                                        msg_count=10 * 1000 * 1000,
+                                       rate_limit_bps=256 *
+                                       self.small_segment_size,
                                        custom_node=self.preallocated_nodes)
         producer.start()
         try:
@@ -1072,15 +1216,16 @@ class EndToEndSpilloverTest(RedpandaTest):
                         cleanup_policy=TopicSpec.CLEANUP_DELETE), )
 
     def __init__(self, test_context):
-        self.si_settings = SISettings(
-            test_context,
-            log_segment_size=1024,
-            fast_uploads=True,
-            cloud_storage_housekeeping_interval_ms=10000,
-            cloud_storage_spillover_manifest_max_segments=10)
-        super(EndToEndSpilloverTest,
-              self).__init__(test_context=test_context,
-                             si_settings=self.si_settings)
+        extra_rp_conf = dict(cloud_storage_spillover_manifest_size=None)
+        super(EndToEndSpilloverTest, self).__init__(
+            test_context=test_context,
+            extra_rp_conf=extra_rp_conf,
+            si_settings=SISettings(
+                test_context,
+                log_segment_size=1024,
+                fast_uploads=True,
+                cloud_storage_housekeeping_interval_ms=10000,
+                cloud_storage_spillover_manifest_max_segments=10))
 
         self.msg_size = 1024 * 256
         self.msg_count = 3000
@@ -1119,7 +1264,7 @@ class EndToEndSpilloverTest(RedpandaTest):
 
         consumer.free()
 
-    @cluster(num_nodes=4)
+    @cluster(num_nodes=4, log_allow_list=[r"cluster.*Can't add segment"])
     @matrix(cloud_storage_type=get_cloud_storage_type())
     def test_spillover(self, cloud_storage_type):
 
@@ -1155,3 +1300,254 @@ class EndToEndSpilloverTest(RedpandaTest):
 
         self.logger.info("Restart consumer")
         self.consume()
+
+
+class EndToEndThrottlingTest(RedpandaTest):
+    topics = (TopicSpec(partition_count=3,
+                        cleanup_policy=TopicSpec.CLEANUP_DELETE), )
+
+    def __init__(self, test_context):
+        si_settings = SISettings(
+            test_context,
+            log_segment_size=10 * 1024 * 1024,
+            fast_uploads=True,
+        )
+
+        super(EndToEndThrottlingTest, self).__init__(test_context=test_context,
+                                                     si_settings=si_settings)
+
+        self.rpk = RpkTool(self.redpanda)
+        self.admin = Admin(self.redpanda)
+
+        # 1 GiB of data
+        self.msg_size = 1024 * 128
+        self.msg_count = 8196
+
+    def produce(self):
+        topic_name = self.topics[0].name
+        producer = KgoVerifierProducer(self.test_context,
+                                       self.redpanda,
+                                       topic_name,
+                                       msg_size=self.msg_size,
+                                       msg_count=self.msg_count)
+
+        producer.start()
+        producer.wait()
+        producer.free()
+
+        wait_until(self._all_uploads_done, timeout_sec=180, backoff_sec=10)
+
+    def _all_uploads_done(self):
+        return all_uploads_done(self.rpk, self.topic, self.redpanda,
+                                self.logger)
+
+    def consume(self):
+        topic_name = self.topics[0].name
+        consumer = KgoVerifierSeqConsumer(self.test_context,
+                                          self.redpanda,
+                                          topic_name,
+                                          loop=False,
+                                          debug_logs=True,
+                                          trace_logs=True)
+
+        start = time.time()
+        consumer.start()
+        consumer.wait(timeout_sec=400)
+        consume_duration = time.time() - start
+
+        assert consumer.consumer_status.validator.invalid_reads == 0
+        assert consumer.consumer_status.validator.valid_reads >= self.msg_count
+
+        consumer.free()
+
+        return consume_duration
+
+    def measure_consume_throughput(self):
+        bw_measurements = []
+        for iter_ix in range(2):
+            # Trim cache.
+            self.redpanda.for_nodes(
+                self.redpanda.nodes, lambda n: self.admin.cloud_storage_trim(
+                    byte_limit=0, object_limit=0, node=n))
+
+            # Restart redpanda to make sure it gave up on all the file handles.
+            self.redpanda.restart_nodes(self.redpanda.nodes)
+
+            # Wait all topics to have leadership.
+            wait_until(lambda: all(
+                self.admin.get_partition_leader(
+                    namespace='kafka', topic=self.topic, partition=p) != -1
+                for p in range(self.topics[0].partition_count)),
+                       timeout_sec=60,
+                       backoff_sec=1)
+
+            # Measure throughput.
+            self.logger.info(f"Start consumer iteration {iter_ix}")
+            duration = self.consume()
+            bw = self.msg_count * self.msg_size / duration
+            self.logger.info(
+                f"Consumer took {duration} seconds. Measured throughput: {bw} bytes/sec"
+            )
+            bw_measurements.append(bw)
+
+        return sum(bw_measurements) / len(bw_measurements)
+
+    # We throttle cloud storage download bandwidth and also the I/O of the
+    # cloud storage scheduling group. In debug mode, Seastar I/O throttling
+    # makes the system way slower than the target bandwidth which makes it
+    # hard to assert the bandwidth or test duration so we skip the test.
+    @cluster(num_nodes=4)
+    # @skip_debug_mode
+    @matrix(cloud_storage_type=get_cloud_storage_type(
+        docker_use_arbitrary=True))
+    def test_throttling(self, cloud_storage_type):
+
+        self.logger.info("Start producer")
+        self.produce()
+
+        self.logger.info("Remove local data")
+
+        rpk = RpkTool(self.redpanda)
+        num_partitions = self.topics[0].partition_count
+        topic_name = self.topics[0].name
+        rpk.alter_topic_config(topic_name, 'retention.local.target.bytes',
+                               4096)
+
+        for pix in range(0, num_partitions):
+            wait_for_local_storage_truncate(self.redpanda,
+                                            self.topic,
+                                            target_bytes=8192,
+                                            partition_idx=pix,
+                                            timeout_sec=30)
+
+        # A warm-up consume to make all future measurements fairer.
+        # This potentially warms up object storage. Potentially some local
+        # files which are not trimmed yet.
+        self.consume()
+
+        unrestricted_bw = self.measure_consume_throughput()
+
+        # Limit bandwidth to half of the unrestricted throughput. The expected
+        # throughput depends on the number of CPU cores available and the
+        # number of partitions. In the best case scenario, we expect each
+        # partition to land on a separate core and the throughput limit to
+        # apply to each partition independently.
+        per_shard_bw_limit = int(unrestricted_bw / 2 / num_partitions)
+        expected_bw = per_shard_bw_limit * num_partitions * 1.1
+        self.logger.info(
+            f"Unrestricted bandwidth: {unrestricted_bw} bytes/sec. "
+            f"Configuring per shard limit to {per_shard_bw_limit} bytes/sec. "
+            f"Expecting throughput to be less than {expected_bw} bytes/sec.")
+
+        self.redpanda.set_cluster_config(
+            {'cloud_storage_max_throughput_per_shard': per_shard_bw_limit})
+
+        restricted_bw = self.measure_consume_throughput()
+        self.logger.info(f"Restricted bandwidth: {restricted_bw} bytes/sec")
+
+        assert restricted_bw < expected_bw, f"Expected {restricted_bw=} < {expected_bw=}"
+
+
+class EndToEndHydrationTimeoutTest(EndToEndShadowIndexingBase):
+    segment_size = 1048576 * 32
+
+    def setup(self):
+        assert self.redpanda is not None
+
+    def _start_redpanda(self, override_cfg_params: Optional[dict] = None):
+        if override_cfg_params:
+            self.redpanda.add_extra_rp_conf(override_cfg_params)
+        self.redpanda.start()
+        for topic in self.topics:
+            self.kafka_tools.create_topic(topic)
+
+    def _all_kafka_connections_closed(self):
+        count = 0
+        for n in self.redpanda.nodes:
+            for family in self.redpanda.metrics(
+                    n, metrics_endpoint=MetricsEndpoint.PUBLIC_METRICS):
+                for sample in family.samples:
+                    if sample.name == "redpanda_rpc_active_connections" and sample.labels[
+                            "redpanda_server"] == "kafka":
+                        connections = int(sample.value)
+                        self.logger.debug(
+                            f"open connections: {connections} on node {n.account.hostname}"
+                        )
+                        count += connections
+        return count == 0
+
+    def workload(self):
+        msg_count = 5 * (self.segment_size // 2048)
+        producer = KgoVerifierProducer(self.test_context,
+                                       self.redpanda,
+                                       self.s3_topic_name,
+                                       msg_size=2048,
+                                       msg_count=msg_count)
+        producer.start()
+        producer.wait(timeout_sec=300)
+        producer.free()
+
+        original_snapshot = self.redpanda.storage(
+            all_nodes=True).segments_by_node("kafka", self.topic, 0)
+
+        for node, node_segments in original_snapshot.items():
+            assert len(
+                node_segments
+            ) >= 5, f"Expected at least 10 segments, but got {len(node_segments)} on {node}"
+
+        self.kafka_tools.alter_topic_config(
+            self.topic,
+            {
+                TopicSpec.PROPERTY_RETENTION_LOCAL_TARGET_BYTES:
+                self.segment_size,
+            },
+        )
+
+        wait_for_removal_of_n_segments(redpanda=self.redpanda,
+                                       topic=self.topic,
+                                       partition_idx=0,
+                                       n=2,
+                                       original_snapshot=original_snapshot)
+
+        def segments_downloaded():
+            downloads = self.redpanda.metric_sum(
+                'vectorized_cloud_storage_successful_downloads_total')
+            self.logger.debug(f'downloads: {downloads}')
+            return downloads > 0
+
+        assert not segments_downloaded()
+
+        try:
+            # The rpk process is killed after one second, due to the relatively larger segment
+            # size, this should ensure that the client is disconnected during hydrate.
+            self.rpk.consume(self.topic, timeout=1)
+        except RpkException as e:
+            assert 'timed out' in e.msg
+
+        # All connections should close very quickly once wait for hydration aborts.
+        wait_until(self._all_kafka_connections_closed,
+                   timeout_sec=5,
+                   err_msg="Kafka connections are still open")
+
+        # Even when the consumer disconnects or times out, the download should still complete.
+        # TODO assert that if we have multiple consumers and one disconnects, the others should
+        #  be able to consume.
+        wait_until(segments_downloaded,
+                   timeout_sec=30,
+                   backoff_sec=1,
+                   err_msg="Segment downloads did not complete")
+
+    @cluster(num_nodes=4)
+    def test_hydration_completes_on_timeout(self):
+        # The short hydration timeout should cause hydrate to abort early
+        self._start_redpanda({
+            'cloud_storage_hydration_timeout_ms': 1,
+            'cloud_storage_disable_chunk_reads': True
+        })
+        self.workload()
+
+    @cluster(num_nodes=4)
+    def test_hydration_completes_when_consumer_killed(self):
+        # Disable chunk reads so that hydration downloads full segments and takes longer.
+        self._start_redpanda({'cloud_storage_disable_chunk_reads': True})
+        self.workload()

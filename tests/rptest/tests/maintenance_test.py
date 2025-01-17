@@ -8,6 +8,7 @@
 # by the Apache License, Version 2.0
 
 import random
+from time import sleep
 from rptest.clients.default import DefaultClient
 
 from rptest.services.admin import Admin
@@ -28,9 +29,9 @@ class MaintenanceTest(RedpandaTest):
         # Vary partition count relative to num_cpus. This is to ensure that
         # leadership is moved back to a node that exits maintenance.
         num_cpus = self.redpanda.get_node_cpu_count()
-        self.topics = (TopicSpec(partition_count=num_cpus * 3,
+        self.topics = (TopicSpec(partition_count=num_cpus * 5,
                                  replication_factor=3),
-                       TopicSpec(partition_count=num_cpus * 3,
+                       TopicSpec(partition_count=num_cpus * 10,
                                  replication_factor=3))
         self.admin = Admin(self.redpanda)
         self.rpk = RpkTool(self.redpanda)
@@ -55,8 +56,12 @@ class MaintenanceTest(RedpandaTest):
 
     def _in_maintenance_mode_fully(self, node):
         status = self.admin.maintenance_status(node)
-        return status["finished"] and not status["errors"] and \
-                status["partitions"] > 0
+        if all([key in status
+                for key in ['finished', 'errors', 'partitions']]):
+            return status["finished"] and not status["errors"] and \
+                    status["partitions"] > 0
+        else:
+            return False
 
     def _verify_broker_metadata(self, maintenance_enabled, node):
         """
@@ -79,17 +84,18 @@ class MaintenanceTest(RedpandaTest):
             return False
         # check status wanted
         if maintenance_enabled:
-            return status['draining'] and status['finished']
+            return status['draining'] and status[
+                'finished'] if 'finished' in status else True
         else:
             return not status['draining']
 
-    def _verify_maintenance_status(self, node, draining):
+    def _verify_maintenance_status(self, node, enabled):
         """
         Check that cluster reports maintenance status as expected through
         both rpk status tooling as well as raw admin interface.
         """
         # get status for this node via rpk
-        node_id = self.redpanda.idx(node)
+        node_id = self.redpanda.node_id(node)
         statuses = self.rpk.cluster_maintenance_status()
         self.logger.debug(f"finding node_id {node_id} in rpk "
                           "maintenance status: {statuses}")
@@ -107,7 +113,7 @@ class MaintenanceTest(RedpandaTest):
                           "{node.name}: {admin_status}")
 
         # ensure that both agree on expected outcome
-        return admin_status["draining"] == rpk_status.draining == draining
+        return admin_status["draining"] == rpk_status.enabled == enabled
 
     def _enable_maintenance(self, node):
         """
@@ -125,8 +131,12 @@ class MaintenanceTest(RedpandaTest):
         """
         self.logger.debug(
             f"Checking that node {node.name} has a leadership role")
+        # In case the node is unlucky and doesn't get any leaders "naturally",
+        # we have to wait for the leadership balancer to do its job. We have to wait
+        # at least 1 minute for it to unmute just restarted nodes and perform another
+        # tick. Wait more than leader_balancer_idle_timeout (2 minutes) just to be sure.
         wait_until(lambda: self._has_leadership_role(node),
-                   timeout_sec=60,
+                   timeout_sec=150,
                    backoff_sec=10)
 
         self.logger.debug(
@@ -280,3 +290,59 @@ class MaintenanceTest(RedpandaTest):
                    30,
                    backoff_sec=1,
                    err_msg="Error waiting for all partitions to have leaders")
+
+    @cluster(num_nodes=3)
+    @matrix(use_rpk=[True, False])
+    def test_maintenance_mode_of_stopped_node(self, use_rpk):
+        self._use_rpk = use_rpk
+
+        target = random.choice(self.redpanda.nodes)
+        target_id = self.redpanda.node_id(target)
+
+        self._enable_maintenance(target)
+        self.redpanda.stop_node(target)
+
+        def _node_is_not_alive():
+            all_brokers = []
+            for n in self.redpanda.started_nodes():
+                all_brokers += self.admin.get_brokers(n)
+
+            return all([
+                b['is_alive'] == False for b in all_brokers
+                if b['node_id'] == target_id
+            ])
+
+        wait_until(
+            _node_is_not_alive,
+            timeout_sec=30,
+            backoff_sec=5,
+            err_msg=
+            f"Timeout waiting for node {target_id} status update. Node should be marked as stopped."
+        )
+
+        def _check_maintenance_status_on_each_broker(status):
+            all_brokers = []
+            for n in self.redpanda.started_nodes():
+                all_brokers += self.admin.get_brokers(n)
+
+            return all([
+                b['maintenance_status']['draining'] == status
+                for b in all_brokers if b['node_id'] == target_id
+            ])
+
+        assert _check_maintenance_status_on_each_broker(
+            True
+        ), "All the nodes should keep reporting the state of node in maintenance mode"
+
+        if self._use_rpk:
+            self.rpk.cluster_maintenance_disable(target)
+        else:
+            self.admin.maintenance_stop(target)
+
+        wait_until(
+            lambda: _check_maintenance_status_on_each_broker(False),
+            timeout_sec=30,
+            backoff_sec=5,
+            err_msg=
+            f"Timeout waiting for maintenance mode to be disabled on node {target_id}"
+        )

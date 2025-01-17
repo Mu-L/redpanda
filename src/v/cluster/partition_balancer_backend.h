@@ -10,14 +10,15 @@
 
 #pragma once
 
-#include "cluster/controller_stm.h"
+#include "base/seastarx.h"
 #include "cluster/fwd.h"
+#include "cluster/notification.h"
 #include "cluster/partition_balancer_types.h"
 #include "cluster/types.h"
 #include "config/property.h"
+#include "features/enterprise_features.h"
 #include "model/fundamental.h"
 #include "raft/consensus.h"
-#include "seastarx.h"
 #include "utils/mutex.h"
 
 #include <seastar/core/sharded.hh>
@@ -35,28 +36,30 @@ public:
     partition_balancer_backend(
       consensus_ptr raft0,
       ss::sharded<controller_stm>&,
+      ss::sharded<features::feature_table>&,
       ss::sharded<partition_balancer_state>&,
       ss::sharded<health_monitor_backend>&,
       ss::sharded<partition_allocator>&,
       ss::sharded<topics_frontend>&,
       ss::sharded<members_frontend>&,
-      config::binding<model::partition_autobalancing_mode>&& mode,
       config::binding<std::chrono::seconds>&& availability_timeout,
       config::binding<unsigned>&& max_disk_usage_percent,
       config::binding<unsigned>&& storage_space_alert_free_threshold_percent,
       config::binding<std::chrono::milliseconds>&& tick_interval,
-      config::binding<size_t>&& movement_batch_size_bytes,
       config::binding<size_t>&& max_concurrent_actions,
       config::binding<double>&& moves_drop_threshold,
       config::binding<size_t>&& segment_fallocation_step,
       config::binding<std::optional<size_t>> min_partition_size_threshold,
       config::binding<std::chrono::milliseconds> node_status_interval,
-      config::binding<size_t> raft_learner_recovery_rate);
+      config::binding<size_t> raft_learner_recovery_rate,
+      config::binding<bool> topic_aware);
 
     void start();
     ss::future<> stop();
 
     bool is_leader() const { return _raft0->is_leader(); }
+
+    bool is_enabled() const;
 
     std::optional<model::node_id> leader_id() const {
         auto leader_id = _raft0->get_leader_id();
@@ -80,8 +83,8 @@ private:
     void on_members_update(model::node_id, model::membership_state);
     void on_topic_table_update();
     void on_health_monitor_update(
-      node_health_report const&,
-      std::optional<std::reference_wrapper<const node_health_report>>);
+      const node_health_report&,
+      std::optional<ss::lw_shared_ptr<const node_health_report>>);
     size_t get_min_partition_size_threshold() const;
 
 private:
@@ -89,26 +92,29 @@ private:
     consensus_ptr _raft0;
 
     controller_stm& _controller_stm;
+    features::feature_table& _feature_table;
     partition_balancer_state& _state;
     health_monitor_backend& _health_monitor;
     partition_allocator& _partition_allocator;
     topics_frontend& _topics_frontend;
     members_frontend& _members_frontend;
 
-    config::binding<model::partition_autobalancing_mode> _mode;
+    features::sanctioning_binding<
+      config::enum_property<model::partition_autobalancing_mode>>
+      _mode;
     config::binding<std::chrono::seconds> _availability_timeout;
     config::binding<unsigned> _max_disk_usage_percent;
     config::binding<unsigned> _storage_space_alert_free_threshold_percent;
     config::binding<std::chrono::milliseconds> _tick_interval;
-    config::binding<size_t> _movement_batch_size_bytes;
     config::binding<size_t> _max_concurrent_actions;
     config::binding<double> _concurrent_moves_drop_threshold;
     config::binding<size_t> _segment_fallocation_step;
     config::binding<std::optional<size_t>> _min_partition_size_threshold;
     config::binding<std::chrono::milliseconds> _node_status_interval;
     config::binding<size_t> _raft_learner_recovery_rate;
+    config::binding<bool> _topic_aware;
 
-    mutex _lock{};
+    mutex _lock{"partition_balancer_backend::lock"};
     ss::gate _gate;
     ss::timer<clock_t> _timer;
     notification_id_type _topic_table_updates;

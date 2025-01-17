@@ -14,7 +14,6 @@
 #include "model/metadata.h"
 #include "reflection/adl.h"
 #include "storage/types.h"
-#include "types.h"
 #include "utils/human.h"
 #include "utils/named_type.h"
 
@@ -36,7 +35,7 @@ using application_version = named_type<ss::sstring, struct version_number_tag>;
  * A snapshot of node-local state: i.e. things that don't depend on consensus.
  */
 struct local_state
-  : serde::envelope<local_state, serde::version<2>, serde::compat_version<0>> {
+  : serde::envelope<local_state, serde::version<3>, serde::compat_version<0>> {
     application_version redpanda_version;
     cluster_version logical_version{invalid_version};
     std::chrono::milliseconds uptime;
@@ -107,9 +106,18 @@ struct local_state
         uint64_t data_target_size{0};
         uint64_t data_current_size{0};
         uint64_t data_reclaimable_size{0};
+        auto serde_fields() {
+            return std::tie(
+              data_target_size, data_current_size, data_reclaimable_size);
+        }
+        friend bool operator==(const log_data_state&, const log_data_state&)
+          = default;
         friend std::ostream& operator<<(std::ostream&, const log_data_state&);
     };
     std::optional<log_data_state> log_data_size{std::nullopt};
+
+    // True if the node has been booted up in recovery mode.
+    bool recovery_mode_enabled = false;
 
     void serde_read(iobuf_parser&, const serde::header&);
     void serde_write(iobuf& out) const;
@@ -121,6 +129,7 @@ struct local_state
     void set_disk(storage::disk);
     void set_disks(std::vector<storage::disk>);
 
+    friend bool operator==(const local_state&, const local_state&) = default;
     friend std::ostream& operator<<(std::ostream&, const local_state&);
 };
 

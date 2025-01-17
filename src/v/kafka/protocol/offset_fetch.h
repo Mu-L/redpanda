@@ -11,13 +11,13 @@
 
 #pragma once
 
+#include "base/seastarx.h"
 #include "bytes/iobuf.h"
+#include "container/fragmented_vector.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/offset_fetch_request.h"
 #include "kafka/protocol/schemata/offset_fetch_response.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
-#include "seastarx.h"
 
 #include <seastar/core/future.hh>
 
@@ -62,7 +62,8 @@ struct offset_fetch_response final {
         data.error_code = error_code::none;
         if (topics) {
             for (auto& topic : *topics) {
-                std::vector<offset_fetch_response_partition> partitions;
+                small_fragment_vector<offset_fetch_response_partition>
+                  partitions;
                 for (auto id : topic.partition_indexes) {
                     offset_fetch_response_partition p = {
                       .partition_index = id,

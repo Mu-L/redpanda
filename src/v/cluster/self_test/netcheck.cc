@@ -11,10 +11,9 @@
 
 #include "cluster/self_test/netcheck.h"
 
+#include "base/vassert.h"
+#include "base/vlog.h"
 #include "cluster/logger.h"
-#include "utils/gate_guard.h"
-#include "vassert.h"
-#include "vlog.h"
 
 #include <seastar/core/coroutine.hh>
 
@@ -27,7 +26,7 @@ class netcheck_unreachable_peer_exception final : public netcheck_exception {
 public:
     explicit netcheck_unreachable_peer_exception(model::node_id peer)
       : netcheck_exception(
-        fmt::format("Failed to reach peer with node_id: {}", peer)) {}
+          fmt::format("Failed to reach peer with node_id: {}", peer)) {}
 };
 
 void netcheck::validate_options(const netcheck_opts& opts) {
@@ -85,7 +84,7 @@ ss::future<std::vector<self_test_result>> netcheck::run(netcheck_opts opts) {
     _cancelled = false;
     _opts = opts;
     try {
-        gate_guard g{_gate};
+        auto g = _gate.hold();
         co_await ss::futurize_invoke(validate_options, opts);
         vlog(
           clusterlog.info,
@@ -115,6 +114,7 @@ netcheck::run_individual_benchmark(model::node_id peer) {
     const auto max_deadline = ss::lowres_clock::now() + _opts.max_duration;
     self_test_result result;
     try {
+        auto begin_t = ss::lowres_system_clock::now();
         auto durations = co_await ssx::parallel_transform(
           irange, [this, max_deadline, peer, &m](auto) {
               return run_benchmark_fiber(
@@ -125,6 +125,7 @@ netcheck::run_individual_benchmark(model::node_id peer) {
         const auto total_duration = std::accumulate(
           durations.begin(), durations.end(), ss::lowres_clock::duration{0});
         m.set_total_time(total_duration / _opts.parallelism);
+        m.set_start_end_time(begin_t, ss::lowres_system_clock::now());
         result = m.to_st_result();
         if (total_duration == 0ms) {
             /// Constant timeouts prevented test from any successful work
@@ -178,7 +179,7 @@ ss::future<size_t> netcheck::process_netcheck_reply(
   result<rpc::client_context<netcheck_response>> reply,
   run_fiber_opts& fiber_state,
   model::node_id peer,
-  metrics& m) {
+  metrics&) {
     if (!reply) {
         if (
           reply.error() == rpc::errc::client_request_timeout

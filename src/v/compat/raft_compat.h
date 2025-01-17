@@ -11,6 +11,8 @@
 #pragma once
 
 #include "compat/check.h"
+#include "compat/json.h"
+#include "compat/model_json.h"
 #include "compat/raft_generator.h"
 #include "compat/raft_json.h"
 #include "raft/types.h"
@@ -270,6 +272,7 @@ struct compat_check<raft::install_snapshot_request> {
         json_write(file_offset);
         json_write(chunk);
         json_write(done);
+        json_write(dirty_offset);
     }
 
     static raft::install_snapshot_request from_json(json::Value& rd) {
@@ -282,6 +285,7 @@ struct compat_check<raft::install_snapshot_request> {
         json_read(file_offset);
         json_read(chunk);
         json_read(done);
+        json_read(dirty_offset);
         return obj;
     }
 
@@ -308,6 +312,7 @@ compat_copy(raft::install_snapshot_request obj) {
           .file_offset = obj.file_offset,
           .chunk = obj.chunk.copy(),
           .done = obj.done,
+          .dirty_offset = obj.dirty_offset,
         };
     };
     return std::make_pair(f(), f());
@@ -514,10 +519,10 @@ compat_copy(raft::append_entries_request r) {
     auto target_node = r.target_node();
     auto source_node = r.source_node();
     auto flush = r.is_flush_required();
-
+    auto sz = r.batches_size();
     auto a_batches = model::consume_reader_to_memory(
                        std::move(r).release_batches(), model::no_timeout)
-                       .get0();
+                       .get();
 
     ss::circular_buffer<model::record_batch> b_batches;
     for (const auto& batch : a_batches) {
@@ -529,6 +534,7 @@ compat_copy(raft::append_entries_request r) {
       target_node,
       metadata,
       model::make_memory_record_batch_reader(std::move(a_batches)),
+      sz,
       flush);
 
     raft::append_entries_request b(
@@ -536,6 +542,7 @@ compat_copy(raft::append_entries_request r) {
       target_node,
       metadata,
       model::make_memory_record_batch_reader(std::move(b_batches)),
+      sz,
       flush);
 
     return {std::move(a), std::move(b)};
@@ -560,7 +567,7 @@ struct compat_check<raft::append_entries_request> {
         json::write_member(wr, "flush", obj.is_flush_required());
         auto batches = model::consume_reader_to_memory(
                          std::move(obj).release_batches(), model::no_timeout)
-                         .get0();
+                         .get();
         json::write_member(wr, "batches", batches);
     }
 
@@ -582,6 +589,7 @@ struct compat_check<raft::append_entries_request> {
           target,
           meta,
           model::make_memory_record_batch_reader(std::move(batches)),
+          0,
           flush};
     }
 
@@ -626,12 +634,12 @@ struct compat_check<raft::append_entries_request> {
         auto decoded_batches = model::consume_reader_to_memory(
                                  std::move(decoded).release_batches(),
                                  model::no_timeout)
-                                 .get0();
+                                 .get();
 
         auto expected_batches = model::consume_reader_to_memory(
                                   std::move(expected).release_batches(),
                                   model::no_timeout)
-                                  .get0();
+                                  .get();
 
         if (decoded_batches.size() != expected_batches.size()) {
             throw compat_error(fmt::format(

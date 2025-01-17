@@ -15,13 +15,10 @@ if [[ -n $(echo "$ORIG_LABELS" | jq '.[] | select(.name == "kind/backport")') ]]
 fi
 
 additional_body=""
-orig_assignees=$ORIG_ASSIGNEES
-
 if [[ -n $CREATE_ISSUE_ON_ERROR ]]; then
-  additional_body="Note that this issue was created as a placeholder, since the original PR's commit(s) could not be automatically cherry-picked."
+  additional_body="This issue was created as a placeholder because the original PR's commit(s) could not be automatically cherry-picked."
 
-  local_user=$(gh api user --jq .login)
-  local_branch="$local_user/backport-$PR_NUMBER-$BACKPORT_BRANCH-$((RANDOM % 1000))"
+  local_branch="manual-backport-$PR_NUMBER-$BACKPORT_BRANCH-$((RANDOM % 1000))"
 
   additional_body="$additional_body
   Here are the commands to execute:
@@ -38,11 +35,8 @@ if [[ -n $CREATE_ISSUE_ON_ERROR ]]; then
     --head \"$local_branch\" \\
     --draft \\
     --repo \"$TARGET_ORG/$TARGET_REPO\" \\
-    --reviewer \"$ORIG_REVIEWERS\" \\
     --milestone \"$TARGET_MILESTONE\" \\
     --body \"Backport of PR $ORIG_ISSUE_URL \""
-
-  orig_assignees=$(gh issue view $PR_NUMBER --json author --jq .author.login)
 fi
 
 backport_issue_url=$(gh_issue_url)
@@ -50,7 +44,7 @@ if [[ -z $backport_issue_url ]]; then
   gh issue create --title "[$BACKPORT_BRANCH] $ORIG_TITLE" \
     --label "kind/backport" \
     --repo "$TARGET_ORG/$TARGET_REPO" \
-    --assignee "$orig_assignees" \
+    --assignee "$ASSIGNEES" \
     --milestone "$TARGET_MILESTONE" \
     --body "Backport $ORIG_ISSUE_URL to branch $BACKPORT_BRANCH. $additional_body"
 else

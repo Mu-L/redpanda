@@ -15,6 +15,7 @@
 #include "cluster/commands.h"
 #include "cluster/controller_snapshot.h"
 #include "cluster/feature_backend.h"
+#include "cluster/fwd.h"
 #include "cluster/logger.h"
 #include "cluster/members_manager.h"
 #include "cluster/types.h"
@@ -40,12 +41,14 @@ bootstrap_backend::bootstrap_backend(
   ss::sharded<storage::api>& storage,
   ss::sharded<members_manager>& members_manager,
   ss::sharded<features::feature_table>& feature_table,
-  ss::sharded<feature_backend>& feature_backend)
+  ss::sharded<feature_backend>& feature_backend,
+  ss::sharded<cluster_recovery_table>& cluster_recovery_table)
   : _credentials(credentials)
   , _storage(storage)
   , _members_manager(members_manager)
   , _feature_table(feature_table)
-  , _feature_backend(feature_backend) {}
+  , _feature_backend(feature_backend)
+  , _cluster_recovery_table(cluster_recovery_table) {}
 
 namespace {
 
@@ -155,7 +158,7 @@ bootstrap_backend::apply(bootstrap_cluster_cmd cmd, model::offset offset) {
 
     // Apply initial node UUID to ID map
     co_await _members_manager.local().set_initial_state(
-      cmd.value.initial_nodes, cmd.value.node_ids_by_uuid);
+      cmd.value.initial_nodes, cmd.value.node_ids_by_uuid, offset);
 
     // Apply cluster version to feature table: this activates features without
     // waiting for feature_manager to come up.
@@ -194,6 +197,32 @@ bootstrap_backend::apply(bootstrap_cluster_cmd cmd, model::offset offset) {
         }
     }
 
+    // If this is a recovery cluster, initialize recovery state.
+    if (cmd.value.recovery_state.has_value()) {
+        co_await _cluster_recovery_table.invoke_on_all(
+          [o = offset,
+           m = cmd.value.recovery_state->manifest,
+           b = cmd.value.recovery_state->bucket](auto& recovery_table) {
+              auto ec = recovery_table.apply(o, m, b, wait_for_nodes::yes);
+              // We don't expect this since recoveries can only be initialized
+              // at or after bootstrap time, but be conservative and handle
+              // possible error codes.
+              if (ec == errc::update_in_progress) {
+                  vlog(
+                    clusterlog.error,
+                    "Failed to apply recovery state: {} ({})",
+                    ec.message(),
+                    ec);
+              } else if (ec) {
+                  throw std::runtime_error(fmt_with_ctx(
+                    fmt::format,
+                    "Failed to apply recovery state: {} ({})",
+                    ec.message(),
+                    ec));
+              }
+          });
+    }
+
     co_await apply_cluster_uuid(cmd.value.uuid);
 
     co_return errc::success;
@@ -205,7 +234,9 @@ ss::future<> bootstrap_backend::apply_cluster_uuid(model::cluster_uuid uuid) {
           storage.set_cluster_uuid(new_cluster_uuid);
       });
     co_await _storage.local().kvs().put(
-      cluster_uuid_key_space, cluster_uuid_key, serde::to_iobuf(uuid));
+      cluster_uuid_key_space,
+      bytes::from_string(cluster_uuid_key),
+      serde::to_iobuf(uuid));
     _cluster_uuid_applied = uuid;
     vlog(clusterlog.debug, "Cluster UUID initialized {}", uuid);
 }

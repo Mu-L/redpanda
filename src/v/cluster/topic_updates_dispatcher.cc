@@ -12,13 +12,14 @@
 #include "cluster/cluster_utils.h"
 #include "cluster/commands.h"
 #include "cluster/controller_snapshot.h"
+#include "cluster/logger.h"
 #include "cluster/partition_balancer_state.h"
 #include "cluster/partition_leaders_table.h"
 #include "cluster/scheduling/partition_allocator.h"
 #include "cluster/topic_table.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "raft/types.h"
+#include "raft/fundamental.h"
 #include "ssx/future-util.h"
 
 #include <seastar/coroutine/maybe_yield.hh>
@@ -83,15 +84,12 @@ ss::future<std::error_code> topic_updates_dispatcher::do_topic_delete(
                 "Deallocating ntp: {}, in_progress ops: {}",
                 tp_ns,
                 in_progress);
-              deallocate_topic(
-                tp_ns,
-                *topic_assignments,
-                in_progress,
-                get_allocation_domain(tp_ns));
+              deallocate_topic(tp_ns, *topic_assignments, in_progress);
 
-              for (const auto& p_as : *topic_assignments) {
-                  _partition_balancer_state.local().handle_ntp_update(
-                    tp_ns.ns, tp_ns.tp, p_as.id, p_as.replicas, {});
+              for (const auto& [_, p_as] : *topic_assignments) {
+                  _partition_balancer_state.local()
+                    .handle_ntp_move_begin_or_cancel(
+                      tp_ns.ns, tp_ns.tp, p_as.id, p_as.replicas, {});
               }
           }
 
@@ -122,18 +120,12 @@ ss::future<std::error_code> topic_updates_dispatcher::apply(
     auto ec = co_await dispatch_updates_to_cores(std::move(command), offset);
 
     if (ec == errc::success) {
-        add_allocations_for_new_partitions(
-          assignments, get_allocation_domain(tp_ns));
-        ss::chunked_fifo<ntp_leader> leaders;
+        add_allocations_for_new_partitions(assignments);
         for (const auto& p_as : assignments) {
-            _partition_balancer_state.local().handle_ntp_update(
+            _partition_balancer_state.local().handle_ntp_move_begin_or_cancel(
               tp_ns.ns, tp_ns.tp, p_as.id, {}, p_as.replicas);
-            leaders.emplace_back(
-              model::ntp(tp_ns.ns, tp_ns.tp, p_as.id),
-              p_as.replicas.begin()->node_id);
             co_await ss::coroutine::maybe_yield();
         }
-        co_await update_leaders_with_estimates(std::move(leaders));
 
         co_return errc::success;
     }
@@ -171,14 +163,39 @@ ss::future<std::error_code> topic_updates_dispatcher::apply(
           "partition reallocation",
           ntp);
 
-        update_allocations_for_reconfiguration(
-          p_as->replicas, cmd.value, get_allocation_domain(ntp));
+        update_allocations_for_reconfiguration(p_as->replicas, cmd.value);
 
-        _partition_balancer_state.local().handle_ntp_update(
+        _partition_balancer_state.local().handle_ntp_move_begin_or_cancel(
           ntp.ns, ntp.tp.topic, ntp.tp.partition, p_as->replicas, cmd.value);
     }
     co_return ec;
 }
+
+ss::future<std::error_code> topic_updates_dispatcher::apply(
+  update_partition_replicas_cmd cmd, model::offset offset) {
+    const auto& ntp = cmd.value.ntp;
+    auto p_as = _topic_table.local().get_partition_assignment(ntp);
+    auto ec = co_await dispatch_updates_to_cores(cmd, offset);
+    if (!ec) {
+        vassert(
+          p_as.has_value(),
+          "Partition {} have to exist before successful "
+          "partition reallocation",
+          ntp);
+
+        update_allocations_for_reconfiguration(
+          p_as->replicas, cmd.value.replicas);
+
+        _partition_balancer_state.local().handle_ntp_move_begin_or_cancel(
+          ntp.ns,
+          ntp.tp.topic,
+          ntp.tp.partition,
+          p_as->replicas,
+          cmd.value.replicas);
+    }
+    co_return ec;
+}
+
 ss::future<std::error_code> topic_updates_dispatcher::apply(
   cancel_moving_partition_replicas_cmd cmd, model::offset offset) {
     auto current_assignment = _topic_table.local().get_partition_assignment(
@@ -202,17 +219,15 @@ ss::future<std::error_code> topic_updates_dispatcher::apply(
             "currently being updated",
             ntp);
 
-          auto to_add = subtract_replica_sets(
+          auto to_add = subtract(
             *new_target_replicas, current_assignment->replicas);
-          _partition_allocator.local().add_final_counts(
-            to_add, get_allocation_domain(ntp));
+          _partition_allocator.local().add_final_counts(to_add);
 
-          auto to_remove = subtract_replica_sets(
+          auto to_remove = subtract(
             current_assignment->replicas, *new_target_replicas);
-          _partition_allocator.local().remove_final_counts(
-            to_remove, get_allocation_domain(ntp));
+          _partition_allocator.local().remove_final_counts(to_remove);
 
-          _partition_balancer_state.local().handle_ntp_update(
+          _partition_balancer_state.local().handle_ntp_move_begin_or_cancel(
             ntp.ns,
             ntp.tp.topic,
             ntp.tp.partition,
@@ -270,8 +285,7 @@ ss::future<std::error_code> topic_updates_dispatcher::apply(
           std::vector<model::broker_shard> to_delete;
           // move was successful, not cancelled
           if (target_replicas == command_replicas) {
-              to_delete = subtract_replica_sets(
-                *previous_replicas, command_replicas);
+              to_delete = subtract(*previous_replicas, command_replicas);
           } else {
               vassert(
                 previous_replicas == command_replicas,
@@ -282,11 +296,9 @@ ss::future<std::error_code> topic_updates_dispatcher::apply(
                 ntp,
                 command_replicas,
                 previous_replicas);
-              to_delete = subtract_replica_sets(
-                *target_replicas, command_replicas);
+              to_delete = subtract(*target_replicas, command_replicas);
           }
-          _partition_allocator.local().remove_allocations(
-            to_delete, get_allocation_domain(ntp));
+          _partition_allocator.local().remove_allocations(to_delete);
 
           return ec;
       });
@@ -308,11 +320,10 @@ ss::future<std::error_code> topic_updates_dispatcher::apply(
     auto ec = co_await dispatch_updates_to_cores(std::move(cmd), offset);
 
     if (ec == errc::success) {
-        add_allocations_for_new_partitions(
-          assignments, get_allocation_domain(tp_ns));
+        add_allocations_for_new_partitions(assignments);
 
         for (const auto& p_as : assignments) {
-            _partition_balancer_state.local().handle_ntp_update(
+            _partition_balancer_state.local().handle_ntp_move_begin_or_cancel(
               tp_ns.ns, tp_ns.tp, p_as.id, {}, p_as.replicas);
         }
     }
@@ -328,20 +339,20 @@ ss::future<std::error_code> topic_updates_dispatcher::apply(
     }
     if (ec == errc::success) {
         for (const auto& [partition_id, replicas] : cmd.value) {
-            auto assigment_it = assignments.value().find(partition_id);
+            auto assignment_it = assignments.value().find(partition_id);
             auto ntp = model::ntp(cmd.key.ns, cmd.key.tp, partition_id);
-            if (assigment_it == assignments.value().end()) {
+            if (assignment_it == assignments.value().end()) {
                 co_return std::error_code(errc::partition_not_exists);
             }
 
             update_allocations_for_reconfiguration(
-              assigment_it->replicas, replicas, get_allocation_domain(ntp));
+              assignment_it->second.replicas, replicas);
 
-            _partition_balancer_state.local().handle_ntp_update(
+            _partition_balancer_state.local().handle_ntp_move_begin_or_cancel(
               ntp.ns,
               ntp.tp.topic,
               ntp.tp.partition,
-              assigment_it->replicas,
+              assignment_it->second.replicas,
               replicas);
         }
     }
@@ -394,19 +405,14 @@ ss::future<std::error_code> topic_updates_dispatcher::apply(
             "currently being cancelled",
             ntp);
 
-          auto to_add = subtract_replica_sets(
-            *target_replicas, *previous_replicas);
-          _partition_allocator.local().add_final_counts(
-            to_add, get_allocation_domain(ntp));
+          auto to_add = subtract(*target_replicas, *previous_replicas);
+          _partition_allocator.local().add_final_counts(to_add);
 
-          auto to_delete = subtract_replica_sets(
-            *previous_replicas, *target_replicas);
-          _partition_allocator.local().remove_allocations(
-            to_delete, get_allocation_domain(ntp));
-          _partition_allocator.local().remove_final_counts(
-            to_delete, get_allocation_domain(ntp));
+          auto to_delete = subtract(*previous_replicas, *target_replicas);
+          _partition_allocator.local().remove_allocations(to_delete);
+          _partition_allocator.local().remove_final_counts(to_delete);
 
-          _partition_balancer_state.local().handle_ntp_update(
+          _partition_balancer_state.local().handle_ntp_move_begin_or_cancel(
             ntp.ns,
             ntp.tp.topic,
             ntp.tp.partition,
@@ -430,10 +436,9 @@ ss::future<std::error_code> topic_updates_dispatcher::apply(
       "Partition {} have to exist before successful force-reconfiguration",
       ntp);
 
-    update_allocations_for_reconfiguration(
-      p_as->replicas, cmd.value.replicas, get_allocation_domain(ntp));
+    update_allocations_for_reconfiguration(p_as->replicas, cmd.value.replicas);
 
-    _partition_balancer_state.local().handle_ntp_update(
+    _partition_balancer_state.local().handle_ntp_move_begin_or_cancel(
       ntp.ns,
       ntp.tp.topic,
       ntp.tp.partition,
@@ -443,6 +448,16 @@ ss::future<std::error_code> topic_updates_dispatcher::apply(
     co_return ec;
 }
 
+ss::future<std::error_code> topic_updates_dispatcher::apply(
+  set_topic_partitions_disabled_cmd cmd, model::offset base_offset) {
+    co_return co_await dispatch_updates_to_cores(cmd, base_offset);
+}
+
+ss::future<std::error_code> topic_updates_dispatcher::apply(
+  bulk_force_reconfiguration_cmd cmd, model::offset base_offset) {
+    co_return co_await dispatch_updates_to_cores(std::move(cmd), base_offset);
+}
+
 topic_updates_dispatcher::in_progress_map
 topic_updates_dispatcher::collect_in_progress(
   const model::topic_namespace& tp_ns,
@@ -450,7 +465,7 @@ topic_updates_dispatcher::collect_in_progress(
     in_progress_map in_progress;
     in_progress.reserve(current_assignments.size());
     // collect in progress assignments
-    for (auto& p : current_assignments) {
+    for (auto& [_, p] : current_assignments) {
         model::ntp ntp(tp_ns.ns, tp_ns.tp, p.id);
         const auto& in_progress_updates
           = _topic_table.local().updates_in_progress();
@@ -459,37 +474,13 @@ topic_updates_dispatcher::collect_in_progress(
             continue;
         }
         const auto state = it->second.get_state();
-        if (state == reconfiguration_state::in_progress) {
-            in_progress[p.id] = it->second.get_previous_replicas();
-        } else {
-            vassert(
-              state == reconfiguration_state::cancelled
-                || state == reconfiguration_state::force_cancelled,
-              "Invalid reconfiguration state: {}",
-              state);
+        if (is_cancelled_state(state)) {
             in_progress[p.id] = it->second.get_target_replicas();
+        } else {
+            in_progress[p.id] = it->second.get_previous_replicas();
         }
     }
     return in_progress;
-}
-
-ss::future<> topic_updates_dispatcher::update_leaders_with_estimates(
-  ss::chunked_fifo<ntp_leader> leaders) {
-    return ss::do_with(
-      std::move(leaders), [this](ss::chunked_fifo<ntp_leader>& leaders) {
-          return ss::parallel_for_each(leaders, [this](ntp_leader& leader) {
-              vlog(
-                clusterlog.debug,
-                "update_leaders_with_estimates: new NTP {} leader {}",
-                leader.first,
-                leader.second);
-              return _partition_leaders_table.invoke_on_all(
-                [leader = std::move(leader)](partition_leaders_table& l) {
-                    return l.update_partition_leader(
-                      leader.first, model::term_id(1), leader.second);
-                });
-          });
-      });
 }
 
 template<typename Cmd>
@@ -524,19 +515,18 @@ topic_updates_dispatcher::dispatch_updates_to_cores(Cmd cmd, model::offset o) {
 void topic_updates_dispatcher::deallocate_topic(
   const model::topic_namespace& tp_ns,
   const assignments_set& topic_assignments,
-  const in_progress_map& in_progress,
-  const partition_allocation_domain domain) {
-    for (auto& p_as : topic_assignments) {
-        model::ntp ntp(tp_ns.ns, tp_ns.tp, p_as.id);
+  const in_progress_map& in_progress) {
+    for (auto& [_, p_as] : topic_assignments) {
         // we must remove the allocation that would normally
         // be removed with update_finished request
         auto it = in_progress.find(p_as.id);
         auto to_delete = it == in_progress.end()
                            ? p_as.replicas
-                           : union_replica_sets(it->second, p_as.replicas);
-        _partition_allocator.local().remove_allocations(to_delete, domain);
-        _partition_allocator.local().remove_final_counts(p_as.replicas, domain);
+                           : union_vectors(it->second, p_as.replicas);
+        _partition_allocator.local().remove_allocations(to_delete);
+        _partition_allocator.local().remove_final_counts(p_as.replicas);
         if (unlikely(clusterlog.is_enabled(ss::log_level::trace))) {
+            model::ntp ntp(tp_ns.ns, tp_ns.tp, p_as.id);
             vlog(
               clusterlog.trace,
               "Deallocated ntp: {}, current assignment: {}, "
@@ -549,24 +539,22 @@ void topic_updates_dispatcher::deallocate_topic(
 }
 template<typename T>
 void topic_updates_dispatcher::add_allocations_for_new_partitions(
-  const T& assignments, const partition_allocation_domain domain) {
+  const T& assignments) {
     auto& allocator = _partition_allocator.local();
     for (const auto& pas : assignments) {
-        allocator.add_allocations_for_new_partition(
-          pas.replicas, pas.group, domain);
+        allocator.add_allocations_for_new_partition(pas.replicas, pas.group);
     }
 }
 
 void topic_updates_dispatcher::update_allocations_for_reconfiguration(
   const std::vector<model::broker_shard>& previous,
-  const std::vector<model::broker_shard>& target,
-  partition_allocation_domain domain) {
-    auto to_add = subtract_replica_sets(target, previous);
-    _partition_allocator.local().add_allocations(to_add, domain);
-    _partition_allocator.local().add_final_counts(to_add, domain);
+  const std::vector<model::broker_shard>& target) {
+    auto to_add = subtract(target, previous);
+    _partition_allocator.local().add_allocations(to_add);
+    _partition_allocator.local().add_final_counts(to_add);
 
-    auto to_remove = subtract_replica_sets(previous, target);
-    _partition_allocator.local().remove_final_counts(to_remove, domain);
+    auto to_remove = subtract(previous, target);
+    _partition_allocator.local().remove_final_counts(to_remove);
 }
 
 ss::future<>
@@ -581,11 +569,6 @@ ss::future<> topic_updates_dispatcher::apply_snapshot(
     co_await _topic_table.invoke_on_all([&snap, offset](topic_table& topics) {
         return topics.apply_snapshot(offset, snap);
     });
-
-    co_await _partition_leaders_table.invoke_on_all(
-      [](partition_leaders_table& leaders) {
-          return leaders.update_with_estimates();
-      });
 
     co_await _partition_allocator.local().apply_snapshot(snap);
 

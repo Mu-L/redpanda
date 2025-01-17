@@ -9,12 +9,12 @@
  * by the Apache License, Version 2.0
  */
 
+#include "base/vlog.h"
 #include "cluster/commands.h"
 #include "cluster/feature_manager.h"
 #include "cluster/members_table.h"
 #include "test_utils/async.h"
 #include "test_utils/fixture.h"
-#include "vlog.h"
 
 #include <seastar/core/manual_clock.hh>
 #include <seastar/core/sleep.hh>
@@ -60,7 +60,8 @@ struct barrier_fixture {
               model::broker_properties{}));
         }
         for (auto& br : brokers) {
-            members.apply(model::offset(0), cluster::add_node_cmd(br.id(), br));
+            BOOST_REQUIRE(!members.apply(
+              model::offset(0), cluster::add_node_cmd(br.id(), br)));
         }
     }
 

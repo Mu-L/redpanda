@@ -11,7 +11,6 @@
 
 #pragma once
 #include "cluster/fwd.h"
-#include "cluster/rm_group_proxy.h"
 #include "cluster/tx_gateway_service.h"
 
 #include <seastar/core/sharded.hh>
@@ -34,49 +33,50 @@ public:
       ss::smp_service_group,
       ss::sharded<cluster::tx_gateway_frontend>&,
       rm_group_proxy*,
-      ss::sharded<cluster::rm_partition_frontend>&,
-      ss::sharded<cluster::tx_registry_frontend>&);
+      ss::sharded<cluster::rm_partition_frontend>&);
 
     ss::future<init_tm_tx_reply>
-    init_tm_tx(init_tm_tx_request&&, rpc::streaming_context&) override;
+    init_tm_tx(init_tm_tx_request, rpc::streaming_context&) override;
 
     ss::future<fetch_tx_reply>
-    fetch_tx(fetch_tx_request&&, rpc::streaming_context&) override;
+    fetch_tx(fetch_tx_request, rpc::streaming_context&) override;
 
     ss::future<try_abort_reply>
-    try_abort(try_abort_request&&, rpc::streaming_context&) override;
+    try_abort(try_abort_request, rpc::streaming_context&) override;
 
     ss::future<begin_tx_reply>
-    begin_tx(begin_tx_request&&, rpc::streaming_context&) override;
+    begin_tx(begin_tx_request, rpc::streaming_context&) override;
 
     ss::future<prepare_tx_reply>
-    prepare_tx(prepare_tx_request&&, rpc::streaming_context&) override;
+    prepare_tx(prepare_tx_request, rpc::streaming_context&) override;
 
     ss::future<commit_tx_reply>
-    commit_tx(commit_tx_request&&, rpc::streaming_context&) override;
+    commit_tx(commit_tx_request, rpc::streaming_context&) override;
 
     ss::future<abort_tx_reply>
-    abort_tx(abort_tx_request&&, rpc::streaming_context&) override;
+    abort_tx(abort_tx_request, rpc::streaming_context&) override;
 
     ss::future<begin_group_tx_reply>
-    begin_group_tx(begin_group_tx_request&&, rpc::streaming_context&) override;
+    begin_group_tx(begin_group_tx_request, rpc::streaming_context&) override;
 
     ss::future<prepare_group_tx_reply> prepare_group_tx(
-      prepare_group_tx_request&&, rpc::streaming_context&) override;
+      prepare_group_tx_request, rpc::streaming_context&) override;
 
-    ss::future<commit_group_tx_reply> commit_group_tx(
-      commit_group_tx_request&&, rpc::streaming_context&) override;
+    ss::future<commit_group_tx_reply>
+    commit_group_tx(commit_group_tx_request, rpc::streaming_context&) override;
 
     ss::future<abort_group_tx_reply>
-    abort_group_tx(abort_group_tx_request&&, rpc::streaming_context&) override;
+    abort_group_tx(abort_group_tx_request, rpc::streaming_context&) override;
 
     ss::future<find_coordinator_reply> find_coordinator(
-      find_coordinator_request&&, rpc::streaming_context&) override;
+      find_coordinator_request, rpc::streaming_context&) override;
+
+    ss::future<get_producers_reply>
+    get_producers(get_producers_request, rpc::streaming_context&) override;
 
 private:
     ss::sharded<cluster::tx_gateway_frontend>& _tx_gateway_frontend;
     rm_group_proxy* _rm_group_proxy;
     ss::sharded<cluster::rm_partition_frontend>& _rm_partition_frontend;
-    ss::sharded<cluster::tx_registry_frontend>& _tx_registry_frontend;
 };
 } // namespace cluster

@@ -7,15 +7,16 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-from rptest.tests.redpanda_test import RedpandaTest
-from rptest.services.cluster import cluster
-from rptest.services.kgo_verifier_services import KgoVerifierProducer, KgoVerifierSeqConsumer
-from rptest.services.redpanda import SISettings, MetricsEndpoint, ResourceSettings
-from rptest.clients.rpk import RpkTool, RpkException
 import concurrent.futures
-from rptest.utils.si_utils import quiesce_uploads
-import time
 import threading
+import time
+
+from rptest.clients.rpk import RpkTool, RpkException
+from rptest.services.cluster import cluster
+from rptest.services.kgo_verifier_services import KgoVerifierProducer
+from rptest.services.redpanda import SISettings, MetricsEndpoint, ResourceSettings
+from rptest.tests.redpanda_test import RedpandaTest
+from rptest.utils.si_utils import quiesce_uploads
 
 
 class TieredStorageReaderStressTest(RedpandaTest):
@@ -30,8 +31,7 @@ class TieredStorageReaderStressTest(RedpandaTest):
     cache_max_throughput = 10 * expect_throughput
     cache_size = SISettings.cache_size_for_throughput(cache_max_throughput)
 
-    # This is the same as the default at time of writing (v23.2)
-    readers_per_shard = 1000
+    readers_per_shard = 10000
 
     # To help reduce runtime by requiring less data to get a given segment count
     segment_size = 16 * 1024 * 1024
@@ -81,7 +81,7 @@ class TieredStorageReaderStressTest(RedpandaTest):
                                     **kwargs)
         produce_duration = time.time() - t1
         self.logger.info(
-            f"Produced {data_size} bytes in {produce_duration} seconds, {(data_size/produce_duration)/1000000.0:.2f}MB/s"
+            f"Produced {data_size} bytes in {produce_duration} seconds, {(data_size / produce_duration) / 1000000.0:.2f}MB/s"
         )
 
         quiesce_uploads(
@@ -114,7 +114,10 @@ class TieredStorageReaderStressTest(RedpandaTest):
             segment_reader_count = 0
             partition_reader_count = 0
             partition_reader_delay_count = 0
+            segment_reader_delay_count = 0
+            materialize_segment_delay_count = 0
             connection_count = 0
+            hydrations_count = 0
             for family in metrics:
                 for sample in family.samples:
                     if sample.name == "redpanda_cloud_storage_readers":
@@ -123,15 +126,28 @@ class TieredStorageReaderStressTest(RedpandaTest):
                         partition_reader_count += int(sample.value)
                     if sample.name == "redpanda_cloud_storage_partition_readers_delayed_total":
                         partition_reader_delay_count += int(sample.value)
+                    if sample.name == "redpanda_cloud_storage_segment_readers_delayed_total":
+                        segment_reader_delay_count += int(sample.value)
+                    if sample.name == "redpanda_cloud_storage_segment_materializations_delayed_total":
+                        materialize_segment_delay_count += int(sample.value)
                     elif sample.name == "redpanda_rpc_active_connections":
                         if sample.labels["redpanda_server"] == "kafka":
                             connection_count += int(sample.value)
+            for family in self.redpanda.metrics(
+                    node, metrics_endpoint=MetricsEndpoint.METRICS):
+                for sample in family.samples:
+                    if sample.name == "vectorized_cloud_storage_read_path_hydrations_in_progress_total":
+                        hydrations_count += int(sample.value)
 
             stats = {
                 "segment_readers": segment_reader_count,
+                "segment_readers_delayed": segment_reader_delay_count,
                 "partition_readers": partition_reader_count,
                 "partition_readers_delayed": partition_reader_delay_count,
-                "connections": connection_count
+                "materialize_segments_delayed":
+                materialize_segment_delay_count,
+                "connections": connection_count,
+                "hydrations_count": hydrations_count
             }
             self.logger.debug(f"stats[{node.name}] = {stats}")
             results[node] = stats
@@ -269,57 +285,51 @@ class TieredStorageReaderStressTest(RedpandaTest):
             assert hwms[
                 'partition_readers'] <= self.readers_per_shard * self.redpanda.get_node_cpu_count(
                 )
-
-            # Segment reader limit is sloppy, but probabilistically it should not have overshot
-            # by more than a factor of 2 before getting trimmed.
             assert hwms[
-                'segment_readers'] <= 2 * self.readers_per_shard * self.redpanda.get_node_cpu_count(
+                'segment_readers'] <= self.readers_per_shard * self.redpanda.get_node_cpu_count(
                 )
 
         # TODO: assert on reader HWM once we enforce it more strongly
 
-        # TODO: once we implement abort source driven cancellation of tiered storage
-        # I/O on client disconnect, we should assert here that the connection count
-        # is at zero, and we should assert that no new downloads start after all our
-        # clients have stopped.
-
         stats = self._get_stats()
         for node, stats in stats.items():
             # The stats indicate saturation with tiered storage reads.
-            assert stats['partition_readers_delayed']
-            # There are still some segment readers cached as expected, they shouldn't
-            # all have been trimmed.
-            assert stats['segment_readers']
+            assert stats['partition_readers_delayed'] or stats[
+                'segment_readers_delayed']
 
-            # TODO: remove these last assertions once we have clean abort on client timeout:
-            # they are currently asserting that the buggy behavior happens where we have
-            # a backlog of connections due to abandoned kafka RPC dispatch fibers.
-            assert stats['connections']
-            assert stats['partition_readers']
-
-        def connections_closed():
+        def is_metric_zero(fn, label):
             for node, stats in self._get_stats().items():
-                if stats['connections'] > 0:
+                if metric := fn(stats):
                     self.logger.debug(
-                        f"Node {node.name} still has {stats['connections']} connections open"
-                    )
+                        f"Node {node.name} still has {metric} {label}")
                     return False
-
             return True
 
-        self.logger.info("Waiting for all Kafka connections to close")
-        # The timeout here has to be set in a way that's aligned with the number of parallel
-        # reads we did: if this timeout is long enough for them all to complete and drain (even
-        # without aborting requests on client timeout), then the test will pass even if
-        # we aren't doing proper aborting on client timeout.
-        # TODO: make this much tighter, and/or an immediate assertion rather than a
-        #       wait_until, once we have aborting of readers on client disconnect.
-        expect_runtime_per_request = 0.5
+        """
+        Active chunk hydrations block remote segment readers during reader creation,
+        which in turn keep kafka connections open. A connection can only be closed
+        once the download finishes, so we wait for active downloads to finish first.
+        """
+        self.logger.info("Waiting for active hydrations to finish")
         self.redpanda.wait_until(
-            connections_closed,
-            # How long we expect all the timequeries to take to drain if they
-            # are sat there running in orphan rpc fibers
-            # TODO: this reflects the behavior that abort-on-client-timeout should fix.
-            timeout_sec=expect_runtime_per_request * total_timequeries,
+            lambda: is_metric_zero(lambda s: s['hydrations_count'],
+                                   'active hydrations'),
+            timeout_sec=15,
+            backoff_sec=1,
+            err_msg="Waiting for active hydrations to finish")
+
+        # Once downloads are done, connections should be closed very shortly after.
+        self.logger.info("Waiting for all Kafka connections to close")
+        self.redpanda.wait_until(
+            lambda: is_metric_zero(lambda s: s["connections"],
+                                   "kafka connections"),
+            timeout_sec=3,
             backoff_sec=1,
             err_msg="Waiting for Kafka connections to close")
+
+        # No new downloads should be started once all reader activity is done
+        for _ in range(10):
+            time.sleep(0.5)
+            assert is_metric_zero(
+                lambda s: s['hydrations_count'], 'active hydrations'
+            ), 'found an active hydration where none expected'

@@ -10,11 +10,11 @@
 
 #pragma once
 
+#include "base/seastarx.h"
 #include "config/property.h"
 #include "model/fundamental.h"
 #include "pandaproxy/schema_registry/subject_name_strategy.h"
 #include "pandaproxy/schema_registry/types.h"
-#include "seastarx.h"
 
 #include <boost/multi_index/indexed_by.hpp>
 #include <boost/multi_index/key.hpp>
@@ -44,7 +44,7 @@ public:
       field field,
       subject_name_strategy sns,
       schema_id s_id,
-      offsets_t const& offsets) {
+      const offsets_t& offsets) {
         auto& map = _cache.get<underlying_map>();
         auto it = map.find(entry::view_t(topic, field, sns, s_id, offsets));
         bool has = it != map.end();
@@ -111,19 +111,19 @@ private:
           field,
           subject_name_strategy,
           schema_id,
-          offsets_t const&>;
+          const offsets_t&>;
         view_t view() const { return {topic, f, sns, s_id, offsets}; }
 
         // Full comparison of entry
         struct less {
             using is_transparent = void;
-            bool operator()(entry const& lhs, entry const& rhs) const {
+            bool operator()(const entry& lhs, const entry& rhs) const {
                 return lhs.view() < rhs.view();
             }
-            bool operator()(view_t lhs, entry const& rhs) const {
+            bool operator()(view_t lhs, const entry& rhs) const {
                 return lhs < rhs.view();
             }
-            bool operator()(entry const& lhs, view_t rhs) const {
+            bool operator()(const entry& lhs, view_t rhs) const {
                 return lhs.view() < rhs;
             }
         };
@@ -131,10 +131,10 @@ private:
         // Compare only the topic
         struct topic_less {
             using is_transparent = void;
-            bool operator()(model::topic_view lhs, entry const& rhs) const {
+            bool operator()(model::topic_view lhs, const entry& rhs) const {
                 return lhs < model::topic_view(rhs.topic);
             }
-            bool operator()(entry const& lhs, model::topic_view rhs) const {
+            bool operator()(const entry& lhs, model::topic_view rhs) const {
                 return model::topic_view(lhs.topic) < rhs;
             }
         };

@@ -65,11 +65,6 @@ class CloudRetentionTest(PreallocNodesTest):
             msg_count = int(1024 * 1024 * 1024 / msg_size)
             segment_size = 1024 * 1024
 
-        if max_consume_rate_mb is None:
-            max_read_msgs = 25000
-        else:
-            max_read_msgs = 2000
-
         si_settings = SISettings(self.test_context,
                                  log_segment_size=segment_size,
                                  fast_uploads=True)
@@ -79,6 +74,7 @@ class CloudRetentionTest(PreallocNodesTest):
                              default_retention_segments * segment_size,
                              log_segment_size_jitter_percent=5,
                              group_initial_rebalance_delay=300,
+                             cloud_storage_spillover_manifest_size=None,
                              cloud_storage_segment_max_upload_interval_sec=60,
                              cloud_storage_housekeeping_interval_ms=10_000)
         self.redpanda.add_extra_rp_conf(extra_rp_conf)
@@ -102,20 +98,9 @@ class CloudRetentionTest(PreallocNodesTest):
                                        msg_count=msg_count,
                                        custom_node=self.preallocated_nodes)
 
-        consumer = KgoVerifierConsumerGroupConsumer(
-            self.test_context,
-            self.redpanda,
-            self.topic_name,
-            msg_size,
-            readers=3,
-            loop=True,
-            max_msgs=max_read_msgs,
-            nodes=self.preallocated_nodes)
-
         producer.start(clean=False)
 
         producer.wait_for_offset_map()
-        consumer.start(clean=False)
 
         producer.wait_for_acks(msg_count, timeout_sec=600, backoff_sec=5)
         producer.wait()
@@ -144,14 +129,15 @@ class CloudRetentionTest(PreallocNodesTest):
             for p in range(0, num_partitions):
                 try:
                     manifest = s3_snapshot.manifest_for_ntp(self.topic_name, p)
+
+                    kafka_last_offset = BucketView.kafka_last_offset(manifest)
+                    self.logger.info(
+                        f"Partition {p} kafka last offset: {kafka_last_offset}"
+                    )
+                    total_of_hwms += kafka_last_offset
                 except Exception as e:
                     self.logger.debug(f"Failed to get manifest: {e}")
                     return False
-
-                kafka_last_offset = BucketView.kafka_last_offset(manifest)
-                self.logger.info(
-                    f"Partition {p} kafka last offset: {kafka_last_offset}")
-                total_of_hwms += kafka_last_offset
 
             # Require that all data is uploaded except for up to one segment's
             # worth of messages for each partition
@@ -191,10 +177,22 @@ class CloudRetentionTest(PreallocNodesTest):
                    timeout_sec=60,
                    backoff_sec=5)
 
+        consumer = KgoVerifierConsumerGroupConsumer(
+            self.test_context,
+            self.redpanda,
+            self.topic_name,
+            msg_size,
+            readers=3,
+            loop=True,
+            max_throughput_mb=max_consume_rate_mb,
+            nodes=self.preallocated_nodes)
+        consumer.start(clean=False)
+
         consumer.wait()
         self.logger.info("finished consuming")
-        assert consumer.consumer_status.validator.valid_reads > \
-            segment_size * num_partitions / msg_size
+        valid_reads = consumer.consumer_status.validator.valid_reads
+        threshold = segment_size * num_partitions / msg_size
+        assert valid_reads > threshold, f"valid_reads {valid_reads} are below the threshold {threshold}, segment_size {segment_size}, num_partitions {num_partitions}, msg_size {msg_size}"
 
     @cluster(num_nodes=4)
     @skip_debug_mode

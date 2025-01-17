@@ -1,14 +1,19 @@
-from io import BytesIO
+import collections
+import datetime
 import logging
 import os
+import re
 import struct
+from io import BytesIO
+
 from model import *
 from reader import Reader
 from storage import BatchType, Header, Record, Segment
-import collections
-import datetime
 
 logger = logging.getLogger('kvstore')
+
+STM_SNAPSHOT_KEY_PATTERN = re.compile(
+    "^(?P<name>.+)/{(?P<namespace>.+)/(?P<topic>.+)/(?P<partition>\d+)}$")
 
 
 class SnapshotBatch:
@@ -84,6 +89,10 @@ class KvStoreRecordDecoder:
             return "offset_translator"
         elif ks == 5:
             return "usage"
+        elif ks == 6:
+            return "stms"
+        elif ks == 7:
+            return "shard_placement"
         return "unknown"
 
     def decode(self):
@@ -215,6 +224,25 @@ def decode_offset_translator_key(k):
     return ret
 
 
+def decode_stm_snapshot_key(k):
+    rdr = Reader(BytesIO(k))
+    ret = {}
+
+    key = rdr.read_string()
+    match = STM_SNAPSHOT_KEY_PATTERN.match(key)
+    if not match:
+        raise Exception("Failed to pattern match STM snapshot key: {}", key)
+
+    ret["name"] = match["name"]
+    ret["ntp"] = {
+        "namespace": match["namespace"],
+        "topic": match["topic"],
+        "partition": int(match["partition"]),
+    }
+
+    return ret
+
+
 def decode_storage_key_name(key_type):
     if key_type == 0:
         return "start offset"
@@ -233,6 +261,25 @@ def decode_storage_key(k):
     return ret
 
 
+def decode_shard_placement_key(k):
+    rdr = Reader(BytesIO(k))
+    ret = {}
+    ret['type'] = rdr.read_int32()
+    if ret['type'] == 0:
+        ret['name'] = "persistence_enabled"
+    elif ret['type'] == 1:
+        ret['name'] = "assignment"
+        ret['group'] = rdr.read_int64()
+    elif ret['type'] == 2:
+        ret['name'] = "current_state"
+        ret['group'] = rdr.read_int64()
+    elif ret['type'] == 3:
+        ret['name'] = "balancer_state"
+    else:
+        ret['name'] = "unknown"
+    return ret
+
+
 def decode_key(ks, key):
     data = key
     if ks == "consensus":
@@ -241,6 +288,10 @@ def decode_key(ks, key):
         data = decode_storage_key(key)
     elif ks == "offset_translator":
         data = decode_offset_translator_key(key)
+    elif ks == "stms":
+        data = decode_stm_snapshot_key(key)
+    elif ks == "shard_placement":
+        data = decode_shard_placement_key(key)
     else:
         data = key.hex()
     return {'keyspace': ks, 'data': data}

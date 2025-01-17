@@ -1,3 +1,12 @@
+// Copyright 2023 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
 package partitions
 
 import (
@@ -15,8 +24,17 @@ func NewPartitionsCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 	p.InstallAdminFlags(cmd)
 	p.InstallSASLFlags(cmd)
 	cmd.AddCommand(
+		newMovePartitionReplicasCommand(fs, p),
 		newBalancerStatusCommand(fs, p),
+		newListCommand(fs, p),
 		newMovementCancelCommand(fs, p),
+		newMovementCancelCommandHidden(fs, p),
+		newPartitionDisableCommand(fs, p),
+		newPartitionEnableCommand(fs, p),
+		newPartitionMovementsStatusCommand(fs, p),
+		newTransferLeaderCommand(fs, p),
+		newTriggerBalancerCommand(fs, p),
+		newUnsafeRecoveryCommand(fs, p),
 	)
 	return cmd
 }

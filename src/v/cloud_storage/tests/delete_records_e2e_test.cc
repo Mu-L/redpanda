@@ -8,10 +8,11 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
-#include "archival/ntp_archiver_service.h"
 #include "cloud_storage/spillover_manifest.h"
 #include "cloud_storage/tests/produce_utils.h"
 #include "cloud_storage/tests/s3_imposter.h"
+#include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/ntp_archiver_service.h"
 #include "config/configuration.h"
 #include "kafka/server/tests/delete_records_utils.h"
 #include "kafka/server/tests/list_offsets_utils.h"
@@ -22,6 +23,7 @@
 #include "redpanda/tests/fixture.h"
 #include "storage/disk_log_impl.h"
 #include "test_utils/async.h"
+#include "test_utils/scoped_config.h"
 
 #include <seastar/core/io_priority_class.hh>
 
@@ -77,30 +79,28 @@ public:
     static constexpr auto segs_per_spill = 10;
     delete_records_e2e_fixture()
       : redpanda_thread_fixture(
-        redpanda_thread_fixture::init_cloud_storage_tag{},
-        httpd_port_number()) {
+          redpanda_thread_fixture::init_cloud_storage_tag{},
+          httpd_port_number()) {
         // No expectations: tests will PUT and GET organically.
         set_expectations_and_listen({});
         wait_for_controller_leadership().get();
 
         // Apply local retention frequently.
-        config::shard_local_cfg().log_compaction_interval_ms.set_value(
-          std::chrono::duration_cast<std::chrono::milliseconds>(1s));
+        test_local_cfg.get("log_compaction_interval_ms")
+          .set_value(std::chrono::duration_cast<std::chrono::milliseconds>(1s));
         // We'll control uploads ourselves.
-        config::shard_local_cfg()
-          .cloud_storage_enable_segment_merging.set_value(false);
-        config::shard_local_cfg()
-          .cloud_storage_disable_upload_loop_for_tests.set_value(true);
+        test_local_cfg.get("cloud_storage_enable_segment_merging")
+          .set_value(false);
+        test_local_cfg.get("cloud_storage_disable_upload_loop_for_tests")
+          .set_value(true);
         // Disable metrics to speed things up.
-        config::shard_local_cfg().enable_metrics_reporter.set_value(false);
+        test_local_cfg.get("enable_metrics_reporter").set_value(false);
         // Encourage spilling over.
-        config::shard_local_cfg()
-          .cloud_storage_spillover_manifest_max_segments.set_value(
-            std::make_optional<size_t>(segs_per_spill));
-        config::shard_local_cfg()
-          .cloud_storage_spillover_manifest_size.set_value(
-            std::optional<size_t>{});
-        config::shard_local_cfg().retention_local_strict.set_value(true);
+        test_local_cfg.get("cloud_storage_spillover_manifest_max_segments")
+          .set_value(std::make_optional<size_t>(segs_per_spill));
+        test_local_cfg.get("cloud_storage_spillover_manifest_size")
+          .set_value(std::optional<size_t>{});
+        test_local_cfg.get("retention_local_strict").set_value(true);
 
         topic_name = model::topic("tapioca");
         ntp = model::ntp(model::kafka_namespace, topic_name, 0);
@@ -129,8 +129,9 @@ public:
         new_archiver.housekeeping().get();
         BOOST_REQUIRE_EQUAL(
           new_archiver.manifest().get_start_kafka_offset_override(),
-          model::offset{});
+          kafka::offset{});
     }
+    scoped_config test_local_cfg;
 
     model::topic topic_name;
     model::ntp ntp;
@@ -164,7 +165,8 @@ FIXTURE_TEST(test_timequery_below_deleted_offset, delete_records_e2e_fixture) {
                     .list_offset_for_partition(
                       topic_name, model::partition_id(0), first_seg_max_ts)
                     .get();
-    BOOST_REQUIRE_EQUAL(first_seg->last_kafka_offset(), offset);
+    BOOST_REQUIRE_EQUAL(
+      first_seg->last_kafka_offset(), model::offset_cast(offset));
     auto second_seg = stm_manifest.segment_containing(
       first_seg->next_kafka_offset());
 
@@ -198,7 +200,7 @@ FIXTURE_TEST(test_timequery_below_deleted_offset, delete_records_e2e_fixture) {
               kafka::offset_cast(first_local_offset),
               5s)
             .get();
-    BOOST_REQUIRE_EQUAL(first_local_offset, lwm);
+    BOOST_REQUIRE_EQUAL(first_local_offset, model::offset_cast(lwm));
 
     // Timequeries into the cloud region should be bumped up.
     post_delete_offset = lister
@@ -207,7 +209,8 @@ FIXTURE_TEST(test_timequery_below_deleted_offset, delete_records_e2e_fixture) {
                              model::partition_id(0),
                              first_seg_max_ts)
                            .get();
-    BOOST_REQUIRE_EQUAL(first_local_offset, post_delete_offset);
+    BOOST_REQUIRE_EQUAL(
+      first_local_offset, model::offset_cast(post_delete_offset));
 }
 
 FIXTURE_TEST(
@@ -267,7 +270,8 @@ FIXTURE_TEST(test_delete_from_stm_consume, delete_records_e2e_fixture) {
                    topic_name, model::partition_id(0), model::offset(1), 5s)
                  .get();
     BOOST_CHECK_EQUAL(model::offset(1), lwm);
-    boost_require_eventually(10s, [this] { return log->segment_count() == 1; });
+    RPTEST_REQUIRE_EVENTUALLY(
+      10s, [this] { return log->segment_count() == 1; });
 
     kafka_consume_transport consumer(make_kafka_client().get());
     consumer.start().get();
@@ -317,7 +321,7 @@ FIXTURE_TEST(test_delete_from_archive_consume, delete_records_e2e_fixture) {
     deleter.start().get();
     kafka_consume_transport consumer(make_kafka_client().get());
     consumer.start().get();
-    for (size_t i = 1; i < total_records; i++) {
+    for (int i = 1; i < total_records; i++) {
         auto lwm = deleter
                      .delete_records_from_partition(
                        topic_name, model::partition_id(0), model::offset(i), 5s)
@@ -362,13 +366,13 @@ FIXTURE_TEST(
     auto new_start_offset = kafka::offset(245);
     BOOST_REQUIRE_EQUAL(
       new_start_offset,
-      deleter
-        .delete_records_from_partition(
-          topic_name,
-          model::partition_id(0),
-          kafka::offset_cast(new_start_offset),
-          5s)
-        .get());
+      model::offset_cast(deleter
+                           .delete_records_from_partition(
+                             topic_name,
+                             model::partition_id(0),
+                             kafka::offset_cast(new_start_offset),
+                             5s)
+                           .get()));
 
     // The first housekeeping should remove all spillover segments.
     auto archive_start = stm_manifest.get_archive_start_offset();
@@ -400,13 +404,13 @@ FIXTURE_TEST(
       stm_manifest.get_start_kafka_offset_override(), kafka::offset{});
 
     // Produce more data and upload to cloud.
-    auto produced_kafka_base_offset = gen.producer()
-                                        .produce_to_partition(
-                                          topic_name,
-                                          model::partition_id(0),
-                                          tests::kv_t::sequence(
-                                            0, records_per_seg))
-                                        .get();
+    auto produced_kafka_base_offset = model::offset_cast(
+      gen.producer()
+        .produce_to_partition(
+          topic_name,
+          model::partition_id(0),
+          tests::kv_t::sequence(0, records_per_seg))
+        .get());
     log->flush().get();
     log->force_roll(ss::default_priority_class()).get();
     BOOST_REQUIRE_GT(produced_kafka_base_offset, new_start_offset);
@@ -424,7 +428,7 @@ FIXTURE_TEST(
       archiver->upload_manifest("test").get());
     BOOST_REQUIRE(stm_manifest.get_start_kafka_offset().has_value());
     BOOST_REQUIRE_EQUAL(
-      stm_manifest.get_start_kafka_offset().value(), model::offset(200));
+      stm_manifest.get_start_kafka_offset().value(), kafka::offset(200));
 
     // When truncating the STM, we should still honor the requested start.
     archiver->housekeeping().get();
@@ -432,7 +436,7 @@ FIXTURE_TEST(
     BOOST_REQUIRE_EQUAL(
       stm_manifest.get_start_kafka_offset().value(), new_start_offset);
     BOOST_REQUIRE_EQUAL(
-      stm_manifest.get_start_kafka_offset_override(), model::offset(245));
+      stm_manifest.get_start_kafka_offset_override(), kafka::offset(245));
 
     auto size_above_override = segment_bytes_above_offset(
       stm_manifest, kafka::offset(245));

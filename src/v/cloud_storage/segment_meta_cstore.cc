@@ -11,10 +11,10 @@
 #include "cloud_storage/segment_meta_cstore.h"
 
 #include "cloud_storage/types.h"
+#include "config/configuration.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timestamp.h"
-#include "serde/serde.h"
 #include "utils/delta_for.h"
 
 #include <bitset>
@@ -30,21 +30,23 @@ namespace cloud_storage {
 using int64_delta_alg = details::delta_delta<int64_t>;
 using int64_xor_alg = details::delta_xor;
 // Column for monotonically increasing data
-using counter_col_t = segment_meta_column<int64_t, int64_delta_alg>;
+using counter_col_t
+  = deltafor_column<int64_t, int64_delta_alg, cstore_max_frame_size>;
 // Column for varying data
-using gauge_col_t = segment_meta_column<int64_t, int64_xor_alg>;
+using gauge_col_t
+  = deltafor_column<int64_t, int64_xor_alg, cstore_max_frame_size>;
 
 /// Sampling rate of the indexer inside the column store, if
 /// sampling_rate == 1 every row is indexed, 2 - every second row, etc
-/// The value 8 with max_frame_size set to 64 will give us 8 hints per
+/// The value 8 with max_frame_size set to 1024 will give us 8 hints per
 /// frame (frame has 64 rows). There is no measurable difference between
 /// value 8 and smaller values.
-static constexpr uint32_t sampling_rate = 8;
-
 // Sampling rate should be proportional to max_frame_size so we will
 // sample first row of every frame.
 static_assert(
-  gauge_col_t::max_frame_size % sampling_rate == 0, "Invalid sampling rate");
+  cstore_max_frame_size % (details::FOR_buffer_depth * cstore_sampling_rate)
+    == 0,
+  "Invalid sampling rate");
 
 enum class segment_meta_ix {
     is_compacted,
@@ -197,24 +199,24 @@ class column_store
     // projections from segment_meta to value_t used by the columns. the order
     // is the same of columns()
     constexpr static auto segment_meta_accessors = std::tuple{
-      [](segment_meta const& s) {
+      [](const segment_meta& s) {
           return static_cast<int64_t>(s.is_compacted);
       },
-      [](segment_meta const& s) { return static_cast<int64_t>(s.size_bytes); },
-      [](segment_meta const& s) { return s.base_offset(); },
-      [](segment_meta const& s) { return s.committed_offset(); },
-      [](segment_meta const& s) { return s.base_timestamp(); },
-      [](segment_meta const& s) { return s.max_timestamp(); },
-      [](segment_meta const& s) { return s.delta_offset(); },
-      [](segment_meta const& s) { return s.ntp_revision(); },
-      [](segment_meta const& s) { return s.archiver_term(); },
-      [](segment_meta const& s) { return s.segment_term(); },
-      [](segment_meta const& s) { return s.delta_offset_end(); },
-      [](segment_meta const& s) {
+      [](const segment_meta& s) { return static_cast<int64_t>(s.size_bytes); },
+      [](const segment_meta& s) { return s.base_offset(); },
+      [](const segment_meta& s) { return s.committed_offset(); },
+      [](const segment_meta& s) { return s.base_timestamp(); },
+      [](const segment_meta& s) { return s.max_timestamp(); },
+      [](const segment_meta& s) { return s.delta_offset(); },
+      [](const segment_meta& s) { return s.ntp_revision(); },
+      [](const segment_meta& s) { return s.archiver_term(); },
+      [](const segment_meta& s) { return s.segment_term(); },
+      [](const segment_meta& s) { return s.delta_offset_end(); },
+      [](const segment_meta& s) {
           return static_cast<std::underlying_type_t<segment_name_format>>(
             s.sname_format);
       },
-      [](segment_meta const& s) {
+      [](const segment_meta& s) {
           return static_cast<int64_t>(s.metadata_size_hint);
       },
     };
@@ -285,7 +287,8 @@ public:
 
         if (
           ix
-            % static_cast<uint32_t>(::details::FOR_buffer_depth * sampling_rate)
+            % static_cast<uint32_t>(
+              ::details::FOR_buffer_depth * cstore_sampling_rate)
           == 0) {
             // At the beginning of every row we need to collect
             // a set of hints to speed up the subsequent random
@@ -341,7 +344,7 @@ public:
                 // replacements either start before or exactly at 0
                 return size_t{0};
             }
-            auto candidate = _base_offset.find(offset_seg_it->first());
+            auto candidate = _base_offset.lower_bound(offset_seg_it->first());
             if (candidate.is_end()) {
                 // replacements are append only, return an index that will
                 // signal this
@@ -396,12 +399,11 @@ public:
           last_hint_tosave,
           _hints.end()};
 
-        auto unchanged_committed_offset
-          = replacement_store.last_committed_offset().value_or(
-            model::offset::min());
+        auto unchanged_base_offset = replacement_store._base_offset.last_value()
+                                       .value_or(model::offset::min()());
 
         // iterator pointing to first segment not cloned into replacement_store
-        auto old_segments_it = upper_bound(unchanged_committed_offset());
+        auto old_segments_it = upper_bound(unchanged_base_offset);
         auto old_segments_end = end();
 
         // merge replacements and old segments into new store
@@ -411,9 +413,9 @@ public:
             ++offset_seg_it;
 
             auto old_seg = dereference(old_segments_it);
-            // append old segments with committed offset smaller than
+            // append old segments with base_offset smaller than
             // replacement
-            while (old_seg.committed_offset < replacement_base_offset) {
+            while (old_seg.base_offset < replacement_base_offset) {
                 replacement_store.append(old_seg);
                 details::increment_all(old_segments_it);
                 if (old_segments_it == old_segments_end) {
@@ -551,8 +553,37 @@ public:
         }
         auto bo = *base_offset_iter;
         auto ix = base_offset_iter.index();
-        auto hint_it = _hints.lower_bound(bo);
-        if (hint_it == _hints.end() || hint_it->second == std::nullopt) {
+
+        auto maybe_hint = [&]() -> std::optional<hint_vec_t> {
+            // escape hatch: disable the use of _hints if their value causes
+            // std::out_of_bound exceptions.
+            if (unlikely(config::shard_local_cfg()
+                           .storage_ignore_cstore_hints.value())) {
+                return std::nullopt;
+            }
+
+            auto hint_it = _hints.lower_bound(bo);
+            if (hint_it == _hints.end() || hint_it->second == std::nullopt) {
+                return std::nullopt;
+            }
+
+            auto& hint_vec = hint_it->second.value();
+            auto hint_bo = hint_vec.at(
+              static_cast<size_t>(segment_meta_ix::base_offset));
+
+            // The hint can only be applied within the same column_store_frame
+            // instance. If the hint belongs to the previous frame we need to
+            // materialize without optimization.
+            if (_base_offset
+                  .get_frame_iterator_by_element_index(base_offset_iter.index())
+                  ->is_applicable(hint_bo)) {
+                return hint_vec;
+            }
+
+            return std::nullopt;
+        }();
+
+        if (!maybe_hint) {
             return iterators_t(
               _is_compacted.at_index(ix),
               _size_bytes.at_index(ix),
@@ -569,7 +600,7 @@ public:
               _metadata_size_hint.at_index(ix));
         }
 
-        auto hint = hint_it->second;
+        auto& hint = maybe_hint.value();
         return iterators_t(
           at_with_hint<segment_meta_ix::is_compacted>(_is_compacted, ix, hint),
           at_with_hint<segment_meta_ix::size_bytes>(_size_bytes, ix, hint),
@@ -702,7 +733,7 @@ public:
           [&](auto&... field) { (field_writer(field), ...); }, member_fields());
     }
 
-    void serde_read(iobuf_parser& in, serde::header const& h) {
+    void serde_read(iobuf_parser& in, const serde::header& h) {
         // hint_map_t (absl::btree_map) is not serde-enabled, read it as
         // size,[(key,value)...]
         auto field_reader = [&]<typename FieldType>(FieldType& f) {
@@ -744,7 +775,7 @@ public:
     auto unsafe_alias() const -> column_store {
         auto tmp = column_store{};
         details::tuple_map(
-          [](auto& lhs, auto const& rhs) { lhs = rhs.unsafe_alias(); },
+          [](auto& lhs, const auto& rhs) { lhs = rhs.unsafe_alias(); },
           tmp.columns(),
           columns());
         tmp._hints = _hints;
@@ -980,7 +1011,9 @@ public:
         if (_write_buffer.size() > 1) {
             auto not_replaced_segment = std::find_if(
               std::next(m_it), _write_buffer.end(), [&](auto& kv) {
-                  return kv.first > m.committed_offset;
+                  // first element with a committed offset that spans over the
+                  // range of m
+                  return kv.second.committed_offset > m.committed_offset;
               });
             // if(next(m_it) == not_replaced_segment) there is nothing to erase,
             // _write_buffer.erase would do nothing
@@ -1029,7 +1062,7 @@ public:
         flush_write_buffer();
         serde::write(out, std::exchange(_col, {}));
     }
-    void serde_read(iobuf_parser& in, serde::header const& h) {
+    void serde_read(iobuf_parser& in, const serde::header& h) {
         if (h._bytes_left_limit == in.bytes_left()) {
             return;
         }
@@ -1083,11 +1116,16 @@ segment_meta_cstore&
 segment_meta_cstore::operator=(segment_meta_cstore&&) noexcept
   = default;
 
-bool segment_meta_cstore::operator==(segment_meta_cstore const& oth) const {
-    // this overload of std::equal in clang stdlib works with const_iterator
-    // because it does not perform a copy of the iterator
-    return size() == oth.size()
-           && std::equal(begin(), end(), oth.begin(), std::equal_to{});
+bool segment_meta_cstore::operator==(const segment_meta_cstore& oth) const {
+    if (size() != oth.size()) {
+        return false;
+    }
+    for (auto lhs = begin(), rhs = oth.begin(); lhs != end(); ++lhs, ++rhs) {
+        if (*lhs != *rhs) {
+            return false;
+        }
+    }
+    return true;
 }
 
 segment_meta_cstore::const_iterator segment_meta_cstore::begin() const {
@@ -1140,7 +1178,7 @@ segment_meta_cstore::at_index(size_t ix) const {
     return const_iterator(_impl->at_index(ix));
 }
 
-auto segment_meta_cstore::prev(const_iterator const& it) const
+auto segment_meta_cstore::prev(const const_iterator& it) const
   -> const_iterator {
 #ifndef NDEBUG
     vassert(it != begin(), "prev called on a begin() iterator");

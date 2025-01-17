@@ -21,6 +21,7 @@ import (
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 	"github.com/twmb/franz-go/pkg/kerr"
+	"go.uber.org/zap"
 )
 
 func newAddPartitionsCommand(fs afero.Fs, p *config.Params) *cobra.Command {
@@ -31,7 +32,7 @@ func newAddPartitionsCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 		Short: "Add partitions to existing topics",
 		Args:  cobra.MinimumNArgs(1),
 		Long:  `Add partitions to existing topics.`,
-		Run: func(cmd *cobra.Command, topics []string) {
+		Run: func(_ *cobra.Command, topics []string) {
 			if !force {
 				for _, t := range topics {
 					if t == "__consumer_offsets" || t == "_schemas" || t == "__transaction_state" || t == "coprocessor_internal_topic" {
@@ -40,7 +41,7 @@ func newAddPartitionsCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 				}
 			}
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
 
 			adm, err := kafka.NewAdmin(fs, p)
 			out.MaybeDie(err, "unable to initialize kafka client: %v", err)
@@ -65,11 +66,19 @@ func newAddPartitionsCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 
 			for _, resp := range resps.Sorted() {
 				msg := "OK"
+				if resp.ErrMessage != "" {
+					zap.L().Sugar().Debugf("redpanda returned error message: %v", resp.ErrMessage)
+				}
 				if e := resp.Err; e != nil {
 					if errors.Is(e, kerr.InvalidPartitions) && num > 0 {
 						msg = fmt.Sprintf("INVALID_PARTITIONS: unable to add %d partitions due to hardware constraints", num)
 					} else {
 						msg = e.Error()
+						if ke := (*kerr.Error)(nil); errors.As(e, &ke) {
+							if resp.ErrMessage != "" {
+								msg = ke.Message + ": " + resp.ErrMessage
+							}
+						}
 					}
 					exit1 = true
 				}

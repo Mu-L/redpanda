@@ -12,6 +12,8 @@ package cloud
 import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/cloud/auth"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/cloud/byoc"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/cloud/cluster"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/cloud/resourcegroup"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
@@ -26,6 +28,8 @@ func NewCommand(fs afero.Fs, p *config.Params, execFn func(string, []string) err
 	cmd.AddCommand(
 		auth.NewCommand(fs, p),
 		byoc.NewCommand(fs, p, execFn),
+		cluster.NewCommand(fs, p),
+		resourcegroup.NewCommand(fs, p),
 		newLoginCommand(fs, p),
 		newLogoutCommand(fs, p),
 	)

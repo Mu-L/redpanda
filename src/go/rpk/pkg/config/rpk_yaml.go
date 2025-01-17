@@ -17,11 +17,12 @@ import (
 	"reflect"
 	"time"
 
+	"connectrpc.com/connect"
+	rpkos "github.com/redpanda-data/redpanda/src/go/rpk/pkg/os"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/publicapi"
 	"github.com/spf13/afero"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
-
-	rpkos "github.com/redpanda-data/redpanda/src/go/rpk/pkg/os"
 )
 
 // DefaultRpkYamlPath returns the OS equivalent of ~/.config/rpk/rpk.yaml, if
@@ -38,12 +39,13 @@ func defaultVirtualRpkYaml() (RpkYaml, error) {
 	path, _ := DefaultRpkYamlPath() // if err is non-nil, we fail in Write
 	y := RpkYaml{
 		fileLocation: path,
-		Version:      1,
+		Version:      6,
 		Profiles:     []RpkProfile{DefaultRpkProfile()},
 		CloudAuths:   []RpkCloudAuth{DefaultRpkCloudAuth()},
 	}
 	y.CurrentProfile = y.Profiles[0].Name
-	y.CurrentCloudAuth = y.CloudAuths[0].Name
+	y.CurrentCloudAuthOrgID = y.CloudAuths[0].OrgID
+	y.CurrentCloudAuthKind = y.CloudAuths[0].Kind
 	return y, nil
 }
 
@@ -60,14 +62,15 @@ func DefaultRpkProfile() RpkProfile {
 // auth exists.
 func DefaultRpkCloudAuth() RpkCloudAuth {
 	return RpkCloudAuth{
-		Name:        "default",
-		Description: "Default rpk cloud auth",
+		Name:         "default",
+		Organization: "Default organization",
+		OrgID:        "default-org-no-id",
 	}
 }
 
 func emptyVirtualRpkYaml() RpkYaml {
 	return RpkYaml{
-		Version: 1,
+		Version: 6,
 	}
 }
 
@@ -84,55 +87,62 @@ type (
 		// If we read a config with a newer version, we exit with a
 		// message saying "we don't know how to parse this, please
 		// upgrade rpk".
-		Version int `yaml:"version"`
+		Version int `json:"version" yaml:"version"`
 
-		Globals RpkGlobals `yaml:"globals,omitempty"`
+		Globals RpkGlobals `json:"globals" yaml:"globals"`
 
-		CurrentProfile   string         `yaml:"current_profile"`
-		CurrentCloudAuth string         `yaml:"current_cloud_auth"`
-		Profiles         []RpkProfile   `yaml:"profiles,omitempty"`
-		CloudAuths       []RpkCloudAuth `yaml:"cloud_auth,omitempty"`
+		CurrentProfile        string         `json:"current_profile" yaml:"current_profile"`
+		CurrentCloudAuthOrgID string         `json:"current_cloud_auth_org_id" yaml:"current_cloud_auth_org_id"`
+		CurrentCloudAuthKind  string         `json:"current_cloud_auth_kind" yaml:"current_cloud_auth_kind"`
+		Profiles              []RpkProfile   `json:"profiles" yaml:"profiles"`
+		CloudAuths            []RpkCloudAuth `json:"cloud_auth" yaml:"cloud_auth"`
 	}
 
 	RpkGlobals struct {
 		// Prompt is the prompt to use for all profiles, unless the
 		// profile itself overrides it.
-		Prompt string `yaml:"prompt"`
+		Prompt string `json:"prompt" yaml:"prompt"`
 
 		// NoDefaultCluster disables localhost:{9092,9644} as a default
 		// profile when no other is selected.
-		NoDefaultCluster bool `yaml:"no_default_cluster"`
+		NoDefaultCluster bool `json:"no_default_cluster" yaml:"no_default_cluster"`
+
+		// CommandTimeout is how long to allow commands to run, for
+		// certain potentially-slow commands.
+		CommandTimeout Duration `json:"command_timeout" yaml:"command_timeout"`
 
 		// DialTimeout is how long we allow for initiating a connection
 		// to brokers for the Admin API and Kafka API.
-		DialTimeout Duration `yaml:"dial_timeout"`
+		DialTimeout Duration `json:"dial_timeout" yaml:"dial_timeout"`
 
 		// RequestTimeoutOverhead, for Kafka API requests, how long do
 		// we give the request on top of any request's timeout field.
-		RequestTimeoutOverhead Duration `yaml:"request_timeout_overhead"`
+		RequestTimeoutOverhead Duration `json:"request_timeout_overhead" yaml:"request_timeout_overhead"`
 
 		// RetryTimeout allows us to retry requests. If see we need to
 		// retry before the retry timeout has elapsed, we do -- even if
 		// backing off after we know to retry pushes us past the
 		// timeout.
-		RetryTimeout Duration `yaml:"retry_timeout"`
+		RetryTimeout Duration `json:"retry_timeout" yaml:"retry_timeout"`
 
 		// FetchMaxWait is how long we give the broker to respond to
 		// fetch requests.
-		FetchMaxWait Duration `yaml:"fetch_max_wait"`
+		FetchMaxWait Duration `json:"fetch_max_wait" yaml:"fetch_max_wait"`
 
 		// KafkaProtocolReqClientID is the client ID to use for the Kafka API.
-		KafkaProtocolReqClientID string `yaml:"kafka_protocol_request_client_id"`
+		KafkaProtocolReqClientID string `json:"kafka_protocol_request_client_id" yaml:"kafka_protocol_request_client_id"`
 	}
 
 	RpkProfile struct {
-		Name         string           `yaml:"name"`
-		Description  string           `yaml:"description,omitempty"`
-		Prompt       string           `yaml:"prompt,omitempty"`
-		FromCloud    bool             `yaml:"from_cloud,omitempty"`
-		CloudCluster *RpkCloudCluster `yaml:"cloud_cluster,omitempty"`
-		KafkaAPI     RpkKafkaAPI      `yaml:"kafka_api,omitempty"`
-		AdminAPI     RpkAdminAPI      `yaml:"admin_api,omitempty"`
+		Name         string               `json:"name" yaml:"name"`
+		Description  string               `json:"description" yaml:"description"`
+		Prompt       string               `json:"prompt" yaml:"prompt"`
+		FromCloud    bool                 `json:"from_cloud" yaml:"from_cloud"`
+		CloudCluster RpkCloudCluster      `json:"cloud_cluster,omitempty" yaml:"cloud_cluster,omitempty"`
+		KafkaAPI     RpkKafkaAPI          `json:"kafka_api" yaml:"kafka_api"`
+		AdminAPI     RpkAdminAPI          `json:"admin_api" yaml:"admin_api"`
+		SR           RpkSchemaRegistryAPI `json:"schema_registry" yaml:"schema_registry"`
+		LicenseCheck *LicenseStatusCache  `json:"license_check,omitempty" yaml:"license_check,omitempty"`
 
 		// We stash the config struct itself so that we can provide
 		// the logger / dev overrides.
@@ -140,25 +150,42 @@ type (
 	}
 
 	RpkCloudCluster struct {
-		Namespace string `yaml:"namespace"`
-		Cluster   string `yaml:"cluster"`
-		Auth      string `yaml:"auth"`
+		Namespace     string `json:"namespace" yaml:"namespace"`
+		ResourceGroup string `json:"resource_group" yaml:"resource_group"`
+		ClusterID     string `json:"cluster_id" yaml:"cluster_id"`
+		ClusterName   string `json:"cluster_name" yaml:"cluster_name"`
+		AuthOrgID     string `json:"auth_org_id" yaml:"auth_org_id"`
+		AuthKind      string `json:"auth_kind" yaml:"auth_kind"`
+		ClusterType   string `json:"cluster_type" yaml:"cluster_type"`
+		ClusterURL    string `json:"cluster_url,omitempty" yaml:"cluster_url,omitempty"`
 	}
 
+	// RpkCloudAuth is unique by name and org ID. We support multiple auths
+	// per org ID in case a person wants to use client credentials and SSO.
 	RpkCloudAuth struct {
-		Name         string `yaml:"name"`
-		Description  string `yaml:"description,omitempty"`
-		AuthToken    string `yaml:"auth_token,omitempty"`
-		RefreshToken string `yaml:"refresh_token,omitempty"`
-		ClientID     string `yaml:"client_id,omitempty"`
-		ClientSecret string `yaml:"client_secret,omitempty"`
+		Name         string `json:"name" yaml:"name"`
+		Organization string `json:"organization" yaml:"organization"`
+		OrgID        string `json:"org_id" yaml:"org_id"`
+		Kind         string `json:"kind" yaml:"kind"`
+		AuthToken    string `json:"auth_token,omitempty" yaml:"auth_token,omitempty"`
+		RefreshToken string `json:"refresh_token,omitempty" yaml:"refresh_token,omitempty"`
+		ClientID     string `json:"client_id,omitempty" yaml:"client_id,omitempty"`
+		ClientSecret string `json:"client_secret,omitempty" yaml:"client_secret,omitempty"`
 	}
 
 	Duration struct{ time.Duration }
+
+	LicenseStatusCache struct {
+		LastUpdate int64 `json:"last_update" yaml:"last_update"`
+	}
 )
 
 // Profile returns the given profile, or nil if it does not exist.
+// This is safe to call even if y is nil.
 func (y *RpkYaml) Profile(name string) *RpkProfile {
+	if y == nil {
+		return nil
+	}
 	for i, p := range y.Profiles {
 		if p.Name == name {
 			return &y.Profiles[i]
@@ -167,71 +194,111 @@ func (y *RpkYaml) Profile(name string) *RpkProfile {
 	return nil
 }
 
-// PushProfile pushes a profile to the front and returns the profile's name.
-func (y *RpkYaml) PushProfile(p RpkProfile) string {
+// PushProfile pushes a profile to the front, updates the current profile, and
+// returns the prior profile's auth and the current profile's auth.
+func (y *RpkYaml) PushProfile(p RpkProfile) (priorAuth, currentAuth *RpkCloudAuth) {
+	priorAuth = y.CurrentAuth()
 	y.Profiles = append([]RpkProfile{p}, y.Profiles...)
-	return p.Name
+	if p.FromCloud {
+		y.CurrentCloudAuthOrgID = p.CloudCluster.AuthOrgID
+		y.CurrentCloudAuthKind = p.CloudCluster.AuthKind
+	}
+	currentAuth = y.CurrentAuth()
+	y.CurrentProfile = p.Name
+	return priorAuth, currentAuth
 }
 
 // MoveProfileToFront moves the given profile to the front of the list.
-func (y *RpkYaml) MoveProfileToFront(p *RpkProfile) {
-	reordered := []RpkProfile{*p}
+func (y *RpkYaml) MoveProfileToFront(p **RpkProfile) (priorAuth, currentAuth *RpkCloudAuth) {
+	priorAuth = y.CurrentAuth()
+	reordered := []RpkProfile{**p}
 	for i := range y.Profiles {
-		if &y.Profiles[i] == p {
+		if &y.Profiles[i] == *p {
 			continue
 		}
 		reordered = append(reordered, y.Profiles[i])
 	}
 	y.Profiles = reordered
+	*p = &reordered[0]
+	y.CurrentProfile = (*p).Name
+
+	// If this is a cloud profile, we switch the auth as well.
+	if (*p).FromCloud {
+		y.CurrentCloudAuthOrgID = (*p).CloudCluster.AuthOrgID
+		y.CurrentCloudAuthKind = (*p).CloudCluster.AuthKind
+	}
+	currentAuth = y.CurrentAuth()
+	return priorAuth, currentAuth
 }
 
-// Auth returns the given auth, or nil if it does not exist.
-func (y *RpkYaml) Auth(name string) *RpkCloudAuth {
+// LookupAuth returns an RpkCloudAuth based on the org and kind.
+func (y *RpkYaml) LookupAuth(org, kind string) *RpkCloudAuth {
 	for i, a := range y.CloudAuths {
-		if a.Name == name {
+		if a.OrgID == org && a.Kind == kind {
 			return &y.CloudAuths[i]
 		}
 	}
 	return nil
 }
 
-// PushAuth pushes an auth to the front and returns the auth's name.
-func (y *RpkYaml) PushAuth(a RpkCloudAuth) string {
+// PushNewAuth pushes an auth to the front and sets it as the current auth.
+func (y *RpkYaml) PushNewAuth(a RpkCloudAuth) {
 	y.CloudAuths = append([]RpkCloudAuth{a}, y.CloudAuths...)
-	return a.Name
+	y.CurrentCloudAuthOrgID = a.OrgID
+	y.CurrentCloudAuthKind = a.Kind
 }
 
-// MoveAuthToFront moves the given auth to the front of the list.
-func (y *RpkYaml) MoveAuthToFront(a *RpkCloudAuth) {
-	reordered := []RpkCloudAuth{*a}
+// MakeAuthCurrent finds the given auth, moves it to the front, and updates
+// the current cloud auth fields. This pointer must exist, if it does not,
+// this function panics.
+// This updates *a to point to the new address of the auth.
+func (y *RpkYaml) MakeAuthCurrent(a **RpkCloudAuth) {
+	reordered := []RpkCloudAuth{**a}
+	var found bool
 	for i := range y.CloudAuths {
-		if &y.CloudAuths[i] == a {
+		if &y.CloudAuths[i] == *a {
+			found = true
 			continue
 		}
 		reordered = append(reordered, y.CloudAuths[i])
 	}
+	if !found {
+		panic("MakeAuthCurrent called with an auth that does not exist")
+	}
+	*a = &reordered[0]
 	y.CloudAuths = reordered
+	y.CurrentCloudAuthOrgID = (*a).OrgID
+	y.CurrentCloudAuthKind = (*a).Kind
 }
 
-type CloudAuthKind string
-
-const (
-	CloudAuthUninitialized     CloudAuthKind = "uninitialized"
-	CloudAuthSSO               CloudAuthKind = "sso"
-	CloudAuthClientCredentials CloudAuthKind = "client-credentials"
-)
-
-// Kind returns either a known auth kind or "uninitialized".
-func (a *RpkCloudAuth) Kind() (CloudAuthKind, bool) {
-	switch {
-	case a.ClientID != "" && a.ClientSecret != "":
-		return CloudAuthClientCredentials, true
-	case a.ClientID != "":
-		return CloudAuthSSO, true
-	default:
-		return CloudAuthUninitialized, false
+// DropAuth removes the given auth from the list of auths. If this was the
+// current auth, this clears the current auth.
+func (y *RpkYaml) DropAuth(a *RpkCloudAuth) {
+	dropped := y.CloudAuths[:0]
+	for i := range y.CloudAuths {
+		if &y.CloudAuths[i] == a {
+			continue
+		}
+		dropped = append(dropped, y.CloudAuths[i])
+	}
+	y.CloudAuths = dropped
+	if y.CurrentCloudAuthOrgID == a.OrgID && y.CurrentCloudAuthKind == a.Kind {
+		y.CurrentCloudAuthOrgID = ""
+		y.CurrentCloudAuthKind = ""
 	}
 }
+
+// CurrentAuth returns the auth corresponding to the current cloud auth, if
+// it exists.
+func (y *RpkYaml) CurrentAuth() *RpkCloudAuth {
+	return y.LookupAuth(y.CurrentCloudAuthOrgID, y.CurrentCloudAuthKind)
+}
+
+const (
+	CloudAuthUninitialized     = ""
+	CloudAuthSSO               = "sso"
+	CloudAuthClientCredentials = "client-credentials"
+)
 
 ///////////
 // FUNCS //
@@ -255,7 +322,7 @@ func (p *RpkProfile) Defaults() *RpkGlobals {
 
 // CurrentAuth returns the current cloud Auth.
 func (p *RpkProfile) CurrentAuth() *RpkCloudAuth {
-	return p.c.rpkYaml.Auth(p.c.rpkYaml.CurrentCloudAuth)
+	return p.c.rpkYaml.LookupAuth(p.c.rpkYaml.CurrentCloudAuthOrgID, p.c.rpkYaml.CurrentCloudAuthKind)
 }
 
 // DevOverrides returns any configured dev overrides.
@@ -269,10 +336,56 @@ func (p *RpkProfile) HasSASLCredentials() bool {
 	return s != nil && s.User != "" && s.Password != ""
 }
 
-// HasClientCredentials returns if both ClientID and ClientSecret are empty.
+// ActualAuth returns the actual cloud auth for this profile, if it exists.
+func (p *RpkProfile) ActualAuth() *RpkCloudAuth {
+	if p == nil {
+		return nil
+	}
+	return p.c.rpkYamlActual.LookupAuth(p.CloudCluster.AuthOrgID, p.CloudCluster.AuthKind)
+}
+
+// VirtualAuth returns the virtual cloud auth for this profile if
+// this profile is for a cloud cluster (following the newer scheme
+// of the CloudCluster field).
+func (p *RpkProfile) VirtualAuth() *RpkCloudAuth {
+	if p == nil {
+		return nil
+	}
+	return p.c.rpkYaml.LookupAuth(p.CloudCluster.AuthOrgID, p.CloudCluster.AuthKind)
+}
+
+func (p *RpkProfile) ActualConfig() (*RpkYaml, bool) {
+	if p.c == nil {
+		return nil, false
+	}
+	return p.c.ActualRpkYaml()
+}
+
+// DataplaneClient creates a publicapi.DataPlaneClientSet with the information
+// loaded in the profile.
+func (p *RpkProfile) DataplaneClient(opts ...connect.ClientOption) (*publicapi.DataPlaneClientSet, error) {
+	url, err := p.CloudCluster.CheckClusterURL()
+	if err != nil {
+		return nil, fmt.Errorf("unable to get cluster information from your profile: %v", err)
+	}
+	return publicapi.NewDataPlaneClientSet(url, p.CurrentAuth().AuthToken, opts...)
+}
+
+// HasClientCredentials returns if both ClientID and ClientSecret are non-empty.
 func (a *RpkCloudAuth) HasClientCredentials() bool {
-	k, _ := a.Kind()
-	return k == CloudAuthClientCredentials
+	return a.ClientID != "" && a.ClientSecret != ""
+}
+
+// Equals returns if the two cloud auths are the same, which is true
+// if the name matches (the name embeds the org name, ID, and auth kind).
+func (a *RpkCloudAuth) Equals(other *RpkCloudAuth) bool {
+	if a == nil && other == nil {
+		return true
+	}
+	if a == nil || other == nil {
+		return false
+	}
+	return a.Name == other.Name
 }
 
 // Returns if the raw config is the same as the one in memory.
@@ -323,6 +436,37 @@ func (y *RpkYaml) WriteAt(fs afero.Fs, path string) error {
 	return rpkos.ReplaceFile(fs, path, b, 0o644)
 }
 
+// FullName returns "resource_group/cluster_name".
+func (c *RpkCloudCluster) FullName() string {
+	return fmt.Sprintf("%s/%s", c.ResourceGroup, c.ClusterName)
+}
+
+// HasAuth returns if the cluster has the given auth.
+// This is ok to call even if c is nil.
+func (c *RpkCloudCluster) HasAuth(a RpkCloudAuth) bool {
+	if c == nil {
+		return false
+	}
+	return c.AuthOrgID == a.OrgID && c.AuthKind == a.Kind
+}
+
+func (c *RpkCloudCluster) IsServerless() bool {
+	return c != nil && c.ClusterType == publicapi.ServerlessClusterType
+}
+
+func (c *RpkCloudCluster) CheckClusterURL() (string, error) {
+	if c == nil {
+		return "", fmt.Errorf("cluster information not present in current profile; please delete and re-create the current profile with 'rpk profile create --from-cloud'")
+	}
+	if c.ClusterURL == "" {
+		if c.ClusterID != "" {
+			return "", fmt.Errorf("cluster URL not present in profile; please delete and re-create the current profile with 'rpk profile create <name> --from-cloud=%v'", c.ClusterID)
+		}
+		return "", errors.New("cluster URL not present in profile; please delete and re-create the current profile with 'rpk profile create --from-cloud' and selecting this cluster")
+	}
+	return c.ClusterURL, nil
+}
+
 ////////////////
 // MISC TYPES //
 ////////////////
@@ -340,3 +484,38 @@ func (d *Duration) UnmarshalText(text []byte) error {
 }
 
 func (*Duration) YamlTypeNameForTest() string { return "duration" }
+
+/////////////////////
+// GLOBALS GETTERS //
+/////////////////////
+
+// GetCommandTimeout returns the command timeout, or 10s if none is set.
+func (g *RpkGlobals) GetCommandTimeout() time.Duration {
+	if g.CommandTimeout.Duration == 0 {
+		return 10 * time.Second
+	}
+	return g.CommandTimeout.Duration
+}
+
+//////////
+// MISC //
+//////////
+
+// MaybePrintAuthSwitchMessage prints a message if the prior and current
+// auths are different.
+func MaybePrintAuthSwitchMessage(priorAuth *RpkCloudAuth, currentAuth *RpkCloudAuth) {
+	if priorAuth == nil {
+		if currentAuth == nil {
+			return
+		}
+		fmt.Printf("rpk cloud commands are now talking to organization %q (%s).\n", currentAuth.Organization, currentAuth.OrgID)
+		return
+	}
+	if currentAuth == nil {
+		fmt.Printf("rpk cloud commands are no longer talking to organization %q (%s) and are now talking to a self hosted cluster.\n", priorAuth.Organization, priorAuth.OrgID)
+		return
+	}
+	if priorAuth.Name != currentAuth.Name {
+		fmt.Printf("rpk switched from talking to organization %q (%s) to %q (%s).\n", priorAuth.Organization, priorAuth.OrgID, currentAuth.Organization, currentAuth.OrgID)
+	}
+}

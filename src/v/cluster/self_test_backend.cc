@@ -11,10 +11,11 @@
 
 #include "cluster/self_test_backend.h"
 
+#include "base/seastarx.h"
+#include "base/vlog.h"
 #include "cluster/logger.h"
-#include "seastarx.h"
+#include "json/document.h"
 #include "ssx/future-util.h"
-#include "vlog.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
@@ -28,36 +29,51 @@ self_test_backend::self_test_backend(
   model::node_id self,
   ss::sharded<node::local_monitor>& nlm,
   ss::sharded<rpc::connection_cache>& connections,
+  ss::sharded<cloud_storage::remote>& cloud_storage_api,
   ss::scheduling_group sg)
   : _self(self)
   , _st_sg(sg)
   , _disk_test(nlm)
-  , _network_test(self, connections) {}
+  , _network_test(self, connections)
+  , _cloud_test(cloud_storage_api) {}
 
 ss::future<> self_test_backend::start() {
     co_await _disk_test.start();
     co_await _network_test.start();
+    co_await _cloud_test.start();
 }
 
 ss::future<> self_test_backend::stop() {
     auto f = _gate.close();
     co_await _disk_test.stop();
     co_await _network_test.stop();
+    co_await _cloud_test.stop();
     co_await _lock.get_units(); /// Ensure outstanding work is completed
     co_await std::move(f);
 }
 
-ss::future<std::vector<self_test_result>> self_test_backend::do_start_test(
-  std::vector<diskcheck_opts> dtos, std::vector<netcheck_opts> ntos) {
+ss::future<std::vector<self_test_result>>
+self_test_backend::do_start_test(start_test_request r) {
     auto gate_holder = _gate.hold();
     std::vector<self_test_result> results;
+
+    parse_self_test_checks(r);
+
+    auto dtos = std::move(r.dtos);
+    auto ntos = std::move(r.ntos);
+    auto ctos = std::move(r.ctos);
+    auto unparsed_checks = std::move(r.unparsed_checks);
+
+    _stage = self_test_stage::disk;
     for (auto& dto : dtos) {
         try {
             dto.sg = _st_sg;
             if (!_cancelling) {
-                auto dtr = co_await _disk_test.run(dto).then(
-                  [](auto result) { return result; });
-                std::copy(dtr.begin(), dtr.end(), std::back_inserter(results));
+                auto dtr = co_await _disk_test.run(dto);
+                results.insert(
+                  results.end(),
+                  std::make_move_iterator(dtr.begin()),
+                  std::make_move_iterator(dtr.end()));
             } else {
                 results.push_back(self_test_result{
                   .name = dto.name,
@@ -75,15 +91,18 @@ ss::future<std::vector<self_test_result>> self_test_backend::do_start_test(
               .name = dto.name, .test_type = "disk", .error = ex.what()});
         }
     }
+
+    _stage = self_test_stage::net;
     for (auto& nto : ntos) {
         try {
             if (!nto.peers.empty()) {
                 nto.sg = _st_sg;
                 if (!_cancelling) {
-                    auto ntr = co_await _network_test.run(nto).then(
-                      [](auto results) { return results; });
-                    std::copy(
-                      ntr.begin(), ntr.end(), std::back_inserter(results));
+                    auto ntr = co_await _network_test.run(nto);
+                    results.insert(
+                      results.end(),
+                      std::make_move_iterator(ntr.begin()),
+                      std::make_move_iterator(ntr.end()));
                 } else {
                     results.push_back(self_test_result{
                       .name = nto.name,
@@ -108,6 +127,45 @@ ss::future<std::vector<self_test_result>> self_test_backend::do_start_test(
               .name = nto.name, .test_type = "network", .error = ex.what()});
         }
     }
+
+    _stage = self_test_stage::cloud;
+    for (auto& cto : ctos) {
+        try {
+            cto.sg = _st_sg;
+            if (!_cancelling) {
+                auto ctr = co_await _cloud_test.run(cto);
+                results.insert(
+                  results.end(),
+                  std::make_move_iterator(ctr.begin()),
+                  std::make_move_iterator(ctr.end()));
+            } else {
+                results.push_back(self_test_result{
+                  .name = cto.name,
+                  .test_type = "cloud",
+                  .warning = "Cloud self test prevented from starting due to "
+                             "cancel signal"});
+            }
+        } catch (const std::exception& ex) {
+            vlog(
+              clusterlog.error,
+              "Cloud self test finished with error: {} - options: {}",
+              ex.what(),
+              cto);
+            results.push_back(self_test_result{
+              .name = cto.name, .test_type = "cloud", .error = ex.what()});
+        }
+    }
+
+    for (const auto& unparsed_check : unparsed_checks) {
+        results.push_back(self_test_result{
+          .name = "Unknown",
+          .test_type = unparsed_check.test_type,
+          .error = fmt::format(
+            "Unknown test type {} requested on node {}",
+            unparsed_check.test_type,
+            _self)});
+    }
+
     co_return results;
 }
 
@@ -120,16 +178,16 @@ get_status_response self_test_backend::start_test(start_test_request req) {
           clusterlog.debug, "Request to start self-tests with id: {}", req.id);
         ssx::background
           = ssx::spawn_with_gate_then(_gate, [this, req = std::move(req)]() {
-                return do_start_test(req.dtos, req.ntos)
-                  .then([this, id = req.id](auto results) {
-                      for (auto& r : results) {
-                          r.test_id = id;
-                      }
-                      _prev_run = get_status_response{
-                        .id = id,
-                        .status = self_test_status::idle,
-                        .results = std::move(results)};
-                  });
+                return do_start_test(std::move(req)).then([this](auto results) {
+                    for (auto& r : results) {
+                        r.test_id = _id;
+                    }
+                    _prev_run = get_status_response{
+                      .id = _id,
+                      .status = self_test_status::idle,
+                      .results = std::move(results),
+                      .stage = _stage};
+                });
             }).finally([units = std::move(units)] {});
     } else {
         vlog(
@@ -148,6 +206,7 @@ ss::future<get_status_response> self_test_backend::stop_test() {
     _cancelling = true;
     _disk_test.cancel();
     _network_test.cancel();
+    _cloud_test.cancel();
     try {
         /// When lock is released, the 'then' block above will set the _prev_run
         /// var with the finalized test results from the cancelled run.
@@ -158,13 +217,13 @@ ss::future<get_status_response> self_test_backend::stop_test() {
         vlog(clusterlog.warn, "Failed to stop self tests within 5s timeout");
     }
     co_return get_status_response{
-      .id = _id, .status = self_test_status::running};
+      .id = _id, .status = self_test_status::running, .stage = _stage};
 }
 
 get_status_response self_test_backend::get_status() const {
     if (!_lock.ready()) {
         return get_status_response{
-          .id = _id, .status = self_test_status::running};
+          .id = _id, .status = self_test_status::running, .stage = _stage};
     }
     return _prev_run;
 }

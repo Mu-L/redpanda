@@ -10,15 +10,19 @@
 
 #include "cloud_roles/refresh_credentials.h"
 
-#include "cloud_roles/aws_refresh_impl.h"
-#include "cloud_roles/aws_sts_refresh_impl.h"
-#include "cloud_roles/gcp_refresh_impl.h"
+#include "aws_refresh_impl.h"
+#include "aws_sts_refresh_impl.h"
+#include "azure_aks_refresh_impl.h"
+#include "azure_vm_refresh_impl.h"
+#include "base/vlog.h"
 #include "cloud_roles/logger.h"
 #include "config/configuration.h"
+#include "config/tls_config.h"
+#include "gcp_refresh_impl.h"
 #include "model/metadata.h"
 #include "net/tls.h"
-#include "utils/gate_guard.h"
-#include "vlog.h"
+#include "net/tls_certificate_probe.h"
+#include "ssx/future-util.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/gate.hh>
@@ -36,7 +40,7 @@ static constexpr std::string_view override_address = "RP_SI_CREDS_API_ADDRESS";
 /// Multiplier to derive sleep duration from expiry time. Leaves 0.1 * expiry
 /// seconds as buffer to make API calls. For default expiry of 1 hour, this
 /// results in a fetch after 54 minutes.
-constexpr float sleep_from_expiry_multiplier = 0.9;
+constexpr double sleep_from_expiry_multiplier = 0.9;
 constexpr std::chrono::milliseconds max_retry_interval_ms{300000};
 
 refresh_credentials::refresh_credentials(
@@ -169,7 +173,7 @@ ss::future<> refresh_credentials::fetch_and_update_credentials() {
     // 2. sleep until we are close to expiry of credentials
     // 3. sleep in case of retryable failure for a short duration
 
-    gate_guard g{_gate};
+    auto g = _gate.hold();
 
     co_await sleep_until_expiry();
 
@@ -223,7 +227,8 @@ std::chrono::milliseconds
 refresh_credentials::impl::calculate_sleep_duration(uint32_t expiry_sec) const {
     vlog(
       clrl_log.trace, "calculating sleep duration from {} seconds", expiry_sec);
-    int sleep = std::floor(expiry_sec * sleep_from_expiry_multiplier);
+    auto sleep = static_cast<uint32_t>(
+      std::floor(expiry_sec * sleep_from_expiry_multiplier));
     vlog(
       clrl_log.trace, "sleep duration adjusted with buffer: {} seconds", sleep);
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -232,14 +237,17 @@ refresh_credentials::impl::calculate_sleep_duration(uint32_t expiry_sec) const {
 
 std::chrono::milliseconds refresh_credentials::impl::calculate_sleep_duration(
   std::chrono::system_clock::time_point expires_at) const {
-    vlog(
-      clrl_log.trace,
-      "calculating sleep duration for credential expiry at: {}",
-      expires_at.time_since_epoch());
     auto now = std::chrono::system_clock::now();
     auto diff = std::chrono::duration_cast<std::chrono::seconds>(
                   expires_at - now)
                   .count();
+    if (diff < 0) {
+        vlog(
+          clrl_log.warn,
+          "negative sleep duration changed from {} to 10 seconds",
+          diff);
+        diff = 10;
+    }
     vlog(
       clrl_log.trace,
       "calculating sleep duration for credential expiry at: {}, now: {}, diff "
@@ -310,11 +318,11 @@ ss::future<> refresh_credentials::impl::sleep_until_expiry() const {
     }
 }
 
-ss::future<http::client>
-refresh_credentials::impl::make_api_client(client_tls_enabled enable_tls) {
+ss::future<http::client> refresh_credentials::impl::make_api_client(
+  ss::sstring name, client_tls_enabled enable_tls) {
     if (enable_tls == client_tls_enabled::yes) {
         if (_tls_certs == nullptr) {
-            co_await init_tls_certs();
+            co_await init_tls_certs(std::move(name));
         }
 
         co_return http::client{
@@ -336,9 +344,11 @@ refresh_credentials::impl::make_api_client(client_tls_enabled enable_tls) {
       _as};
 }
 
-ss::future<> refresh_credentials::impl::init_tls_certs() {
+ss::future<> refresh_credentials::impl::init_tls_certs(ss::sstring name) {
     ss::tls::credentials_builder b;
     b.set_client_auth(ss::tls::client_auth::NONE);
+    b.set_minimum_tls_version(
+      config::from_config(config::shard_local_cfg().tls_min_version()));
 
     if (auto trust_file_path
         = config::shard_local_cfg().cloud_storage_trust_file.value();
@@ -355,11 +365,13 @@ ss::future<> refresh_credentials::impl::init_tls_certs() {
         co_await b.set_x509_trust_file(
           ca_file.value(), ss::tls::x509_crt_format::PEM);
     } else {
-        vlog(clrl_log.info, "Using GnuTLS default");
+        vlog(clrl_log.info, "Using system default");
         co_await b.set_system_trust();
     }
 
-    _tls_certs = co_await b.build_reloadable_certificate_credentials();
+    _tls_certs = co_await net::build_reloadable_credentials_with_probe<
+      ss::tls::certificate_credentials>(
+      std::move(b), "cloud_provider_client", std::move(name));
 }
 
 refresh_credentials make_refresh_credentials(
@@ -393,6 +405,20 @@ refresh_credentials make_refresh_credentials(
           retry_params);
     case model::cloud_credentials_source::gcp_instance_metadata:
         return make_refresh_credentials<gcp_refresh_impl>(
+          as,
+          std::move(creds_update_cb),
+          std::move(region),
+          std::move(endpoint),
+          retry_params);
+    case model::cloud_credentials_source::azure_aks_oidc_federation:
+        return make_refresh_credentials<azure_aks_refresh_impl>(
+          as,
+          std::move(creds_update_cb),
+          std::move(region),
+          std::move(endpoint),
+          retry_params);
+    case model::cloud_credentials_source::azure_vm_instance_metadata:
+        return make_refresh_credentials<azure_vm_refresh_impl>(
           as,
           std::move(creds_update_cb),
           std::move(region),

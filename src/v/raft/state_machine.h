@@ -10,13 +10,12 @@
  */
 
 #pragma once
+#include "base/outcome.h"
+#include "base/seastarx.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
 #include "model/record.h"
-#include "outcome.h"
 #include "raft/offset_monitor.h"
-#include "raft/types.h"
-#include "seastarx.h"
+#include "raft/replicate.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/file.hh>
@@ -120,6 +119,7 @@ protected:
 
     consensus* _raft;
     ss::gate _gate;
+    ss::abort_source _as;
 
 private:
     class batch_applicator {
@@ -135,13 +135,13 @@ private:
     friend batch_applicator;
 
     ss::future<> apply();
+    ss::future<> maybe_apply_raft_snapshot();
     bool stop_batch_applicator();
 
     ss::io_priority_class _io_prio;
     ss::logger& _log;
     offset_monitor _waiters;
     model::offset _next;
-    ss::abort_source _as;
     model::offset _bootstrap_last_applied;
 };
 

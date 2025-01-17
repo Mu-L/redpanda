@@ -9,25 +9,28 @@
 
 #include "raft/consensus.h"
 
+#include "base/likely.h"
+#include "base/vlog.h"
+#include "bytes/iostream.h"
 #include "config/configuration.h"
 #include "config/property.h"
-#include "likely.h"
+#include "metrics/prometheus_sanitize.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
+#include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/record_batch_types.h"
 #include "model/timeout_clock.h"
-#include "prometheus/prometheus_sanitize.h"
 #include "raft/consensus_client_protocol.h"
 #include "raft/consensus_utils.h"
 #include "raft/errc.h"
 #include "raft/group_configuration.h"
 #include "raft/logger.h"
-#include "raft/prevote_stm.h"
 #include "raft/recovery_stm.h"
 #include "raft/replicate_entries_stm.h"
 #include "raft/rpc_client_protocol.h"
+#include "raft/state_machine_manager.h"
 #include "raft/types.h"
 #include "raft/vote_stm.h"
 #include "reflection/adl.h"
@@ -35,13 +38,16 @@
 #include "ssx/future-util.h"
 #include "storage/api.h"
 #include "storage/kvstore.h"
-#include "vlog.h"
+#include "storage/ntp_config.h"
+#include "storage/snapshot.h"
+#include "storage/types.h"
 
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/metrics.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/util/defer.hh>
 
@@ -49,7 +55,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <iterator>
+#include <optional>
+#include <ranges>
 #include <system_error>
 
 template<>
@@ -93,12 +102,14 @@ consensus::consensus(
   ss::shared_ptr<storage::log> l,
   scheduling_config scheduling_config,
   config::binding<std::chrono::milliseconds> disk_timeout,
+  config::binding<bool> enable_longest_log_detection,
   consensus_client_protocol client,
   consensus::leader_cb_t cb,
   storage::api& storage,
   std::optional<std::reference_wrapper<coordinated_recovery_throttle>>
     recovery_throttle,
   recovery_memory_quota& recovery_mem_quota,
+  recovery_scheduler& recovery_scheduler,
   features::feature_table& ft,
   std::optional<voter_priority> voter_priority_override,
   keep_snapshotted_log should_keep_snapshotted_log)
@@ -106,19 +117,12 @@ consensus::consensus(
   , _group(group)
   , _jit(std::move(jit))
   , _log(l)
-  , _offset_translator(
-      offset_translator_batch_types(_log->config().ntp()),
-      group,
-      _log->config().ntp(),
-      storage)
   , _scheduling(scheduling_config)
   , _disk_timeout(std::move(disk_timeout))
+  , _enable_longest_log_detection(std::move(enable_longest_log_detection))
   , _client_protocol(client)
   , _leader_notification(std::move(cb))
-  , _fstats(
-      _self,
-      config::shard_local_cfg()
-        .raft_max_concurrent_append_requests_per_follower())
+  , _fstats(_self)
   , _batcher(this, config::shard_local_cfg().raft_replicate_batch_window_size())
   , _event_manager(this)
   , _probe(std::make_unique<probe>())
@@ -132,6 +136,7 @@ consensus::consensus(
   , _storage(storage)
   , _recovery_throttle(recovery_throttle)
   , _recovery_mem_quota(recovery_mem_quota)
+  , _recovery_scheduler(recovery_scheduler)
   , _features(ft)
   , _snapshot_mgr(
       std::filesystem::path(_log->config().work_directory()),
@@ -140,13 +145,21 @@ consensus::consensus(
   , _configuration_manager(std::move(initial_cfg), _group, _storage, _ctxlog)
   , _node_priority_override(voter_priority_override)
   , _keep_snapshotted_log(should_keep_snapshotted_log)
-  , _append_requests_buffer(*this, 256) {
+  , _append_requests_buffer(*this, 256)
+  , _write_caching_enabled(log_config().write_caching())
+  , _max_pending_flush_bytes(log_config().flush_bytes())
+  , _max_flush_delay(compute_max_flush_delay())
+  , _replication_monitor(this) {
     setup_metrics();
     setup_public_metrics();
     update_follower_stats(_configuration_manager.get_latest());
     _vote_timeout.set_callback([this] {
         maybe_step_down();
         dispatch_vote(false);
+    });
+    _deferred_flusher.set_callback([this]() {
+        ssx::spawn_with_gate(
+          _bg, [this]() { return do_flush().discard_result(); });
     });
 }
 
@@ -159,29 +172,28 @@ void consensus::setup_metrics() {
 
     _probe->setup_metrics(_log->config().ntp());
     auto labels = probe::create_metric_labels(_log->config().ntp());
-    auto aggregate_labels = config::shard_local_cfg().aggregate_metrics()
-                              ? std::vector<sm::label>{sm::shard_label}
-                              : std::vector<sm::label>{};
 
     _metrics.add_group(
       prometheus_sanitize::metrics_name("raft"),
-      {sm::make_gauge(
-         "leader_for",
-         [this] { return is_elected_leader(); },
-         sm::description("Number of groups for which node is a leader"),
-         labels)
-         .aggregate(aggregate_labels),
-       sm::make_gauge(
-         "configuration_change_in_progress",
-         [this] {
-             return is_elected_leader()
-                    && _configuration_manager.get_latest().get_state()
-                         != configuration_state::simple;
-         },
-         sm::description("Indicates if current raft group configuration is in "
-                         "joint state i.e. configuration is being changed"),
-         labels)
-         .aggregate(aggregate_labels)});
+      {
+        sm::make_gauge(
+          "leader_for",
+          [this] { return is_elected_leader(); },
+          sm::description("Number of groups for which node is a leader"),
+          labels),
+        sm::make_gauge(
+          "configuration_change_in_progress",
+          [this] {
+              return is_elected_leader()
+                     && _configuration_manager.get_latest().get_state()
+                          != configuration_state::simple;
+          },
+          sm::description("Indicates if current raft group configuration is in "
+                          "joint state i.e. configuration is being changed"),
+          labels),
+      },
+      {},
+      {sm::shard_label, sm::label("partition")});
 }
 
 void consensus::setup_public_metrics() {
@@ -207,8 +219,14 @@ void consensus::do_step_down(std::string_view ctx) {
 }
 
 void consensus::maybe_step_down() {
+    // ignore stepdown if we are not the leader
+    if (_vstate != vote_state::leader) {
+        return;
+    }
+
     ssx::spawn_with_gate(_bg, [this] {
         return _op_lock.with([this] {
+            // check again while holding a lock
             if (_vstate == vote_state::leader) {
                 auto majority_hbeat = majority_heartbeat();
                 if (majority_hbeat < _became_leader_at) {
@@ -252,17 +270,23 @@ void consensus::shutdown_input() {
     }
 }
 
-ss::future<> consensus::stop() {
+ss::future<xshard_transfer_state> consensus::stop() {
     vlog(_ctxlog.info, "Stopping");
     shutdown_input();
     for (auto& idx : _fstats) {
         idx.second.follower_state_change.broken();
     }
+    co_await _replication_monitor.stop();
     co_await _event_manager.stop();
+    if (_stm_manager) {
+        co_await _stm_manager->stop();
+    }
     co_await _append_requests_buffer.stop();
     co_await _batcher.stop();
 
+    _election_lock.broken();
     _op_lock.broken();
+    _deferred_flusher.cancel();
     co_await _bg.close();
 
     // close writer if we have to
@@ -270,6 +294,17 @@ ss::future<> consensus::stop() {
         co_await _snapshot_writer->close();
         _snapshot_writer.reset();
     }
+    /**
+     * Clear metrics after consensus instance is stopped.
+     */
+    _metrics.clear();
+    _probe->clear();
+
+    std::optional<model::term_id> leader_term;
+    if (is_elected_leader()) {
+        leader_term = _term;
+    }
+    co_return xshard_transfer_state{.leader_term = leader_term};
 }
 
 consensus::success_reply consensus::update_follower_index(
@@ -303,7 +338,14 @@ consensus::success_reply consensus::update_follower_index(
         // current node may change it.
         return success_reply::yes;
     }
-    auto config = _configuration_manager.get_latest();
+
+    if (unlikely(r.value().result == reply_result::follower_busy)) {
+        // ignore this response, timed out on the receiver node
+        vlog(_ctxlog.trace, "Follower busy on node {}", node.id());
+        return success_reply::no;
+    }
+
+    const auto& config = _configuration_manager.get_latest();
     if (!config.contains(node)) {
         // We might have sent an append_entries just before removing
         // a node from configuration: ignore its reply, to avoid
@@ -311,7 +353,7 @@ consensus::success_reply consensus::update_follower_index(
         vlog(
           _ctxlog.debug,
           "Ignoring reply from node {}, it is not in members list",
-          physical_node);
+          node);
         return success_reply::no;
     }
 
@@ -335,17 +377,10 @@ consensus::success_reply consensus::update_follower_index(
           "Received append entries response node_id doesn't match expected "
           "node_id (received: {}, expected: {})",
           reply.node_id.id(),
-          node);
+          physical_node);
         return success_reply::no;
     }
-
-    if (unlikely(reply.result == append_entries_reply::status::timeout)) {
-        // ignore this response, timed out on the receiver node
-        vlog(_ctxlog.trace, "Append entries request timedout at node {}", node);
-        return success_reply::no;
-    }
-    if (unlikely(
-          reply.result == append_entries_reply::status::group_unavailable)) {
+    if (unlikely(reply.result == reply_result::group_unavailable)) {
         // ignore this response since group is not yet bootstrapped at the
         // follower
         vlog(_ctxlog.trace, "Raft group not yet initialized at node {}", node);
@@ -365,7 +400,7 @@ consensus::success_reply consensus::update_follower_index(
         return success_reply::no;
     }
 
-    update_node_reply_timestamp(node);
+    idx.last_received_reply_timestamp = clock_type::now();
 
     if (
       seq < idx.last_received_seq
@@ -428,11 +463,11 @@ consensus::success_reply consensus::update_follower_index(
         idx.next_index = model::next_offset(idx.last_dirty_log_index);
     }
 
-    if (reply.result == append_entries_reply::status::success) {
+    if (reply.result == reply_result::success) {
         successfull_append_entries_reply(idx, std::move(reply));
         return success_reply::yes;
     } else {
-        idx.last_sent_offset = idx.last_dirty_log_index;
+        idx.expected_log_end_offset = model::offset{};
     }
 
     if (idx.is_recovering) {
@@ -444,18 +479,29 @@ consensus::success_reply consensus::update_follower_index(
             idx.last_dirty_log_index = reply.last_dirty_log_index;
             idx.last_flushed_log_index = reply.last_flushed_log_index;
             idx.next_index = model::next_offset(idx.last_dirty_log_index);
-            idx.last_sent_offset = model::offset{};
         }
         return success_reply::no;
     }
 
     if (needs_recovery(idx, dirty_offset)) {
-        vlog(
-          _ctxlog.trace,
-          "Starting recovery process for {} - current reply: {}",
-          idx.node_id,
-          reply);
-        dispatch_recovery(idx);
+        if (
+          reply.may_recover || ntp() == model::controller_ntp
+          || !_features.is_active(
+            features::feature::raft_coordinated_recovery)) {
+            vlog(
+              _ctxlog.trace,
+              "Starting recovery process for {} - current reply: {}",
+              idx.node_id,
+              reply);
+            dispatch_recovery(idx);
+        } else {
+            vlog(
+              _ctxlog.trace,
+              "Recovery required but not yet permitted by follower {} - "
+              "current reply: {}",
+              idx.node_id,
+              reply);
+        }
         return success_reply::no;
     }
     return success_reply::no;
@@ -486,19 +532,34 @@ void consensus::maybe_promote_to_voter(vnode id) {
             return ss::now();
         }
 
-        vlog(_ctxlog.trace, "promoting node {} to voter", id);
-        return _op_lock.get_units()
-          .then([this, id](ssx::semaphore_units u) mutable {
-              auto latest_cfg = _configuration_manager.get_latest();
-              latest_cfg.promote_to_voter(id);
+        // do not promote if the previous configuration is still uncommitted,
+        // otherwise we may add several new voters in quick succession, that the
+        // old voters will not know of, resulting in a possibility of
+        // non-intersecting quorums.
+        if (_configuration_manager.get_latest_offset() > _commit_index) {
+            return ss::now();
+        }
 
-              return replicate_configuration(
-                std::move(u), std::move(latest_cfg));
-          })
-          .then([this, id](std::error_code ec) {
-              vlog(
-                _ctxlog.trace, "node {} promotion result {}", id, ec.message());
-          });
+        return _op_lock.get_units().then([this,
+                                          id](ssx::semaphore_units u) mutable {
+            // check once more under _op_lock to protect against races with
+            // concurrent voter promotions.
+            if (_configuration_manager.get_latest_offset() > _commit_index) {
+                return ss::now();
+            }
+
+            vlog(_ctxlog.trace, "promoting node {} to voter", id);
+            auto latest_cfg = _configuration_manager.get_latest();
+            latest_cfg.promote_to_voter(id);
+            return replicate_configuration(std::move(u), std::move(latest_cfg))
+              .then([this, id](std::error_code ec) {
+                  vlog(
+                    _ctxlog.trace,
+                    "node {} promotion result {}",
+                    id,
+                    ec.message());
+              });
+        });
     });
 }
 
@@ -525,6 +586,13 @@ void consensus::successfull_append_entries_reply(
     idx.match_index = idx.last_dirty_log_index;
     idx.next_index = model::next_offset(idx.last_dirty_log_index);
     idx.last_successful_received_seq = idx.last_received_seq;
+    /**
+     * Update expected log end offset only if it is smaller than current value,
+     * the check is needed here as there might be pending append entries
+     * requests that were not yet replied by the follower.
+     */
+    idx.expected_log_end_offset = std::max(
+      idx.last_dirty_log_index, idx.expected_log_end_offset);
     vlog(
       _ctxlog.trace,
       "Updated node {} match {} and next {} indices",
@@ -559,7 +627,7 @@ void consensus::dispatch_recovery(follower_index_metadata& idx) {
           idx.next_index,
           log_max_offset);
         idx.next_index = log_max_offset;
-        idx.last_sent_offset = model::offset{};
+        idx.expected_log_end_offset = model::offset{};
     }
     idx.is_recovering = true;
     // background
@@ -589,7 +657,8 @@ void consensus::dispatch_recovery(follower_index_metadata& idx) {
         });
 }
 
-ss::future<result<model::offset>> consensus::linearizable_barrier() {
+ss::future<result<model::offset>>
+consensus::linearizable_barrier(model::timeout_clock::time_point deadline) {
     using ret_t = result<model::offset>;
     ssx::semaphore_units u;
     try {
@@ -609,9 +678,19 @@ ss::future<result<model::offset>> consensus::linearizable_barrier() {
     if (_vstate != vote_state::leader) {
         co_return result<model::offset>(make_error_code(errc::not_leader));
     }
-    // store current commit index
-    auto cfg = config();
-    auto dirty_offset = _log->offsets().dirty_offset;
+    /**
+     * Flush log on leader, to make sure the _commited_index will be updated
+     */
+    co_await flush_log();
+    const auto cfg = config();
+    const auto offsets = _log->offsets();
+
+    vlog(
+      _ctxlog.trace,
+      "Linearizable barrier requested. Log state: {}, flushed offset: {}",
+      offsets,
+      _flushed_offset);
+
     /**
      * Dispatch round of heartbeats
      */
@@ -619,8 +698,10 @@ ss::future<result<model::offset>> consensus::linearizable_barrier() {
     absl::flat_hash_map<vnode, follower_req_seq> sequences;
     std::vector<ss::future<>> send_futures;
     send_futures.reserve(cfg.unique_voter_count());
-    cfg.for_each_voter([this, dirty_offset, &sequences, &send_futures](
-                         vnode target) {
+    cfg.for_each_voter([this,
+                        dirty_offset = offsets.dirty_offset,
+                        &sequences,
+                        &send_futures](vnode target) {
         // do not send request to self
         if (target == _self) {
             return;
@@ -632,6 +713,7 @@ ss::future<result<model::offset>> consensus::linearizable_barrier() {
           meta(),
           model::make_memory_record_batch_reader(
             ss::circular_buffer<model::record_batch>{}),
+          0,
           flush_after_append::yes);
         auto seq = next_follower_sequence(target);
         sequences.emplace(target, seq);
@@ -643,8 +725,7 @@ ss::future<result<model::offset>> consensus::linearizable_barrier() {
                    .append_entries(
                      target.id(),
                      std::move(req),
-                     rpc::client_opts(_replicate_append_timeout),
-                     use_all_serde_append_entries())
+                     rpc::client_opts(_replicate_append_timeout))
                    .then([this, id = target.id(), seq, dirty_offset](
                            result<append_entries_reply> reply) {
                        process_append_entries_reply(
@@ -659,7 +740,7 @@ ss::future<result<model::offset>> consensus::linearizable_barrier() {
 
     u.return_all();
 
-    // wait for responsens in background
+    // wait for responses in background
     ssx::spawn_with_gate(_bg, [futures = std::move(send_futures)]() mutable {
         return ss::when_all_succeed(futures.begin(), futures.end());
     });
@@ -679,13 +760,17 @@ ss::future<result<model::offset>> consensus::linearizable_barrier() {
     try {
         // we do not hold the lock while waiting
         co_await _follower_reply.wait(
-          [this, term, &majority_sequences_updated] {
+          deadline, [this, term, &majority_sequences_updated] {
               return majority_sequences_updated() || _term != term;
           });
     } catch (const ss::broken_condition_variable& e) {
         co_return ret_t(make_error_code(errc::shutting_down));
+    } catch (const ss::condition_variable_timed_out& e) {
+        co_return errc::timeout;
     }
-
+    // grab an oplock to serialize state updates i.e. wait for all updates in
+    // the state that were caused by follower replies
+    auto units = co_await _op_lock.get_units();
     // term have changed, not longer a leader
     if (term != _term) {
         co_return ret_t(make_error_code(errc::not_leader));
@@ -729,28 +814,59 @@ consensus::chain_stages(replicate_stages stages) {
       });
 }
 
+ss::future<result<replicate_result>> consensus::replicate(
+  chunked_vector<model::record_batch> batches, replicate_options opts) {
+    return chain_stages(do_replicate({}, std::move(batches), opts));
+}
 ss::future<result<replicate_result>>
-consensus::replicate(model::record_batch_reader&& rdr, replicate_options opts) {
-    return chain_stages(do_replicate({}, std::move(rdr), opts));
+consensus::replicate(model::record_batch batch, replicate_options opts) {
+    return chain_stages(do_replicate(
+      {}, chunked_vector<model::record_batch>::single(std::move(batch)), opts));
 }
 
 ss::future<result<replicate_result>> consensus::replicate(
   model::term_id expected_term,
-  model::record_batch_reader&& rdr,
+  model::record_batch batch,
   replicate_options opts) {
-    return chain_stages(do_replicate(expected_term, std::move(rdr), opts));
+    return chain_stages(do_replicate(
+      expected_term,
+      chunked_vector<model::record_batch>::single(std::move(batch)),
+      opts));
+}
+
+ss::future<result<replicate_result>> consensus::replicate(
+  model::term_id expected_term,
+  chunked_vector<model::record_batch> batches,
+  replicate_options opts) {
+    return chain_stages(do_replicate(expected_term, std::move(batches), opts));
 }
 
 replicate_stages consensus::replicate_in_stages(
-  model::record_batch_reader&& rdr, replicate_options opts) {
-    return do_replicate({}, std::move(rdr), opts);
+  chunked_vector<model::record_batch> batches, replicate_options opts) {
+    return do_replicate({}, std::move(batches), opts);
+}
+
+replicate_stages consensus::replicate_in_stages(
+  model::record_batch batch, replicate_options opts) {
+    return do_replicate(
+      {}, chunked_vector<model::record_batch>::single(std::move(batch)), opts);
 }
 
 replicate_stages consensus::replicate_in_stages(
   model::term_id expected_term,
-  model::record_batch_reader&& rdr,
+  chunked_vector<model::record_batch> batches,
   replicate_options opts) {
-    return do_replicate(expected_term, std::move(rdr), opts);
+    return do_replicate(expected_term, std::move(batches), opts);
+}
+
+replicate_stages consensus::replicate_in_stages(
+  model::term_id expected_term,
+  model::record_batch batch,
+  replicate_options opts) {
+    return do_replicate(
+      expected_term,
+      chunked_vector<model::record_batch>::single(std::move(batch)),
+      opts);
 }
 
 replicate_stages
@@ -767,7 +883,7 @@ wrap_stages_with_gate(ss::gate& gate, replicate_stages stages) {
 }
 replicate_stages consensus::do_replicate(
   std::optional<model::term_id> expected_term,
-  model::record_batch_reader&& rdr,
+  chunked_vector<model::record_batch> batches,
   replicate_options opts) {
     // if gate is closed return fast, after this check we are certain that
     // `ss::with_gate` will succeed
@@ -787,12 +903,17 @@ replicate_stages consensus::do_replicate(
         _probe->replicate_requests_ack_leader();
         break;
     case consistency_level::quorum_ack:
-        _probe->replicate_requests_ack_all();
+        auto flush = opts.force_flush() || !_write_caching_enabled;
+        if (flush) {
+            _probe->replicate_requests_ack_all_with_flush();
+        } else {
+            _probe->replicate_requests_ack_all_without_flush();
+        }
         break;
     }
 
     return wrap_stages_with_gate(
-      _bg, _batcher.replicate(expected_term, std::move(rdr), opts.consistency));
+      _bg, _batcher.replicate(expected_term, std::move(batches), opts));
 }
 
 ss::future<model::record_batch_reader>
@@ -833,37 +954,39 @@ bool consensus::should_skip_vote(bool ignore_heartbeat) {
     return skip_vote;
 }
 
-ss::future<bool> consensus::dispatch_prevote(bool leadership_transfer) {
-    auto pvstm_p = std::make_unique<prevote_stm>(this);
-    auto pvstm = pvstm_p.get();
-    if (leadership_transfer) {
-        return ss::make_ready_future<bool>(true);
-    }
-    return pvstm->prevote(leadership_transfer)
-      .then_wrapped([this, pvstm_p = std::move(pvstm_p), pvstm](
-                      ss::future<bool> prevote_f) mutable {
-          bool ready = false;
-          try {
-              ready = prevote_f.get();
-          } catch (...) {
-              vlog(
-                _ctxlog.warn,
-                "Error returned from prevoting process {}",
-                std::current_exception());
-          }
-          auto f = pvstm->wait().finally([pvstm_p = std::move(pvstm_p)] {});
-          // make sure we wait for all futures when gate is closed
-          if (_bg.is_closed()) {
-              return f.then([ready] { return ready; });
-          }
-          // background
-          ssx::spawn_with_gate(
-            _bg, [pvstm_p = std::move(pvstm_p), f = std::move(f)]() mutable {
-                return std::move(f);
-            });
+ss::future<election_success>
+consensus::dispatch_prevote(bool leadership_transfer) {
+    auto pv_stm = std::make_unique<vote_stm>(this, is_prevote::yes);
 
-          return ss::make_ready_future<bool>(ready);
-      });
+    election_success success = election_success::no;
+    try {
+        vlog(
+          _ctxlog.info,
+          "starting pre-vote leader election, current term: {}, leadership "
+          "transfer: {}",
+          _term,
+          leadership_transfer);
+        success = co_await pv_stm->vote(leadership_transfer);
+    } catch (...) {
+        vlog(
+          _ctxlog.warn,
+          "Error returned from prevoting process {}",
+          std::current_exception());
+    }
+
+    // make sure we wait for all futures when gate is closed
+    if (_bg.is_closed()) {
+        co_await pv_stm->wait();
+        co_return success;
+    }
+    // background
+
+    ssx::spawn_with_gate(_bg, [pv_stm = std::move(pv_stm)]() mutable {
+        auto stm = pv_stm.get();
+        return stm->wait().finally([pv_stm = std::move(pv_stm)] {});
+    });
+
+    co_return success;
 }
 
 /// performs no raft-state mutation other than resetting the timer
@@ -916,8 +1039,18 @@ void consensus::dispatch_vote(bool leadership_transfer) {
     ssx::background
       = ssx::spawn_with_gate_then(_bg, [this, leadership_transfer] {
             return dispatch_prevote(leadership_transfer)
-              .then([this, leadership_transfer](bool ready) mutable {
-                  if (!ready) {
+              .then([this, leadership_transfer](
+                      election_success prevote_success) mutable {
+                  vlog(
+                    _ctxlog.debug,
+                    "pre-vote phase success: {}, current term: {}, "
+                    "leadership transfer: {}",
+                    prevote_success,
+                    _term,
+                    leadership_transfer);
+                  // if a current node is not longer candidate we should skip
+                  // proceeding to actual vote phase
+                  if (!prevote_success || _vstate != vote_state::candidate) {
                       return ss::make_ready_future<>();
                   }
                   auto vstm = std::make_unique<vote_stm>(this);
@@ -925,32 +1058,34 @@ void consensus::dispatch_vote(bool leadership_transfer) {
 
                   // CRITICAL: vote performs locking on behalf of consensus
                   return p->vote(leadership_transfer)
-                    .then_wrapped([this, p, vstm = std::move(vstm)](
-                                    ss::future<> vote_f) mutable {
-                        try {
-                            vote_f.get();
-                        } catch (const ss::gate_closed_exception&) {
-                            // Shutting down, don't log.
-                        } catch (...) {
-                            vlog(
-                              _ctxlog.warn,
-                              "Error returned from voting process {}",
-                              std::current_exception());
-                        }
-                        auto f = p->wait().finally([vstm = std::move(vstm)] {});
-                        // make sure we wait for all futures when gate is closed
-                        if (_bg.is_closed()) {
-                            return f;
-                        }
-                        // background
-                        ssx::spawn_with_gate(
-                          _bg,
-                          [vstm = std::move(vstm), f = std::move(f)]() mutable {
-                              return std::move(f);
-                          });
+                    .then_wrapped(
+                      [this, p, vstm = std::move(vstm)](
+                        ss::future<election_success> vote_f) mutable {
+                          try {
+                              vote_f.get();
+                          } catch (const ss::gate_closed_exception&) {
+                              // Shutting down, don't log.
+                          } catch (...) {
+                              vlog(
+                                _ctxlog.warn,
+                                "Error returned from voting process {}",
+                                std::current_exception());
+                          }
+                          auto f = p->wait().finally(
+                            [vstm = std::move(vstm)] {});
+                          // make sure we wait for all futures when gate is
+                          // closed
+                          if (_bg.is_closed()) {
+                              return f;
+                          }
+                          // background
+                          ssx::spawn_with_gate(
+                            _bg, [f = std::move(f)]() mutable {
+                                return std::move(f);
+                            });
 
-                        return ss::make_ready_future<>();
-                    });
+                          return ss::make_ready_future<>();
+                      });
               })
               .finally([this] { arm_vote_timeout(); });
         }).handle_exception([this](const std::exception_ptr& e) {
@@ -972,7 +1107,8 @@ consensus::update_group_member(model::broker broker) {
           if (!cfg.contains_broker(broker.id())) {
               vlog(
                 _ctxlog.warn,
-                "Node with id {} does not exists in current configuration");
+                "Node with id {} does not exists in current configuration",
+                broker.id());
               return ss::make_ready_future<std::error_code>(
                 errc::node_does_not_exists);
           }
@@ -1002,7 +1138,7 @@ ss::future<std::error_code> consensus::change_configuration(Func&& f) {
               return ss::make_ready_future<std::error_code>(
                 errc::configuration_change_in_progress);
           }
-          maybe_upgrade_configuration_to_v4(latest_cfg);
+          try_updating_configuration_version(latest_cfg);
           result<group_configuration> res = f(std::move(latest_cfg));
           if (res) {
               if (res.value().revision_id() < config().revision_id()) {
@@ -1067,17 +1203,20 @@ ss::future<std::error_code> consensus::replace_configuration(
       });
 }
 
-ss::future<std::error_code>
-consensus::add_group_member(vnode node, model::revision_id new_revision) {
+ss::future<std::error_code> consensus::add_group_member(
+  vnode node,
+  model::revision_id new_revision,
+  std::optional<model::offset> learner_start_offset) {
     vlog(_ctxlog.trace, "Adding member: {}", node);
     return change_configuration(
-      [node, new_revision](group_configuration current) mutable {
+      [this, node, new_revision, learner_start_offset](
+        group_configuration current) mutable {
           using ret_t = result<group_configuration>;
           if (current.contains(node)) {
               return ret_t{errc::node_already_exists};
           }
-          current.set_version(raft::group_configuration::v_5);
-          current.add(node, new_revision);
+          try_updating_configuration_version(current);
+          current.add(node, new_revision, learner_start_offset);
 
           return ret_t{std::move(current)};
       });
@@ -1087,12 +1226,12 @@ ss::future<std::error_code>
 consensus::remove_member(vnode node, model::revision_id new_revision) {
     vlog(_ctxlog.trace, "Removing member: {}", node);
     return change_configuration(
-      [node, new_revision](group_configuration current) {
+      [this, node, new_revision](group_configuration current) {
           using ret_t = result<group_configuration>;
           if (!current.contains(node)) {
               return ret_t{errc::node_does_not_exists};
           }
-          current.set_version(raft::group_configuration::v_5);
+          try_updating_configuration_version(current);
           current.remove(node, new_revision);
 
           if (current.current_config().voters.empty()) {
@@ -1103,14 +1242,23 @@ consensus::remove_member(vnode node, model::revision_id new_revision) {
 }
 
 ss::future<std::error_code> consensus::replace_configuration(
-  std::vector<vnode> nodes, model::revision_id new_revision) {
-    return change_configuration([nodes = std::move(nodes), new_revision](
-                                  group_configuration current) mutable {
-        current.set_version(raft::group_configuration::v_5);
-        current.replace(nodes, new_revision);
+  std::vector<vnode> nodes,
+  model::revision_id new_revision,
+  std::optional<model::offset> learner_start_offset) {
+    return change_configuration(
+      [this, nodes = std::move(nodes), new_revision, learner_start_offset](
+        group_configuration current) mutable {
+          auto old = current;
+          try_updating_configuration_version(current);
+          current.replace(nodes, new_revision, learner_start_offset);
+          vlog(
+            _ctxlog.debug,
+            "Replacing current configuration: {} with new configuration: {}",
+            old,
+            current);
 
-        return result<group_configuration>{std::move(current)};
-    });
+          return result<group_configuration>{std::move(current)};
+      });
 }
 
 template<typename Func>
@@ -1213,14 +1361,10 @@ consensus::abort_configuration_change(model::revision_id revision) {
     if (latest_cfg.revision_id() > revision) {
         co_return errc::invalid_configuration_update;
     }
+
     auto new_cfg = latest_cfg;
     new_cfg.abort_configuration_change(revision);
 
-    auto batches = details::serialize_configuration_as_batches(
-      std::move(new_cfg));
-    for (auto& b : batches) {
-        b.set_term(_term);
-    };
     /**
      * Aborting configuration change is an operation that may lead to data loss.
      * It must be possible to abort configuration change even if there is no
@@ -1228,46 +1372,27 @@ consensus::abort_configuration_change(model::revision_id revision) {
      * replicas log. If new leader will be elected using new configuration it
      * will eventually propagate valid configuration to all the followers.
      */
-    auto append_result = co_await disk_append(
-      model::make_memory_record_batch_reader(std::move(batches)),
-      update_last_quorum_index::yes);
-    vlog(
-      _ctxlog.info,
-      "appended reconfiguration aborting configuration at offset {}",
-      append_result.base_offset);
-    // flush log as all configuration changes must eventually be committed.
-    co_await flush_log();
-    // if current node is a leader make sure we will try to update committed
-    // index, it may be required for single participant raft groups
-    if (is_leader()) {
-        maybe_update_majority_replicated_index();
-        maybe_update_leader_commit_idx();
-    }
+    update_follower_stats(new_cfg);
+    _configuration_manager.set_override(std::move(new_cfg));
+    do_step_down("reconfiguration-aborted");
+
     co_return errc::success;
 }
 
 ss::future<std::error_code> consensus::force_replace_configuration_locally(
-  std::vector<vnode> nodes, model::revision_id new_revision) {
+  std::vector<vnode> voters,
+  std::vector<vnode> learners,
+  model::revision_id new_revision) {
     try {
         auto units = co_await _op_lock.get_units();
-        auto new_cfg = group_configuration(std::move(nodes), new_revision);
+        auto new_cfg = group_configuration(
+          std::move(voters), std::move(learners), new_revision);
+        try_updating_configuration_version(new_cfg);
         vlog(_ctxlog.info, "Force replacing configuration with: {}", new_cfg);
-        auto batches = details::serialize_configuration_as_batches(
-          std::move(new_cfg));
-        for (auto& b : batches) {
-            b.set_term(_term);
-        };
 
-        auto result = co_await disk_append(
-          model::make_memory_record_batch_reader(std::move(batches)),
-          update_last_quorum_index::yes);
-        vlog(
-          _ctxlog.debug,
-          "appended reconfiguration to force update replica "
-          "set at "
-          "offset {}",
-          result.base_offset);
-        co_await flush_log();
+        update_follower_stats(new_cfg);
+        _configuration_manager.set_override(std::move(new_cfg));
+        do_step_down("forced-reconfiguration");
 
     } catch (const ss::broken_semaphore&) {
         co_return errc::shutting_down;
@@ -1275,39 +1400,48 @@ ss::future<std::error_code> consensus::force_replace_configuration_locally(
     co_return errc::success;
 }
 
-ss::future<> consensus::start() {
-    return ss::try_with_gate(_bg, [this] { return do_start(); });
+void consensus::try_updating_configuration_version(group_configuration& cfg) {
+    maybe_upgrade_configuration_to_v4(cfg);
+
+    auto version = cfg.version();
+    if (
+      version >= group_configuration::v_4
+      && version < group_configuration::v_7) {
+        version = supports_symmetric_reconfiguration_cancel()
+                      && cfg.get_state() == configuration_state::simple
+                    ? group_configuration::v_7
+                    : group_configuration::v_6;
+        if (version == cfg.version()) {
+            return;
+        }
+        vlog(
+          _ctxlog.debug,
+          "Upgrading configuration {} version to {}",
+          cfg,
+          version);
+        cfg.set_version(version);
+    }
 }
 
-ss::future<> consensus::do_start() {
+ss::future<> consensus::start(
+  std::optional<state_machine_manager_builder> stm_manager_builder,
+  std::optional<xshard_transfer_state> xst_state) {
+    if (stm_manager_builder) {
+        _stm_manager = std::move(stm_manager_builder.value()).build(this);
+    }
+    return ss::try_with_gate(
+      _bg, [this, xst_state = std::move(xst_state)]() mutable {
+          return do_start(std::move(xst_state));
+      });
+}
+
+ss::future<>
+consensus::do_start(std::optional<xshard_transfer_state> xst_state) {
     try {
         auto u = co_await _op_lock.get_units();
 
         read_voted_for();
-
-        /*
-         * temporary workaround:
-         *
-         * if the group's ntp matches the pattern, then do not load the
-         * initial configuration snapshot from the keyvalue store. more info
-         * here:
-         *
-         * https://github.com/redpanda-data/redpanda/issues/1870
-         */
-        const auto& ntp = _log->config().ntp();
-        const auto normalized_ntp = fmt::format(
-          "{}.{}.{}", ntp.ns(), ntp.tp.topic(), ntp.tp.partition());
-        const auto& patterns = config::shard_local_cfg()
-                                 .full_raft_configuration_recovery_pattern();
-        auto initial_state = std::any_of(
-          patterns.cbegin(),
-          patterns.cend(),
-          [&normalized_ntp](const ss::sstring& pattern) {
-              return pattern == "*" || normalized_ntp.starts_with(pattern);
-          });
-        if (!initial_state) {
-            initial_state = is_initial_state();
-        }
+        bool initial_state = _log->is_new_log();
 
         vlog(
           _ctxlog.info,
@@ -1317,27 +1451,31 @@ ss::future<> consensus::do_start() {
           initial_state);
 
         co_await _configuration_manager.start(initial_state, _self.revision());
-
         vlog(
           _ctxlog.trace,
           "Configuration manager started: {}",
           _configuration_manager);
-        offset_translator::must_reset must_reset{initial_state};
 
-        absl::btree_map<model::offset, int64_t> offset2delta;
-        for (const auto& it : _configuration_manager) {
-            offset2delta.emplace(it.first, it.second.idx());
+        std::optional<storage::truncate_prefix_config> start_truncate_cfg;
+        auto snapshot_units = co_await _snapshot_lock.get_units();
+        auto metadata = co_await read_snapshot_metadata();
+        if (metadata.has_value()) {
+            update_offset_from_snapshot(metadata.value());
+            co_await _configuration_manager.add(
+              _last_snapshot_index, std::move(metadata->latest_configuration));
+            _probe->configuration_update();
+
+            start_truncate_cfg = truncation_cfg_for_snapshot(metadata.value());
+            if (start_truncate_cfg.has_value()) {
+                _flushed_offset = std::max(
+                  _last_snapshot_index, _flushed_offset);
+                co_await _configuration_manager.prefix_truncate(
+                  _last_snapshot_index);
+            }
+            _snapshot_size = co_await _snapshot_mgr.get_snapshot_size();
         }
-
-        auto bootstrap = offset_translator::bootstrap_state{
-          .offset2delta = std::move(offset2delta),
-          .highest_known_offset
-          = _configuration_manager.get_highest_known_offset(),
-        };
-
-        co_await _offset_translator.start(must_reset, std::move(bootstrap));
-
-        co_await _snapshot_lock.with([this] { return hydrate_snapshot(); });
+        co_await _log->start(start_truncate_cfg);
+        snapshot_units.return_all();
 
         vlog(
           _ctxlog.debug,
@@ -1356,6 +1494,11 @@ ss::future<> consensus::do_start() {
           lstats,
           st);
 
+        // if a snapshot contains a term update term with then one from snapshot
+        if (_last_snapshot_term > _term) {
+            _term = _last_snapshot_term;
+        }
+
         // if log term is newer than the one coming from voted_for
         // state, we reset voted_for state
         if (lstats.dirty_offset_term > _term) {
@@ -1370,7 +1513,7 @@ ss::future<> consensus::do_start() {
          */
         _flushed_offset = lstats.dirty_offset;
         /**
-         * The configuration manager state may be divereged from the log
+         * The configuration manager state may be diverged from the log
          * state, as log is flushed lazily, we have to make sure that
          * the log and configuration manager has exactly the same
          * offsets range
@@ -1391,8 +1534,6 @@ ss::future<> consensus::do_start() {
         }
 
         update_follower_stats(_configuration_manager.get_latest());
-
-        co_await _offset_translator.sync_with_log(_log, _as);
 
         /**
          * fix for incorrectly persisted configuration index. In
@@ -1421,31 +1562,39 @@ ss::future<> consensus::do_start() {
             co_await _configuration_manager.adjust_configuration_idx(new_idx);
         }
 
-        auto next_election = clock_type::now();
         // set last heartbeat timestamp to prevent skipping first
         // election
         _hbeat = clock_type::time_point::min();
-        auto conf = _configuration_manager.get_latest().current_config();
-        if (!conf.voters.empty() && _self == conf.voters.front()) {
-            // Arm immediate election for single node scenarios
-            // or for the very first start of the preferred leader
-            // in a multi-node group.  Otherwise use standard election
-            // timeout.
-            if (conf.voters.size() > 1 && _term > model::term_id{0}) {
-                next_election += _jit.next_duration();
-            }
+
+        if (xst_state && xst_state->leader_term == _term) {
+            // we were the leader before the x-shard transfer, try re-electing
+            // immediately.
+            dispatch_vote(true);
         } else {
-            // current node is not a preselected leader, add 2x jitter
-            // to give opportunity to the preselected leader to win
-            // the first round
-            next_election += _jit.base_duration()
-                             + 2 * _jit.next_jitter_duration();
-        }
-        if (!_bg.is_closed()) {
-            _vote_timeout.rearm(next_election);
+            auto next_election = clock_type::now();
+            auto conf = _configuration_manager.get_latest().current_config();
+            if (!conf.voters.empty() && _self == conf.voters.front()) {
+                // Arm immediate election for single node scenarios
+                // or for the very first start of the preferred leader
+                // in a multi-node group.  Otherwise use standard election
+                // timeout.
+                if (conf.voters.size() > 1 && _term > model::term_id{0}) {
+                    next_election += _jit.next_duration();
+                }
+            } else {
+                // current node is not a preselected leader, add 2x jitter
+                // to give opportunity to the preselected leader to win
+                // the first round
+                next_election += _jit.base_duration()
+                                 + 2 * _jit.next_jitter_duration();
+            }
+
+            if (!_bg.is_closed()) {
+                _vote_timeout.rearm(next_election);
+            }
         }
 
-        auto const last_applied = read_last_applied();
+        const auto last_applied = read_last_applied();
         if (last_applied > lstats.dirty_offset) {
             vlog(
               _ctxlog.error,
@@ -1472,6 +1621,9 @@ ss::future<> consensus::do_start() {
 
         co_await _event_manager.start();
         _append_requests_buffer.start();
+        if (_stm_manager) {
+            co_await _stm_manager->start();
+        }
 
         vlog(
           _ctxlog.info,
@@ -1480,7 +1632,7 @@ ss::future<> consensus::do_start() {
           _term,
           _configuration_manager.get_latest());
 
-    } catch (ss::broken_semaphore&) {
+    } catch (const ss::broken_semaphore&) {
     }
 }
 
@@ -1500,7 +1652,7 @@ ss::future<> consensus::write_last_applied(model::offset o) {
      * In order to keep an invariant that: 'last applied offset MUST be
      * readable' we limit it here to committed (leader flushed) offset.
      */
-    auto const limited_offset = std::min(o, _log->offsets().committed_offset);
+    const auto limited_offset = std::min(o, _flushed_offset);
     auto key = last_applied_key();
     iobuf val = reflection::to_iobuf(limited_offset);
     return _storage.kvs().put(
@@ -1576,7 +1728,10 @@ ss::future<vote_reply> consensus::vote(vote_request&& r) {
           .with(
             _jit.base_duration(),
             [this, r = std::move(r)]() mutable {
-                return do_vote(std::move(r));
+                return do_vote(std::move(r)).then([this](vote_reply reply) {
+                    vlog(_ctxlog.trace, "vote reply: {}", reply);
+                    return reply;
+                });
             })
           .handle_exception_type(
             [this, target_node_id](const ss::semaphore_timed_out&) {
@@ -1664,7 +1819,7 @@ ss::future<vote_reply> consensus::do_vote(vote_request r) {
     /// Stable leadership optimization
     ///
     /// When current node is a leader (we set _hbeat to max after
-    /// successfull election) or already processed request from active
+    /// successful election) or already processed request from active
     /// leader  do not grant a vote to follower. This will prevent restarted
     /// nodes to disturb all groups leadership
     // Check if we updated the heartbeat timepoint in the last election
@@ -1688,6 +1843,15 @@ ss::future<vote_reply> consensus::do_vote(vote_request r) {
     reply.log_ok
       = r.prev_log_term > last_entry_term
         || (r.prev_log_term == last_entry_term && r.prev_log_index >= last_log_index);
+
+    vlog(
+      _ctxlog.trace,
+      "vote log_ok response: {}, last_entry_term: {}, last_log_index: {}, log "
+      "offsets: {}",
+      reply.log_ok,
+      last_entry_term,
+      last_log_index,
+      lstats);
 
     // raft.pdf: reply false if term < currentTerm (§5.1)
     if (r.term < _term) {
@@ -1720,7 +1884,7 @@ ss::future<vote_reply> consensus::do_vote(vote_request r) {
         _term = r.term;
         _voted_for = {};
         term_changed = true;
-        do_step_down("voter_term_greater");
+        do_step_down("candidate_term_greater");
         if (_leader_id) {
             _leader_id = std::nullopt;
             trigger_leadership_notification();
@@ -1728,7 +1892,7 @@ ss::future<vote_reply> consensus::do_vote(vote_request r) {
 
         // do not grant vote if log isn't ok
         if (!reply.log_ok) {
-            // even tough we step down we do not want to update the hbeat as it
+            // even though we step down we do not want to update the hbeat as it
             // would cause subsequent votes to fail (_hbeat is updated by the
             // leader)
             _hbeat = clock_type::time_point::min();
@@ -1788,20 +1952,22 @@ consensus::do_append_entries(append_entries_request&& r) {
     reply.term = _term;
     reply.last_dirty_log_index = lstats.dirty_offset;
     reply.last_flushed_log_index = _flushed_offset;
-    reply.result = append_entries_reply::status::failure;
+    reply.result = reply_result::failure;
+    reply.may_recover = _follower_recovery_state
+                        && _follower_recovery_state->is_active();
+
     _probe->append_request();
 
     if (unlikely(is_request_target_node_invalid("append_entries", r))) {
-        return ss::make_ready_future<append_entries_reply>(reply);
+        co_return reply;
     }
     // no need to trigger timeout
-    vlog(
-      _ctxlog.trace, "Received append entries request: {}", request_metadata);
+    vlog(_ctxlog.trace, "Received append entries request: {}", r);
 
     // raft.pdf: Reply false if term < currentTerm (§5.1)
     if (request_metadata.term < _term) {
-        reply.result = append_entries_reply::status::failure;
-        return ss::make_ready_future<append_entries_reply>(std::move(reply));
+        reply.result = reply_result::failure;
+        co_return reply;
     }
     /**
      * When the current leader is alive, whenever a follower receives heartbeat,
@@ -1812,24 +1978,19 @@ consensus::do_append_entries(append_entries_request&& r) {
     if (request_metadata.term > _term) {
         vlog(
           _ctxlog.debug,
-          "Append entries request term:{} is greater than current: {}. "
-          "Setting "
-          "new term",
+          "Append entries request term: {} is greater than current: {}. "
+          "Setting new term",
           request_metadata.term,
           _term);
         _term = request_metadata.term;
         _voted_for = {};
-        return do_append_entries(std::move(r));
-    }
+        maybe_update_leader(r.source_node());
 
+        co_return co_await do_append_entries(std::move(r));
+    }
     // raft.pdf:If AppendEntries RPC received from new leader: convert to
     // follower (§5.2)
-    _vstate = vote_state::follower;
-    if (unlikely(_leader_id != r.source_node())) {
-        _leader_id = r.source_node();
-        _follower_reply.broadcast();
-        trigger_leadership_notification();
-    }
+    maybe_update_leader(r.source_node());
 
     // raft.pdf: Reply false if log doesn’t contain an entry at
     // prevLogIndex whose term matches prevLogTerm (§5.3)
@@ -1847,7 +2008,14 @@ consensus::do_append_entries(append_entries_request&& r) {
               last_log_offset,
               request_metadata.prev_log_index);
         }
-        return ss::make_ready_future<append_entries_reply>(std::move(reply));
+
+        upsert_recovery_state(
+          last_log_offset,
+          request_metadata.dirty_offset,
+          request_metadata.dirty_offset > request_metadata.prev_log_index);
+        reply.may_recover = _follower_recovery_state->is_active();
+
+        co_return reply;
     }
 
     // section 2
@@ -1858,7 +2026,8 @@ consensus::do_append_entries(append_entries_request&& r) {
       = lstats.dirty_offset == request_metadata.prev_log_index
           ? lstats.dirty_offset_term // use term from lstats
           : get_term(model::offset(
-            request_metadata.prev_log_index)); // lookup for request term in log
+              request_metadata
+                .prev_log_index)); // lookup for request term in log
     // We can only check prev_log_term for entries that are present in the
     // log. When leader installed snapshot on the follower we may require to
     // skip the term check as term of prev_log_idx may not be available.
@@ -1872,23 +2041,78 @@ consensus::do_append_entries(append_entries_request&& r) {
           request_metadata.prev_log_index,
           last_log_term,
           request_metadata.prev_log_term);
-        reply.result = append_entries_reply::status::failure;
-        return ss::make_ready_future<append_entries_reply>(std::move(reply));
+        reply.result = reply_result::failure;
+
+        upsert_recovery_state(
+          last_log_offset,
+          request_metadata.dirty_offset,
+          request_metadata.dirty_offset > request_metadata.prev_log_index);
+        reply.may_recover = _follower_recovery_state->is_active();
+
+        co_return reply;
     }
 
-    // special case heartbeat case
+    model::offset adjusted_prev_log_index = request_metadata.prev_log_index;
+    if (adjusted_prev_log_index < last_log_offset) {
+        // The append point is before the end of our log. We need to skip
+        // over batches that we already have (they will have the matching
+        // term) to find the true truncation point. This is important for the
+        // case when we already have _all_ batches locally (possible if e.g.
+        // the request was delayed/duplicated). In this case we don't want to
+        // truncate, otherwise we might lose already committed data.
+
+        struct find_mismatch_consumer {
+            const consensus& parent;
+            model::offset last_log_offset;
+            model::offset last_matched;
+
+            ss::future<ss::stop_iteration>
+            operator()(const model::record_batch& b) {
+                model::offset last_batch_offset
+                  = last_matched
+                    + model::offset(b.header().last_offset_delta + 1);
+                if (
+                  last_batch_offset > last_log_offset
+                  || parent.get_term(last_batch_offset) != b.term()) {
+                    co_return ss::stop_iteration::yes;
+                }
+                last_matched = last_batch_offset;
+                co_return ss::stop_iteration::no;
+            }
+
+            model::offset end_of_stream() { return last_matched; }
+        };
+
+        model::offset last_matched = co_await r.batches().peek_each_ref(
+          find_mismatch_consumer{
+            .parent = *this,
+            .last_log_offset = last_log_offset,
+            .last_matched = adjusted_prev_log_index},
+          model::no_timeout); // no_timeout as the batches are already in memory
+        if (last_matched != adjusted_prev_log_index) {
+            vlog(
+              _ctxlog.info,
+              "skipped matching records in append_entries batch from {} to {}, "
+              "current state: {}",
+              adjusted_prev_log_index,
+              last_matched,
+              meta());
+            adjusted_prev_log_index = last_matched;
+        }
+    }
+
+    // special case for heartbeats and batches without new records.
     // we need to handle it early (before executing truncation)
     // as timeouts are asynchronous to append calls and can have stall data
     if (r.batches().is_end_of_stream()) {
-        if (request_metadata.prev_log_index < last_log_offset) {
-            // do not tuncate on heartbeat just response with false
-            reply.result = append_entries_reply::status::failure;
-            return ss::make_ready_future<append_entries_reply>(
-              std::move(reply));
+        if (adjusted_prev_log_index < last_log_offset) {
+            // do not truncate on heartbeat just response with false
+            reply.result = reply_result::failure;
+            co_return reply;
         }
         auto f = ss::now();
         if (r.is_flush_required() && lstats.dirty_offset > _flushed_offset) {
-            f = flush_log();
+            f = flush_log().discard_result();
         }
         auto last_visible = std::min(
           lstats.dirty_offset, request_metadata.last_visible_index);
@@ -1896,116 +2120,199 @@ consensus::do_append_entries(append_entries_request&& r) {
         maybe_update_last_visible_index(last_visible);
         _last_leader_visible_offset = std::max(
           request_metadata.last_visible_index, _last_leader_visible_offset);
-        return f.then([this, reply, request_metadata] {
-            return maybe_update_follower_commit_idx(
-                     model::offset(request_metadata.commit_index))
-              .then([this, reply]() mutable {
-                  reply.last_flushed_log_index = _flushed_offset;
-                  reply.result = append_entries_reply::status::success;
-                  return reply;
-              });
-        });
+        _confirmed_term = _term;
+        if (_follower_recovery_state) {
+            vlog(
+              _ctxlog.debug,
+              "exiting follower_recovery_state (heartbeat), "
+              "leader meta: {} (our offset: {})",
+              request_metadata,
+              last_log_offset);
+            _follower_recovery_state.reset();
+        }
+
+        co_await std::move(f);
+        maybe_update_follower_commit_idx(
+          model::offset(request_metadata.commit_index));
+        reply.last_flushed_log_index = _flushed_offset;
+        reply.result = reply_result::success;
+        co_return reply;
+    }
+
+    if (adjusted_prev_log_index < request_metadata.dirty_offset) {
+        // This is a valid recovery request. In case we haven't allowed it,
+        // defer to the leader and force-enter the recovery state.
+        upsert_recovery_state(
+          last_log_offset, request_metadata.dirty_offset, true);
+        reply.may_recover = _follower_recovery_state->is_active();
     }
 
     // section 3
-    if (request_metadata.prev_log_index < last_log_offset) {
-        if (unlikely(request_metadata.prev_log_index < _commit_index)) {
-            reply.result = append_entries_reply::status::success;
+    if (adjusted_prev_log_index < last_log_offset) {
+        if (unlikely(adjusted_prev_log_index < _commit_index)) {
+            reply.result = reply_result::success;
+            // clamp dirty offset to the current commit index not to allow
+            // leader reasoning about follower log beyond that point
+            reply.last_dirty_log_index = _commit_index;
+            reply.last_flushed_log_index = _commit_index;
             vlog(
               _ctxlog.info,
               "Stale append entries request processed, entry is already "
               "present, request: {}, current state: {}",
               request_metadata,
               meta());
-            return ss::make_ready_future<append_entries_reply>(
-              std::move(reply));
+            co_return reply;
         }
         auto truncate_at = model::next_offset(
-          model::offset(request_metadata.prev_log_index));
+          model::offset(adjusted_prev_log_index));
         vlog(
           _ctxlog.info,
           "Truncating log in term: {}, Request previous log index: {} is "
-          "earlier than log end offset: {}. Truncating to: {}",
+          "earlier than log end offset: {}, last visible index: {}, leader "
+          "last visible index: {}. Truncating to: {}",
           request_metadata.term,
-          request_metadata.prev_log_index,
+          adjusted_prev_log_index,
           lstats.dirty_offset,
+          last_visible_index(),
+          _last_leader_visible_offset,
           truncate_at);
         _probe->log_truncated();
 
-        // We are truncating the offset translator before truncating the log
-        // because if saving offset translator state fails, we will retry and
-        // eventually log and offset translator will become consistent. OTOH if
-        // log truncation were first and saving offset translator state failed,
-        // we wouldn't retry and log and offset translator could diverge.
-        return _offset_translator.truncate(truncate_at)
-          .then([this, truncate_at] {
-              return _log->truncate(storage::truncate_config(
-                truncate_at, _scheduling.default_iopc));
-          })
-          .then([this, truncate_at] {
-              _last_quorum_replicated_index = std::min(
-                model::prev_offset(truncate_at), _last_quorum_replicated_index);
-              // update flushed offset since truncation may happen to already
-              // flushed entries
-              _flushed_offset = std::min(
-                model::prev_offset(truncate_at), _flushed_offset);
+        _majority_replicated_index = std::min(
+          model::prev_offset(truncate_at), _majority_replicated_index);
+        _last_quorum_replicated_index_with_flush = std::min(
+          model::prev_offset(truncate_at),
+          _last_quorum_replicated_index_with_flush);
+        // update flushed offset since truncation may happen to already
+        // flushed entries
+        _flushed_offset = std::min(
+          model::prev_offset(truncate_at), _flushed_offset);
 
-              return _configuration_manager.truncate(truncate_at).then([this] {
-                  _probe->configuration_update();
-                  update_follower_stats(_configuration_manager.get_latest());
-              });
-          })
-          .then([this, r = std::move(r), truncate_at]() mutable {
-              auto lstats = _log->offsets();
-              if (unlikely(
-                    lstats.dirty_offset != r.metadata().prev_log_index)) {
-                  vlog(
-                    _ctxlog.warn,
-                    "Log truncation error, expected offset: {}, log "
-                    "offsets: "
-                    "{}, requested truncation at {}",
-                    r.metadata().prev_log_index,
-                    lstats,
-                    truncate_at);
-                  _flushed_offset = std::min(
-                    model::prev_offset(lstats.dirty_offset), _flushed_offset);
-              }
-              return do_append_entries(std::move(r));
-          })
-          .handle_exception([this, reply](const std::exception_ptr& e) mutable {
-              vlog(_ctxlog.warn, "Error occurred while truncating log - {}", e);
-              reply.result = append_entries_reply::status::failure;
-              return ss::make_ready_future<append_entries_reply>(reply);
-          });
+        try {
+            co_await _log->truncate(
+              storage::truncate_config(truncate_at, _scheduling.default_iopc));
+            // update flushed offset once again after truncation as flush is
+            // executed concurrently to append entries and it may race with
+            // the truncation
+            _flushed_offset = std::min(
+              model::prev_offset(truncate_at), _flushed_offset);
+
+            co_await _configuration_manager.truncate(truncate_at);
+            _probe->configuration_update();
+            update_follower_stats(_configuration_manager.get_latest());
+
+            auto lstats = _log->offsets();
+            if (unlikely(lstats.dirty_offset != adjusted_prev_log_index)) {
+                vlog(
+                  _ctxlog.warn,
+                  "Log truncation error, expected offset: {}, log offsets: {}, "
+                  "requested truncation at {}",
+                  adjusted_prev_log_index,
+                  lstats,
+                  truncate_at);
+                _flushed_offset = std::min(
+                  model::prev_offset(lstats.dirty_offset), _flushed_offset);
+            }
+        } catch (...) {
+            vlog(
+              _ctxlog.warn,
+              "Error occurred while truncating log - {}",
+              std::current_exception());
+            reply.result = reply_result::failure;
+            co_return reply;
+        }
+
+        co_return co_await do_append_entries(std::move(r));
     }
 
     // success. copy entries for each subsystem
-    using offsets_ret = storage::append_result;
-    return disk_append(
-             std::move(r).release_batches(), update_last_quorum_index::no)
-      .then([this, m = request_metadata, target = reply.target_node_id](
-              offsets_ret ofs) {
-          auto f = ss::make_ready_future<>();
-          auto last_visible = std::min(ofs.last_offset, m.last_visible_index);
-          maybe_update_last_visible_index(last_visible);
-          _last_leader_visible_offset = std::max(
-            m.last_visible_index, _last_leader_visible_offset);
-          return maybe_update_follower_commit_idx(model::offset(m.commit_index))
-            .then([this, ofs, target] {
-                return make_append_entries_reply(target, ofs);
-            });
-      })
-      .handle_exception([this, reply](const std::exception_ptr& e) mutable {
-          vlog(
-            _ctxlog.warn, "Error occurred while appending log entries - {}", e);
-          reply.result = append_entries_reply::status::failure;
-          return ss::make_ready_future<append_entries_reply>(reply);
-      })
-      .finally([this] {
-          // we do not want to include our disk flush latency into
-          // the leader vote timeout
-          _hbeat = clock_type::now();
-      });
+
+    try {
+        auto deferred = ss::defer([this] {
+            // we do not want to include our disk flush latency into
+            // the leader vote timeout
+            _hbeat = clock_type::now();
+        });
+        validate_offset_translator_delta(request_metadata, lstats);
+        storage::append_result ofs = co_await disk_append(
+          std::move(r).release_batches(), update_last_quorum_index::no);
+        auto last_visible = std::min(
+          ofs.last_offset, request_metadata.last_visible_index);
+        maybe_update_last_visible_index(last_visible);
+
+        _last_leader_visible_offset = std::max(
+          request_metadata.last_visible_index, _last_leader_visible_offset);
+        _confirmed_term = _term;
+
+        maybe_update_follower_commit_idx(request_metadata.commit_index);
+
+        if (_follower_recovery_state) {
+            _follower_recovery_state->update_progress(
+              ofs.last_offset,
+              std::max(request_metadata.dirty_offset, ofs.last_offset));
+
+            if (
+              request_metadata.dirty_offset
+              == request_metadata.prev_log_index) {
+                // Normal (non-recovery, non-heartbeat) append_entries
+                // request means that recovery is over.
+                vlog(
+                  _ctxlog.debug,
+                  "exiting follower_recovery_state, leader meta: {} "
+                  "(our offset: {})",
+                  request_metadata,
+                  ofs.last_offset);
+                _follower_recovery_state.reset();
+            }
+            // m.dirty_offset can be bogus here if we are talking to
+            // a pre-23.3 redpanda. In this case we can't reliably
+            // distinguish between recovery and normal append_entries
+            // and will exit recovery only via heartbeats (which is okay
+            // but can inflate the number of recovering partitions
+            // statistic a bit).
+        }
+        co_return make_append_entries_reply(reply.target_node_id, ofs);
+    } catch (...) {
+        vlog(
+          _ctxlog.warn,
+          "Error occurred while appending log entries - {}",
+          std::current_exception());
+        reply.result = reply_result::failure;
+        co_return reply;
+    }
+}
+
+void consensus::validate_offset_translator_delta(
+  const protocol_metadata& meta, const storage::offset_stats& lstats) {
+    // do not validate if prev_log_delta is not set
+    if (meta.prev_log_delta < model::offset_delta{0}) {
+        return;
+    }
+    /**
+     * If request contain valid information and it is about to be appended
+     * to the log validate the offset translator delta consistency.
+     */
+    const auto last_delta = get_offset_delta(lstats, meta.prev_log_index);
+    if (
+      last_delta >= model::offset_delta{0}
+      && last_delta != meta.prev_log_delta) {
+        vlog(
+          _ctxlog.error,
+          "Offset translator state inconsistency detected. Received "
+          "append entries request {} with last offset delta different "
+          "than expected: {}",
+          meta,
+          last_delta);
+        _probe->offset_translator_inconsistency_error();
+    }
+}
+
+void consensus::maybe_update_leader(vnode request_node) {
+    if (unlikely(_leader_id != request_node)) {
+        _leader_id = request_node;
+        _follower_reply.broadcast();
+        trigger_leadership_notification();
+    }
 }
 
 ss::future<install_snapshot_reply>
@@ -2026,36 +2333,58 @@ consensus::install_snapshot(install_snapshot_request&& r) {
 ss::future<> consensus::hydrate_snapshot() {
     // Read snapshot, reset state machine using snapshot contents (and load
     // snapshot’s cluster configuration) (§7.8)
-    return _snapshot_mgr.open_snapshot().then(
-      [this](std::optional<storage::snapshot_reader> reader) {
-          // no snapshot do nothing
-          if (!reader) {
-              return ss::now();
-          }
-          return ss::do_with(
-            std::move(*reader), [this](storage::snapshot_reader& reader) {
-                return do_hydrate_snapshot(reader).finally(
-                  [&reader] { return reader.close(); });
-            });
-      });
+    auto metadata = co_await read_snapshot_metadata();
+    if (!metadata.has_value()) {
+        co_return;
+    }
+    update_offset_from_snapshot(metadata.value());
+    co_await _configuration_manager.add(
+      _last_snapshot_index, std::move(metadata->latest_configuration));
+    _probe->configuration_update();
+    auto truncate_cfg = truncation_cfg_for_snapshot(metadata.value());
+    if (truncate_cfg.has_value()) {
+        co_await truncate_to_latest_snapshot(truncate_cfg.value());
+    }
+    _snapshot_size = co_await _snapshot_mgr.get_snapshot_size();
+    update_follower_stats(_configuration_manager.get_latest());
 }
 
-ss::future<> consensus::truncate_to_latest_snapshot() {
+std::optional<storage::truncate_prefix_config>
+consensus::truncation_cfg_for_snapshot(const snapshot_metadata& metadata) {
+    if (
+      _keep_snapshotted_log
+      && _log->offsets().dirty_offset >= _last_snapshot_index) {
+        // skip prefix truncating if we want to preserve the log (e.g. for the
+        // controller partition), but only if there is no gap between old end
+        // offset and new start offset, otherwise we must still advance the log
+        // start offset by prefix-truncating.
+        return std::nullopt;
+    }
+    auto delta = metadata.log_start_delta;
+    if (delta < offset_translator_delta(0)) {
+        delta = offset_translator_delta(
+          _configuration_manager.offset_delta(_last_snapshot_index));
+        vlog(
+          _ctxlog.warn,
+          "received snapshot without delta field in metadata, "
+          "falling back to delta obtained from configuration "
+          "manager: {}",
+          delta);
+    }
+    return storage::truncate_prefix_config(
+      model::next_offset(_last_snapshot_index),
+      _scheduling.default_iopc,
+      model::offset_delta(delta));
+}
+
+ss::future<>
+consensus::truncate_to_latest_snapshot(storage::truncate_prefix_config cfg) {
     // we have to prefix truncate config manage at exactly last offset included
     // in snapshot as this is the offset of configuration included in snapshot
     // metadata.
-    //
-    // We truncate the log before truncating offset translator to wait for
-    // readers that started reading from the start of the log before we advanced
-    // _last_snapshot_index and thus can still need offset translation info.
-    return _log
-      ->truncate_prefix(storage::truncate_prefix_config(
-        model::next_offset(_last_snapshot_index), _scheduling.default_iopc))
+    return _log->truncate_prefix(cfg)
       .then([this] {
           return _configuration_manager.prefix_truncate(_last_snapshot_index);
-      })
-      .then([this] {
-          return _offset_translator.prefix_truncate(_last_snapshot_index);
       })
       .then([this] {
           // when log was prefix truncate flushed offset should be equal to at
@@ -2064,71 +2393,52 @@ ss::future<> consensus::truncate_to_latest_snapshot() {
       });
 }
 
-ss::future<> consensus::do_hydrate_snapshot(storage::snapshot_reader& reader) {
-    return reader.read_metadata()
-      .then([this](iobuf buf) {
-          auto parser = iobuf_parser(std::move(buf));
-          auto metadata = reflection::adl<snapshot_metadata>{}.from(parser);
-          vassert(
-            metadata.last_included_index >= _last_snapshot_index,
-            "Tried to load stale snapshot. Loaded snapshot last "
-            "index {}, current snapshot last index {}",
-            metadata.last_included_index,
-            _last_snapshot_index);
+ss::future<std::optional<snapshot_metadata>>
+consensus::read_snapshot_metadata() {
+    std::optional<raft::snapshot_metadata> metadata;
+    auto snapshot_reader = co_await _snapshot_mgr.open_snapshot();
+    if (!snapshot_reader.has_value()) {
+        co_return std::nullopt;
+    }
+    std::exception_ptr eptr;
+    try {
+        auto buf = co_await snapshot_reader->read_metadata();
+        auto parser = iobuf_parser(std::move(buf));
+        metadata = reflection::adl<raft::snapshot_metadata>{}.from(parser);
+    } catch (...) {
+        eptr = std::current_exception();
+    }
+    co_await snapshot_reader->close();
+    if (eptr) {
+        std::rethrow_exception(eptr);
+    }
+    co_return metadata;
+}
 
-          vlog(
-            _ctxlog.info,
-            "hydrating snapshot with last included index: {}",
-            metadata.last_included_index);
+void consensus::update_offset_from_snapshot(
+  const raft::snapshot_metadata& metadata) {
+    vassert(
+      metadata.last_included_index >= _last_snapshot_index,
+      "Tried to load stale snapshot. Loaded snapshot last "
+      "index {}, current snapshot last index {}",
+      metadata.last_included_index,
+      _last_snapshot_index);
+    vlog(
+      _ctxlog.info,
+      "hydrating snapshot with last included index: {}",
+      metadata.last_included_index);
 
-          _last_snapshot_index = metadata.last_included_index;
-          _last_snapshot_term = metadata.last_included_term;
+    _last_snapshot_index = metadata.last_included_index;
+    _last_snapshot_term = metadata.last_included_term;
 
-          // TODO: add applying snapshot content to state machine
-          auto prev_commit_index = _commit_index;
-          _commit_index = std::max(_last_snapshot_index, _commit_index);
-          maybe_update_last_visible_index(_commit_index);
-          if (prev_commit_index != _commit_index) {
-              _commit_index_updated.broadcast();
-              _event_manager.notify_commit_index();
-          }
-
-          update_follower_stats(metadata.latest_configuration);
-          return _configuration_manager
-            .add(_last_snapshot_index, std::move(metadata.latest_configuration))
-            .then([this, delta = metadata.log_start_delta]() mutable {
-                _probe->configuration_update();
-
-                if (delta < offset_translator_delta(0)) {
-                    delta = offset_translator_delta(
-                      _configuration_manager.offset_delta(
-                        _last_snapshot_index));
-                    vlog(
-                      _ctxlog.warn,
-                      "received snapshot without delta field in metadata, "
-                      "falling back to delta obtained from configuration "
-                      "manager: {}",
-                      delta);
-                }
-                return _offset_translator.prefix_truncate_reset(
-                  _last_snapshot_index, delta);
-            })
-            .then([this] {
-                if (
-                  _keep_snapshotted_log
-                  && _log->offsets().dirty_offset >= _last_snapshot_index) {
-                    // skip prefix truncating if we want to preserve the log
-                    // (e.g. for the controller partition), but only if there is
-                    // no gap between old end offset and new start offset,
-                    // otherwise we must still advance the log start offset by
-                    // prefix-truncating.
-                    return ss::now();
-                }
-                return truncate_to_latest_snapshot();
-            });
-      })
-      .then([this] { return _snapshot_mgr.get_snapshot_size(); })
-      .then([this](uint64_t size) { _snapshot_size = size; });
+    auto prev_commit_index = _commit_index;
+    _commit_index = std::max(_last_snapshot_index, _commit_index);
+    maybe_update_last_visible_index(_commit_index);
+    if (prev_commit_index != _commit_index) {
+        _commit_index_updated.broadcast();
+        _replication_monitor.notify_committed();
+        _event_manager.notify_commit_index();
+    }
 }
 
 ss::future<install_snapshot_reply>
@@ -2153,12 +2463,14 @@ consensus::do_install_snapshot(install_snapshot_request r) {
     _hbeat = clock_type::now();
 
     // request received from new leader
+    do_step_down("install_snapshot_received");
     if (r.term > _term) {
         _term = r.term;
         _voted_for = {};
-        do_step_down("install_snapshot_term_greater");
+        maybe_update_leader(r.source_node());
         co_return co_await do_install_snapshot(std::move(r));
     }
+    maybe_update_leader(r.source_node());
 
     // Create new snapshot file if first chunk (offset is 0) (§7.2)
     if (r.file_offset == 0) {
@@ -2180,6 +2492,8 @@ consensus::do_install_snapshot(install_snapshot_request r) {
         // Out of order request? Ignore and answer with success=false.
         co_return reply;
     }
+
+    upsert_recovery_state(r.last_included_index, r.dirty_offset, true);
 
     // Write data into snapshot file at given offset (§7.3)
     size_t chunk_size = r.chunk.size_bytes();
@@ -2240,6 +2554,7 @@ ss::future<install_snapshot_reply> consensus::finish_snapshot(
 }
 
 ss::future<> consensus::write_snapshot(write_snapshot_cfg cfg) {
+    auto holder = _bg.hold();
     model::offset last_included_index = cfg.last_included_index;
     bool updated = co_await _snapshot_lock
                      .with([this, cfg = std::move(cfg)]() mutable {
@@ -2289,9 +2604,7 @@ ss::future<> consensus::write_snapshot(write_snapshot_cfg cfg) {
     _flushed_offset = std::max(last_included_index, _flushed_offset);
 
     co_await _snapshot_lock.with([this, last_included_index]() mutable {
-        return ss::when_all_succeed(
-          _configuration_manager.prefix_truncate(last_included_index),
-          _offset_translator.prefix_truncate(last_included_index));
+        return _configuration_manager.prefix_truncate(last_included_index);
     });
 }
 
@@ -2323,8 +2636,7 @@ consensus::do_write_snapshot(model::offset last_included_index, iobuf&& data) {
       .latest_configuration = *config,
       .cluster_time = clock_type::time_point::min(),
       .log_start_delta = offset_translator_delta(
-        _offset_translator.state()->delta(
-          model::next_offset(last_included_index))),
+        _log->offset_delta(model::next_offset(last_included_index))()),
     };
 
     return details::persist_snapshot(
@@ -2366,6 +2678,10 @@ consensus::open_snapshot() {
     };
 }
 
+ss::future<std::optional<ss::file>> consensus::open_snapshot_file() const {
+    return _snapshot_mgr.open_snapshot_file();
+}
+
 ss::future<std::error_code> consensus::replicate_configuration(
   ssx::semaphore_units u, group_configuration cfg) {
     // under the _op_sem lock
@@ -2375,17 +2691,21 @@ ss::future<std::error_code> consensus::replicate_configuration(
     vlog(_ctxlog.debug, "Replicating group configuration {}", cfg);
     return ss::with_gate(
       _bg, [this, u = std::move(u), cfg = std::move(cfg)]() mutable {
-          maybe_upgrade_configuration_to_v4(cfg);
+          try_updating_configuration_version(cfg);
+
           auto batches = details::serialize_configuration_as_batches(
             std::move(cfg));
+          size_t batches_size{0};
           for (auto& b : batches) {
+              batches_size += b.size_bytes();
               b.set_term(model::term_id(_term));
           }
           auto seqs = next_followers_request_seq();
           append_entries_request req(
             _self,
             meta(),
-            model::make_memory_record_batch_reader(std::move(batches)));
+            model::make_memory_record_batch_reader(std::move(batches)),
+            batches_size);
           /**
            * We use dispatch_replicate directly as we already hold the
            * _op_lock mutex when replicating configuration
@@ -2405,9 +2725,7 @@ ss::future<std::error_code> consensus::replicate_configuration(
 
 void consensus::maybe_upgrade_configuration_to_v4(group_configuration& cfg) {
     if (unlikely(cfg.version() < group_configuration::v_4)) {
-        if (
-          _features.is_active(features::feature::raft_improved_configuration)
-          && cfg.get_state() == configuration_state::simple) {
+        if (cfg.get_state() == configuration_state::simple) {
             vlog(_ctxlog.debug, "Upgrading configuration version");
             cfg.set_version(raft::group_configuration::v_4);
         }
@@ -2466,40 +2784,86 @@ append_entries_reply consensus::make_append_entries_reply(
     reply.term = _term;
     reply.last_dirty_log_index = disk_results.last_offset;
     reply.last_flushed_log_index = _flushed_offset;
-    reply.result = append_entries_reply::status::success;
+    reply.result = reply_result::success;
+    reply.may_recover = _follower_recovery_state
+                        && _follower_recovery_state->is_active();
     return reply;
 }
 
-ss::future<> consensus::flush_log() {
-    if (!_has_pending_flushes) {
-        return ss::now();
+ss::future<consensus::flushed> consensus::flush_log() {
+    _deferred_flusher.cancel();
+    _in_flight_flush = false;
+    if (!has_pending_flushes()) {
+        _last_flush_time = clock_type::now();
+        co_return flushed::no;
     }
-    _probe->log_flushed();
-    _has_pending_flushes = false;
     auto flushed_up_to = _log->offsets().dirty_offset;
-    return _log->flush().then([this, flushed_up_to] {
-        auto lstats = _log->offsets();
-        /**
-         * log flush may be interleaved with trucation, hence we need to check
-         * if log was truncated, if so we do nothing, flushed offset will be
-         * updated in the truncation path.
-         */
-        if (flushed_up_to > lstats.dirty_offset) {
-            return;
-        }
+    const auto prior_truncations = _log->get_log_truncation_counter();
+    _probe->log_flushed();
+    _pending_flush_bytes = 0;
+    co_await _log->flush();
+    _last_flush_time = clock_type::now();
+    const auto lstats = _log->offsets();
+    /**
+     * log flush may be interleaved with trucation, hence we need to check
+     * if log was truncated, if so we do nothing, flushed offset will be
+     * updated in the truncation path.
+     *
+     * On a follower the log flush may be interleaved with truncation and
+     * append. In this case the dirty_offset will not be moving back (e.g the
+     * log can be truncated by -1 and then +1 message will be added making
+     * dirty_offset equal to the old value and the committed_offset equal to
+     * dirty_offset - 1). In this case we shouldn't do anything as well. The
+     * truncation path should update the flushed offset.
+     */
+    if (
+      flushed_up_to > lstats.dirty_offset
+      || _log->get_log_truncation_counter() > prior_truncations) {
+        co_return flushed::yes;
+    }
 
-        _flushed_offset = std::max(flushed_up_to, _flushed_offset);
-        vlog(_ctxlog.trace, "flushed offset updated: {}", _flushed_offset);
-        // TODO: remove this assertion when we will remove committed_offset
-        // from storage.
-        vassert(
-          lstats.committed_offset >= _flushed_offset,
-          "Raft incorrectly tracking flushed log offset. Expected offset: {}, "
-          " current log offsets: {}, log: {}",
-          _flushed_offset,
-          lstats,
-          _log);
-    });
+    _flushed_offset = std::max(flushed_up_to, _flushed_offset);
+    vlog(_ctxlog.trace, "flushed offset updated: {}", _flushed_offset);
+
+    maybe_update_majority_replicated_index();
+    maybe_update_leader_commit_idx();
+
+    // TODO: remove this assertion when we will remove committed_offset
+    // from storage.
+    vassert(
+      lstats.committed_offset >= _flushed_offset,
+      "Raft incorrectly tracking flushed log offset. Expected offset: {}, "
+      " current log offsets: {}, log: {}",
+      _flushed_offset,
+      lstats,
+      _log);
+    co_return flushed::yes;
+}
+
+void consensus::background_flush_log() {
+    _in_flight_flush = true;
+    // An imminent flush means that we do not need the
+    // scheduled flush anymore as this guarantees that everything
+    // up until this point is flushed.
+    _deferred_flusher.cancel();
+    ssx::spawn_with_gate(_bg, [this]() { return do_flush().discard_result(); });
+}
+
+void consensus::maybe_schedule_flush() {
+    if (!has_pending_flushes() || _in_flight_flush) {
+        // if a flush is already pending, nothing to do.
+        return;
+    }
+    if (_pending_flush_bytes >= _max_pending_flush_bytes) {
+        // max flush bytes exceeded, schedule a flush right away.
+        background_flush_log();
+        return;
+    }
+    if (!_deferred_flusher.armed()) {
+        // No imminent flush and no deferred flush at this point,
+        // arm the timer to ensure appended data honors flush.ms
+        _deferred_flusher.arm(flush_ms());
+    }
 }
 
 ss::future<storage::append_result> consensus::disk_append(
@@ -2515,33 +2879,29 @@ ss::future<storage::append_result> consensus::disk_append(
 
     class consumer {
     public:
-        consumer(offset_translator& translator, storage::log_appender appender)
-          : _translator(translator)
-          , _appender(std::move(appender)) {}
+        consumer(storage::log_appender appender)
+          : _appender(std::move(appender)) {}
 
         ss::future<ss::stop_iteration> operator()(model::record_batch& batch) {
             auto ret = co_await _appender(batch);
-            // passing batch to translator after appender so that correct batch
-            // offsets are filled.
-            _translator.process(batch);
             co_return ret;
         }
 
         auto end_of_stream() { return _appender.end_of_stream(); }
 
     private:
-        offset_translator& _translator;
         storage::log_appender _appender;
     };
 
     return details::for_each_ref_extract_configuration(
              _log->offsets().dirty_offset,
              std::move(reader),
-             consumer(_offset_translator, _log->make_appender(cfg)),
+             consumer(_log->make_appender(cfg)),
              cfg.timeout)
       .then([this, should_update_last_quorum_idx](
-              std::tuple<ret_t, std::vector<offset_configuration>> t) {
+              std::tuple<ret_t, chunked_vector<offset_configuration>> t) {
           auto& [ret, configurations] = t;
+          _pending_flush_bytes += ret.byte_size;
           if (should_update_last_quorum_idx) {
               /**
                * We have to update last quorum replicated index before we
@@ -2549,9 +2909,13 @@ ss::future<storage::append_result> consensus::disk_append(
                * to deceide if follower flush is required basing on last quorum
                * replicated index.
                */
-              _last_quorum_replicated_index = ret.last_offset;
+              _last_quorum_replicated_index_with_flush = ret.last_offset;
+          } else {
+              // Here are are appending entries without a flush, signal the
+              // flusher incase we hit the thresholds, particularly unflushed
+              // bytes.
+              maybe_schedule_flush();
           }
-          _has_pending_flushes = true;
           // TODO
           // if we rolled a log segment. write current configuration
           // for speedy recovery in the background
@@ -2563,8 +2927,11 @@ ss::future<storage::append_result> consensus::disk_append(
           auto f = ss::now();
           if (!configurations.empty()) {
               // we can use latest configuration to update follower stats
-              update_follower_stats(configurations.back().cfg);
-              f = _configuration_manager.add(std::move(configurations));
+              f = _configuration_manager.add(std::move(configurations))
+                    .then([this] {
+                        update_follower_stats(
+                          _configuration_manager.get_latest());
+                    });
           }
 
           return f.then([this, ret = ret] {
@@ -2572,12 +2939,6 @@ ss::future<storage::append_result> consensus::disk_append(
               if (_bg.is_closed()) {
                   return ret;
               }
-
-              // Do checkpointing in the background to avoid latency spikes in
-              // the write path caused by KVStore flush debouncing.
-
-              ssx::spawn_with_gate(
-                _bg, [this] { return _offset_translator.maybe_checkpoint(); });
 
               _configuration_manager
                 .maybe_store_highest_known_offset_in_background(
@@ -2618,7 +2979,19 @@ protocol_metadata consensus::meta() const {
       .term = _term,
       .prev_log_index = lstats.dirty_offset,
       .prev_log_term = prev_log_term,
-      .last_visible_index = last_visible_index()};
+      .last_visible_index = last_visible_index(),
+      .dirty_offset = lstats.dirty_offset,
+      .prev_log_delta = get_offset_delta(lstats, lstats.dirty_offset),
+    };
+}
+
+model::offset_delta consensus::get_offset_delta(
+  const storage::offset_stats& lstats, model::offset offset) const {
+    if (offset < model::offset{0} || offset < lstats.start_offset) {
+        return model::offset_delta{};
+    }
+
+    return _log->offset_delta(offset);
 }
 
 void consensus::update_node_append_timestamp(vnode id) {
@@ -2631,13 +3004,10 @@ void consensus::maybe_update_node_reply_timestamp(vnode id) {
         it->second.last_received_reply_timestamp = clock_type::now();
     }
 }
-void consensus::update_node_reply_timestamp(vnode id) {
-    _fstats.get(id).last_received_reply_timestamp = clock_type::now();
-}
 
 follower_req_seq consensus::next_follower_sequence(vnode id) {
     if (auto it = _fstats.find(id); it != _fstats.end()) {
-        return it->second.last_sent_seq++;
+        return it->second.next_follower_sequence();
     }
 
     return follower_req_seq{};
@@ -2658,8 +3028,8 @@ ss::future<> consensus::refresh_commit_index() {
     return _op_lock.get_units()
       .then([this](ssx::semaphore_units u) mutable {
           auto f = ss::now();
-          if (_has_pending_flushes) {
-              f = flush_log();
+          if (has_pending_flushes()) {
+              f = flush_log().discard_result();
           }
 
           if (!is_elected_leader()) {
@@ -2760,13 +3130,16 @@ ss::future<> consensus::maybe_commit_configuration(ssx::semaphore_units u) {
         vlog(
           _ctxlog.trace,
           "current node is not longer group member, stepping down");
-        do_step_down("not_longer_member");
+        co_await transfer_and_stepdown("no_longer_member");
+        if (_leader_id) {
+            _leader_id = std::nullopt;
+            trigger_leadership_notification();
+        }
     }
 }
 
 ss::future<>
 consensus::do_maybe_update_leader_commit_idx(ssx::semaphore_units u) {
-    auto lstats = _log->offsets();
     // Raft paper:
     //
     // If there exists an N such that N > commitIndex, a majority
@@ -2804,12 +3177,13 @@ consensus::do_maybe_update_leader_commit_idx(ssx::semaphore_units u) {
         _commit_index = majority_match;
         vlog(_ctxlog.trace, "Leader commit index updated {}", _commit_index);
 
+        _replication_monitor.notify_committed();
         _commit_index_updated.broadcast();
         _event_manager.notify_commit_index();
         // if we successfully acknowledged all quorum writes we can make pending
         // relaxed consistency requests visible
-        if (_commit_index >= _last_quorum_replicated_index) {
-            maybe_update_last_visible_index(lstats.dirty_offset);
+        if (_commit_index >= _last_quorum_replicated_index_with_flush) {
+            maybe_update_last_visible_index(_majority_replicated_index);
         } else {
             // still have to wait for some quorum consistency requests to be
             // committed
@@ -2820,8 +3194,9 @@ consensus::do_maybe_update_leader_commit_idx(ssx::semaphore_units u) {
     }
     return ss::now();
 }
-ss::future<>
-consensus::maybe_update_follower_commit_idx(model::offset request_commit_idx) {
+
+void consensus::maybe_update_follower_commit_idx(
+  model::offset request_commit_idx) {
     // Raft paper:
     //
     // If leaderCommit > commitIndex, set commitIndex =
@@ -2832,11 +3207,11 @@ consensus::maybe_update_follower_commit_idx(model::offset request_commit_idx) {
             _commit_index = new_commit_idx;
             vlog(
               _ctxlog.trace, "Follower commit index updated {}", _commit_index);
+            _replication_monitor.notify_committed();
             _commit_index_updated.broadcast();
             _event_manager.notify_commit_index();
         }
     }
-    return ss::make_ready_future<>();
 }
 
 void consensus::update_follower_stats(const group_configuration& cfg) {
@@ -2845,7 +3220,9 @@ void consensus::update_follower_stats(const group_configuration& cfg) {
 }
 
 void consensus::trigger_leadership_notification() {
-    _probe->leadership_changed();
+    if (_leader_id == _self) {
+        _probe->leadership_changed();
+    }
     vlog(
       _ctxlog.debug,
       "triggering leadership notification with term: {}, new leader: {}",
@@ -2853,6 +3230,13 @@ void consensus::trigger_leadership_notification() {
       _leader_id);
     _leader_notification(leadership_status{
       .term = _term, .group = _group, .current_leader = _leader_id});
+
+    if (_follower_recovery_state && !_leader_id) {
+        // If we are recovering and the group has lost leadership, it is unclear
+        // when it will regain it. Yield the recovery slot so that other groups
+        // can make progress.
+        _follower_recovery_state->yield();
+    }
 }
 
 std::ostream& operator<<(std::ostream& o, const consensus& c) {
@@ -3296,6 +3680,67 @@ consensus::do_transfer_leadership(transfer_leadership_request req) {
     return f.finally([this] { _transferring_leadership = false; });
 }
 
+ss::future<> consensus::transfer_and_stepdown(std::string_view ctx) {
+    // select a follower with longest log
+    auto voters = _fstats
+                  | std::views::filter(
+                    [](const follower_stats::container_t::value_type& p) {
+                        return !p.second.is_learner;
+                    });
+    auto it = std::max_element(
+      voters.begin(), voters.end(), [](const auto& a, const auto& b) {
+          return a.second.last_dirty_log_index < b.second.last_dirty_log_index;
+      });
+
+    if (unlikely(it == voters.end())) {
+        vlog(
+          _ctxlog.warn,
+          "Unable to find a follower that would be an eligible candidate to "
+          "take over the leadership");
+        do_step_down(ctx);
+        co_return;
+    }
+
+    const auto target = it->first;
+    vlog(
+      _ctxlog.info,
+      "[{}] stepping down as leader in term {}, dirty offset {}, with "
+      "leadership transfer to {}",
+      ctx,
+      _term,
+      _log->offsets().dirty_offset,
+      target);
+
+    timeout_now_request req{
+      .target_node_id = target,
+      .node_id = _self,
+      .group = _group,
+      .term = _term,
+    };
+    auto timeout = raft::clock_type::now()
+                   + config::shard_local_cfg().raft_timeout_now_timeout_ms();
+    auto r = co_await _client_protocol.timeout_now(
+      target.id(), std::move(req), rpc::client_opts(timeout));
+
+    if (r.has_error()) {
+        vlog(
+          _ctxlog.warn,
+          "[{}] stepping down - failed to request timeout_now from {} - "
+          "{}",
+          ctx,
+          target,
+          r.error().message());
+    } else {
+        vlog(
+          _ctxlog.trace,
+          "[{}]  stepping down - timeout now reply result: {} from node {}",
+          ctx,
+          r.value(),
+          target);
+    }
+    do_step_down(ctx);
+}
+
 ss::future<> consensus::remove_persistent_state() {
     // voted for
     co_await _storage.kvs().remove(
@@ -3305,8 +3750,6 @@ ss::future<> consensus::remove_persistent_state() {
       storage::kvstore::key_space::consensus, last_applied_key());
     // configuration manager
     co_await _configuration_manager.remove_persistent_state();
-    // offset translator
-    co_await _offset_translator.remove_persistent_state();
     // snapshot
     co_await _snapshot_mgr.remove_snapshot();
     co_await _snapshot_mgr.remove_partial_snapshots();
@@ -3318,11 +3761,30 @@ ss::future<> consensus::remove_persistent_state() {
 void consensus::maybe_update_last_visible_index(model::offset offset) {
     _visibility_upper_bound_index = std::max(
       _visibility_upper_bound_index, offset);
-    _majority_replicated_index = std::max(_majority_replicated_index, offset);
+    do_update_majority_replicated_index(offset);
+    if (is_elected_leader()) {
+        _last_leader_visible_offset = std::max(
+          _last_leader_visible_offset, last_visible_index());
+    }
     _consumable_offset_monitor.notify(last_visible_index());
 }
 
+void consensus::do_update_majority_replicated_index(model::offset offset) {
+    vlog(
+      _ctxlog.trace,
+      "update majority_replicated_index, new offset: {}, current: {}",
+      offset,
+      _majority_replicated_index);
+    auto previous_majority_replicated_index = _majority_replicated_index;
+    _majority_replicated_index = std::max(_majority_replicated_index, offset);
+    if (previous_majority_replicated_index != _majority_replicated_index) {
+        _replication_monitor.notify_replicated();
+    }
+}
+
 void consensus::maybe_update_majority_replicated_index() {
+    // Expected to be called on the leader
+
     auto majority_match = config().quorum_match([this](vnode id) {
         if (id == _self) {
             return _log->offsets().dirty_offset;
@@ -3332,38 +3794,68 @@ void consensus::maybe_update_majority_replicated_index() {
         }
         return model::offset{};
     });
-
-    _majority_replicated_index = std::max(
-      _majority_replicated_index, majority_match);
+    do_update_majority_replicated_index(majority_match);
+    _last_leader_visible_offset = std::max(
+      _last_leader_visible_offset, last_visible_index());
     _consumable_offset_monitor.notify(last_visible_index());
 }
 
-heartbeats_suppressed consensus::are_heartbeats_suppressed(vnode id) const {
-    if (!_fstats.contains(id)) {
-        return heartbeats_suppressed::yes;
-    }
+consensus::inflight_appends_guard::inflight_appends_guard(
+  consensus& parent, vnode target) noexcept
+  : _parent(&parent)
+  , _term(_parent->term())
+  , _target(target) {
+    vassert(
+      _parent->is_elected_leader(),
+      "ntp {}: tried to suppress heartbeats to vnode {} while not being leader "
+      "in term {}",
+      _parent->ntp(),
+      _target,
+      _term);
 
-    return _fstats.get(id).suppress_heartbeats;
+    auto it = _parent->_fstats.find(_target);
+    if (it == _parent->_fstats.end()) {
+        // make unsuppress() a noop
+        _parent = nullptr;
+        return;
+    }
+    ++it->second.inflight_append_request_count;
 }
 
-void consensus::update_suppress_heartbeats(
-  vnode id, follower_req_seq last_seq, heartbeats_suppressed suppressed) {
-    if (auto it = _fstats.find(id); it != _fstats.end()) {
-        /**
-         * Since there may be concurrent sources causing heartbeats suppression
-         * we use last_suppress_heartbeats_seq to control concurrency of
-         * heartbeats state update
-         */
-        if (last_seq >= it->second.last_suppress_heartbeats_seq) {
-            it->second.last_suppress_heartbeats_seq = last_seq;
-            it->second.suppress_heartbeats = suppressed;
-        }
+void consensus::inflight_appends_guard::mark_finished() {
+    if (!_parent) {
+        return;
     }
+    if (!_parent->is_elected_leader() || _term != _parent->term()) {
+        // lost leadership while the guard was alive.
+        // do nothing as suppress_heartbeats_count was reset.
+        return;
+    }
+
+    auto it = _parent->_fstats.find(_target);
+    if (it == _parent->_fstats.end()) {
+        // the follower could be removed while the guard is alive
+        _parent = nullptr;
+        return;
+    }
+
+    vassert(
+      it->second.inflight_append_request_count > 0,
+      "ntp {}: suppress/unsuppress_heartbeats mismatch for vnode {}",
+      _parent->ntp(),
+      _target);
+    --it->second.inflight_append_request_count;
+    _parent = nullptr;
+}
+
+consensus::inflight_appends_guard consensus::track_append_inflight(vnode id) {
+    return inflight_appends_guard{*this, id};
 }
 
 void consensus::update_heartbeat_status(vnode id, bool success) {
     if (auto it = _fstats.find(id); it != _fstats.end()) {
         if (success) {
+            it->second.last_received_reply_timestamp = clock_type::now();
             it->second.heartbeats_failed = 0;
         } else {
             it->second.heartbeats_failed++;
@@ -3527,6 +4019,233 @@ std::optional<uint8_t> consensus::get_under_replicated() const {
         }
     }
     return count;
+}
+
+reply_result consensus::lightweight_heartbeat(
+  model::node_id source_node, model::node_id target_node) {
+    /**
+     * Handle lightweight heartbeat
+     */
+    if (unlikely(target_node != _self.id())) {
+        vlog(
+          _ctxlog.warn,
+          "received lw_heartbeat request addressed to different node: {}, "
+          "current node: {}, source: {}",
+          target_node,
+          _self,
+          source_node);
+        return reply_result::group_unavailable;
+    }
+
+    /**
+     * If leader has changed force full heartbeat
+     */
+    if (unlikely(
+          !_leader_id.has_value() || (_leader_id->id() != source_node))) {
+        vlog(
+          _ctxlog.trace,
+          "requesting full heartbeat from {}, leadership changed",
+          source_node);
+        return reply_result::failure;
+    }
+    /**
+     * Not yet received heartbeats, follower was restarted while leader is
+     * sending out lightweight heartbeats, reply with failure to force sending
+     * full heartbeat.
+     */
+    if (unlikely(_hbeat == clock_type::time_point::min())) {
+        vlog(
+          _ctxlog.trace,
+          "requesting full heartbeat from {}, follower still in an initial "
+          "state",
+          source_node);
+        return reply_result::failure;
+    }
+
+    if (unlikely(
+          _follower_recovery_state && _follower_recovery_state->is_active())) {
+        // If for some reason the leader is sending us lightweight heartbeats
+        // after we allowed recovery, notify it by forcing a full heartbeat.
+        return reply_result::failure;
+    }
+
+    _hbeat = clock_type::now();
+    return reply_result::success;
+}
+ss::future<full_heartbeat_reply> consensus::full_heartbeat(
+  group_id group,
+  model::node_id source_node,
+  model::node_id target_node,
+  const heartbeat_request_data& hb_data) {
+    const vnode target_vnode(target_node, hb_data.target_revision);
+    const vnode source_vnode(source_node, hb_data.source_revision);
+    full_heartbeat_reply reply{.group = _group};
+
+    if (unlikely(target_vnode != _self)) {
+        vlog(
+          _ctxlog.warn,
+          "received full heartbeat request addressed to node with different "
+          "revision: {}, current node: {}, source: {}",
+          target_vnode,
+          _self,
+          source_vnode);
+        reply.result = reply_result::group_unavailable;
+        co_return reply;
+    }
+    /**
+     * IMPORTANT: do not use request reference after the scheduling point
+     */
+    append_entries_reply r = co_await append_entries(append_entries_request(
+      source_vnode,
+      target_vnode,
+      protocol_metadata{
+        .group = group,
+        .commit_index = hb_data.commit_index,
+        .term = hb_data.term,
+        .prev_log_index = hb_data.prev_log_index,
+        .prev_log_term = hb_data.prev_log_term,
+        .last_visible_index = hb_data.last_visible_index,
+        .dirty_offset = hb_data.prev_log_index,
+      },
+      model::make_memory_record_batch_reader(
+        ss::circular_buffer<model::record_batch>{}),
+      0,
+      flush_after_append::no));
+
+    reply.result = r.result;
+    reply.data = heartbeat_reply_data{
+      .source_revision = _self.revision(),
+      .target_revision = source_vnode.revision(),
+      .term = r.term,
+      .last_flushed_log_index = r.last_flushed_log_index,
+      .last_dirty_log_index = r.last_dirty_log_index,
+      .last_term_base_offset = r.last_term_base_offset,
+      .may_recover = r.may_recover,
+    };
+    co_return reply;
+}
+void consensus::reset_last_sent_protocol_meta(const vnode& node) {
+    if (auto it = _fstats.find(node); it != _fstats.end()) {
+        it->second.last_sent_protocol_meta.reset();
+    }
+}
+
+void consensus::upsert_recovery_state(
+  model::offset our_last_offset,
+  model::offset leader_last_offset,
+  bool already_recovering) {
+    bool force_active = already_recovering
+                        || !_features.is_active(
+                          features::feature::raft_coordinated_recovery);
+
+    if (!_follower_recovery_state) {
+        _follower_recovery_state.emplace(
+          _recovery_scheduler,
+          *this,
+          our_last_offset,
+          leader_last_offset,
+          force_active);
+        vlog(
+          _ctxlog.debug,
+          "entering follower_recovery_state, leader last offset: {} (already "
+          "recovering: {}), our last offset: {}, may_recover: {}",
+          leader_last_offset,
+          already_recovering,
+          our_last_offset,
+          _follower_recovery_state->is_active());
+    } else {
+        if (force_active && !_follower_recovery_state->is_active()) {
+            _follower_recovery_state->force_active();
+        }
+
+        _follower_recovery_state->update_progress(
+          our_last_offset, leader_last_offset);
+    }
+}
+
+ss::future<> consensus::do_flush() {
+    try {
+        auto holder = _bg.hold();
+        auto flush = ssx::now(consensus::flushed::no);
+        {
+            auto u = co_await _op_lock.get_units();
+            flush = flush_log();
+        }
+        auto flushed = co_await std::move(flush);
+        if (flushed && is_leader()) {
+            for (auto& [id, idx] : _fstats) {
+                // force full heartbeat to move the committed index forward
+                idx.last_sent_protocol_meta.reset();
+            }
+        }
+    } catch (const ss::gate_closed_exception&) {
+    } catch (const ss::broken_semaphore&) {
+        // ignore exception, group is shutting down.
+    }
+}
+
+std::optional<model::offset> consensus::get_learner_start_offset() const {
+    const auto& latest_cfg = _configuration_manager.get_latest();
+
+    if (latest_cfg.get_configuration_update()) {
+        return latest_cfg.get_configuration_update()->learner_start_offset;
+    }
+    return std::nullopt;
+}
+
+consensus::flush_delay_t consensus::compute_max_flush_delay() const {
+    auto delay = flush_jitter_t{log_config().flush_ms(), flush_ms_jitter}
+                   .next_duration();
+    if (delay > std::chrono::years{1}) {
+        // For large delays (eg: long max), the condition variable waiting
+        // on this delay runs into a UB because of an overflow. A total
+        // hack here is to convert it to a larger duration type so the
+        // integral value of the duration is much smaller thus avoiding
+        // the overflow. This is a pretty bad hack but needed to
+        // workaround seastar's inability to wait for arbitrary large yet
+        // valid durations supposedly used for indefinite waits.
+        auto delay_years = std::chrono::duration_cast<std::chrono::years>(
+          delay);
+        return flush_delay_t{delay_years};
+    }
+    return flush_delay_t{delay};
+}
+
+std::chrono::milliseconds consensus::flush_ms() const {
+    return std::visit(
+      [](auto&& delay) {
+          using T = std::decay_t<decltype(delay)>;
+          if constexpr (std::is_same_v<T, std::chrono::milliseconds>) {
+              return delay;
+          } else {
+              return std::chrono::duration_cast<std::chrono::milliseconds>(
+                delay);
+          }
+      },
+      _max_flush_delay);
+}
+
+void consensus::notify_config_update() {
+    _write_caching_enabled = log_config().write_caching();
+    _max_pending_flush_bytes = log_config().flush_bytes();
+    _max_flush_delay = compute_max_flush_delay();
+    if (_deferred_flusher.armed()) {
+        _deferred_flusher.rearm(ss::lowres_clock::now() + flush_ms());
+    }
+}
+
+size_t consensus::bytes_to_deliver_to_learners() const {
+    if (!is_leader()) {
+        return 0;
+    }
+
+    size_t total = 0;
+    for (auto& [f_id, f_meta] : _fstats) {
+        if (f_meta.is_learner) [[unlikely]] {
+            total += _log->size_bytes_after_offset(f_meta.match_index);
+        }
+    }
+    return total;
 }
 
 } // namespace raft

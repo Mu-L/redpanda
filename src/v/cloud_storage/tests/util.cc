@@ -10,12 +10,13 @@
  */
 #include "cloud_storage/tests/util.h"
 
+#include "cloud_storage/partition_manifest_downloader.h"
+#include "model/record.h"
 #include "model/record_batch_types.h"
+#include "utils/stream_provider.h"
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/util/defer.hh>
-
-#include <boost/test/unit_test.hpp>
 
 #include <algorithm>
 #include <ostream>
@@ -24,8 +25,10 @@
 
 namespace cloud_storage {
 
-segment_layout
-generate_segment_layout(int num_segments, int seed, bool exclude_tx_fence) {
+static const remote_path_provider path_provider(std::nullopt, std::nullopt);
+
+segment_layout generate_segment_layout(
+  int num_segments, [[maybe_unused]] int seed, bool exclude_tx_fence) {
     static constexpr size_t max_segment_size = 20;
     static constexpr size_t max_batch_size = 10;
     static constexpr size_t max_record_bytes = 2048;
@@ -55,7 +58,7 @@ generate_segment_layout(int num_segments, int seed, bool exclude_tx_fence) {
                 batch_size = 1;
             }
             std::vector<size_t> sizes;
-            for (int j = 0; j < batch_size; j++) {
+            for (size_t j = 0; j < batch_size; j++) {
                 sizes.push_back(
                   random_generators::get_int(max_record_bytes - 1));
             }
@@ -148,6 +151,16 @@ make_segment(model::offset base, const std::vector<batch_t>& batches) {
           }
           return acc + b.num_records;
       });
+    std::optional<model::timestamp> base_ts;
+    std::optional<model::timestamp> last_ts;
+    for (const auto& b : batches) {
+        if (b.timestamp.has_value()) {
+            last_ts = b.timestamp;
+            if (!base_ts.has_value()) {
+                base_ts = b.timestamp;
+            }
+        }
+    }
     auto [segment_bytes, next_offset] = generate_segment(base, batches);
     std::vector<model::record_batch_header> hdr;
     std::vector<iobuf> rec;
@@ -167,6 +180,8 @@ make_segment(model::offset base, const std::vector<batch_t>& batches) {
     s.num_config_batches = num_config_batches;
     s.num_config_records = num_config_records;
     s.delta_offset_overlap = 0;
+    s.base_timestamp = base_ts;
+    s.last_timestamp = last_ts;
     return s;
 }
 
@@ -345,7 +360,7 @@ std::vector<in_memory_segment> make_segments(
         // s2 should have delta_offset_shift set to number of config records
         // in batch 7, otherwise the manifest will be generated incorrectly.
         in_memory_segment prev;
-        for (int i = 0; i < segments.size(); i++) {
+        for (size_t i = 0; i < segments.size(); i++) {
             const auto& batches = segments[i];
             auto body = make_segment(base_offset, batches);
             if (i > 0) {
@@ -374,7 +389,7 @@ std::vector<in_memory_segment> make_segments(
         // s2             [4, 5, 6, 7]
         // s2'               [5, 6, 7]
         vlog(test_util_log.debug, "Producing duplicated log segments");
-        for (int i = 0; i < segments.size(); i++) {
+        for (size_t i = 0; i < segments.size(); i++) {
             const auto& batches = segments[i];
             auto body = make_segment(base_offset, batches);
             if (batches.size() > 1) {
@@ -387,7 +402,7 @@ std::vector<in_memory_segment> make_segments(
             base_offset = s.back().max_offset + model::offset(1);
         }
     } else {
-        for (int i = 0; i < segments.size(); i++) {
+        for (size_t i = 0; i < segments.size(); i++) {
             const auto& batches = segments[i];
             auto body = make_segment(base_offset, batches);
             s.push_back(std::move(body));
@@ -415,9 +430,10 @@ std::vector<cloud_storage_fixture::expectation> make_imposter_expectations(
   const std::vector<in_memory_segment>& segments) {
     std::vector<cloud_storage_fixture::expectation> results;
     for (const auto& s : segments) {
-        auto url = m.generate_segment_path(*m.get(s.base_offset));
+        auto url = m.generate_segment_path(
+          *m.get(s.base_offset), path_provider);
         results.push_back(cloud_storage_fixture::expectation{
-          .url = "/" + url().string(), .body = s.bytes});
+          .url = url().string(), .body = s.bytes});
     }
     auto serialized = [&] {
         auto s_data = m.serialize().get();
@@ -425,13 +441,14 @@ std::vector<cloud_storage_fixture::expectation> make_imposter_expectations(
         return ss::sstring(buf.begin(), buf.end());
     };
     results.push_back(cloud_storage_fixture::expectation{
-      .url = "/" + m.get_manifest_path()().string(), .body = serialized()});
+      .url = m.get_manifest_path(path_provider)().string(),
+      .body = serialized()});
     std::stringstream ostr;
     m.serialize_json(ostr);
     vlog(
       test_util_log.info,
       "Uploaded manifest at {}:\n{}",
-      m.get_manifest_path(),
+      m.get_manifest_path(path_provider),
       ostr.str());
     return results;
 }
@@ -458,14 +475,14 @@ std::vector<cloud_storage_fixture::expectation> make_imposter_expectations(
           "computed segment delta {}, segment {}",
           segment_delta,
           s);
-        BOOST_REQUIRE(segment_delta <= s.base_offset);
+        BOOST_REQUIRE(model::offset_cast(segment_delta) <= s.base_offset());
         cloud_storage::partition_manifest::segment_meta meta{
           .is_compacted = false,
           .size_bytes = s.bytes.size(),
           .base_offset = s.base_offset,
           .committed_offset = s.max_offset,
-          .base_timestamp = {},
-          .max_timestamp = {},
+          .base_timestamp = s.base_timestamp.value_or(model::timestamp()),
+          .max_timestamp = s.last_timestamp.value_or(model::timestamp()),
           .delta_offset = segment_delta,
           .ntp_revision = m.get_revision_id(),
           .delta_offset_end = model::offset_delta(delta)
@@ -475,9 +492,10 @@ std::vector<cloud_storage_fixture::expectation> make_imposter_expectations(
         m.add(s.sname, meta);
         delta = delta
                 + model::offset(s.num_config_records - s.delta_offset_overlap);
-        auto url = m.generate_segment_path(*m.get(meta.base_offset));
+        auto url = m.generate_segment_path(
+          *m.get(meta.base_offset), path_provider);
         results.push_back(cloud_storage_fixture::expectation{
-          .url = "/" + url().string(), .body = body});
+          .url = url().string(), .body = body});
     }
     m.advance_insync_offset(m.get_last_offset());
     auto serialized = [&] {
@@ -486,14 +504,15 @@ std::vector<cloud_storage_fixture::expectation> make_imposter_expectations(
         return ss::sstring(buf.begin(), buf.end());
     };
     results.push_back(cloud_storage_fixture::expectation{
-      .url = "/" + m.get_manifest_path()().string(), .body = serialized()});
+      .url = m.get_manifest_path(path_provider)().string(),
+      .body = serialized()});
     std::ostringstream ostr;
     m.serialize_json(ostr);
 
     vlog(
       test_util_log.info,
       "Uploaded manifest at {}:\n{}",
-      m.get_manifest_path(),
+      m.get_manifest_path(path_provider),
       ostr.str());
     return results;
 }
@@ -534,6 +553,50 @@ std::vector<in_memory_segment> setup_s3_imposter(
     return segments;
 }
 
+/// Generate segments and replace the original ones.
+/// The batches should describe updated offset range.
+std::vector<in_memory_segment> replace_segments(
+  cloud_storage_fixture& fixture,
+  cloud_storage::partition_manifest& manifest,
+  model::offset base_offset,
+  model::offset_delta base_delta,
+  const std::vector<std::vector<batch_t>>& batches) {
+    // the batches are supposed to replace the ones which are already
+    // in the manifest
+    auto segments = make_segments(batches, base_offset);
+
+    // remove old segments
+    std::vector<ss::sstring> segments_to_remove;
+    for (const auto& s : segments) {
+        auto bo = s.base_offset;
+        auto it = manifest.find(bo);
+        BOOST_REQUIRE(it != manifest.end());
+        auto path = manifest.generate_segment_path(*it, path_provider);
+        segments_to_remove.push_back(path().native());
+    }
+    fixture.remove_expectations(segments_to_remove);
+
+    // remove manifest from the list
+    auto manifest_url = manifest.get_manifest_path(path_provider)().string();
+
+    auto expectations = make_imposter_expectations(
+      manifest, segments, false, base_delta);
+
+    auto it = std::find_if(
+      expectations.begin(),
+      expectations.end(),
+      [manifest_url](const cloud_storage_fixture::expectation& e) {
+          return e.url == manifest_url;
+      });
+
+    vassert(it != expectations.end(), "Can't find manifest URL");
+    expectations.erase(it);
+
+    // add re-generated segments to the impostor
+    fixture.add_expectations(expectations);
+    return segments;
+}
+
 std::vector<in_memory_segment> setup_s3_imposter(
   cloud_storage_fixture& fixture,
   std::vector<std::vector<batch_t>> batches,
@@ -562,10 +625,15 @@ partition_manifest hydrate_manifest(
   remote& api, const cloud_storage_clients::bucket_name& bucket) {
     static ss::abort_source never_abort;
 
+    remote_path_provider path_provider(std::nullopt, std::nullopt);
+    partition_manifest_downloader dl(
+      bucket, path_provider, manifest_ntp, manifest_revision, api);
     partition_manifest m(manifest_ntp, manifest_revision);
-    retry_chain_node rtc(never_abort, 30s, 200ms);
-    auto [res, _] = api.try_download_partition_manifest(bucket, m, rtc).get();
-    BOOST_REQUIRE(res == cloud_storage::download_result::success);
+    retry_chain_node rtc(never_abort, 300s, 200ms);
+    ss::lowres_clock::update();
+    auto res = dl.download_manifest(rtc, &m).get();
+    BOOST_REQUIRE(res.has_value());
+    BOOST_REQUIRE(res.value() == find_partition_manifest_outcome::success);
     return m;
 }
 
@@ -585,25 +653,30 @@ std::vector<model::record_batch_header> scan_remote_partition_incrementally(
     // incorrectly.
     ss::lowres_clock::update();
     auto conf = imposter.get_configuration();
-    static auto bucket = cloud_storage_clients::bucket_name("bucket");
     if (maybe_max_segments) {
         config::shard_local_cfg()
-          .cloud_storage_max_materialized_segments_per_shard(
+          .cloud_storage_max_materialized_segments_per_shard.set_value(
             maybe_max_segments);
     }
     if (maybe_max_readers) {
-        config::shard_local_cfg().cloud_storage_max_segment_readers_per_shard(
-          maybe_max_readers);
+        config::shard_local_cfg()
+          .cloud_storage_max_segment_readers_per_shard.set_value(
+            maybe_max_readers);
     }
-    auto manifest = hydrate_manifest(imposter.api.local(), bucket);
+    auto manifest = hydrate_manifest(
+      imposter.api.local(), imposter.bucket_name);
     partition_probe probe(manifest.get_ntp());
     auto manifest_view = ss::make_shared<async_manifest_view>(
-      imposter.api, imposter.cache, manifest, bucket, probe);
+      imposter.api,
+      imposter.cache,
+      manifest,
+      imposter.bucket_name,
+      path_provider);
     auto partition = ss::make_shared<remote_partition>(
       manifest_view,
       imposter.api.local(),
       imposter.cache.local(),
-      bucket,
+      imposter.bucket_name,
       probe);
     auto partition_stop = ss::defer([&partition] { partition->stop().get(); });
 
@@ -665,28 +738,37 @@ std::vector<model::record_batch_header> scan_remote_partition(
     // incorrectly.
     ss::lowres_clock::update();
     auto conf = imposter.get_configuration();
-    static auto bucket = cloud_storage_clients::bucket_name("bucket");
     if (maybe_max_segments) {
         config::shard_local_cfg()
-          .cloud_storage_max_materialized_segments_per_shard(
+          .cloud_storage_max_materialized_segments_per_shard.set_value(
             maybe_max_segments);
     }
     if (maybe_max_readers) {
-        config::shard_local_cfg().cloud_storage_max_segment_readers_per_shard(
-          maybe_max_readers);
+        config::shard_local_cfg()
+          .cloud_storage_max_segment_readers_per_shard.set_value(
+            maybe_max_readers);
     }
     storage::log_reader_config reader_config(
       base, max, ss::default_priority_class());
 
-    auto manifest = hydrate_manifest(imposter.api.local(), bucket);
+    auto manifest = hydrate_manifest(
+      imposter.api.local(), imposter.bucket_name);
     partition_probe probe(manifest.get_ntp());
     auto manifest_view = ss::make_shared<async_manifest_view>(
-      imposter.api, imposter.cache, manifest, bucket, probe);
+      imposter.api,
+      imposter.cache,
+      manifest,
+      imposter.bucket_name,
+      path_provider);
+    auto manifest_view_stop = ss::defer(
+      [&manifest_view] { manifest_view->stop().get(); });
+    manifest_view->start().get();
+
     auto partition = ss::make_shared<remote_partition>(
       manifest_view,
       imposter.api.local(),
       imposter.cache.local(),
-      bucket,
+      imposter.bucket_name,
       probe);
     auto partition_stop = ss::defer([&partition] { partition->stop().get(); });
 
@@ -699,6 +781,165 @@ std::vector<model::record_batch_header> scan_remote_partition(
     std::move(reader).release();
 
     return headers_read;
+}
+
+/// Similar to previous function but uses timequery to start the scan
+scan_result scan_remote_partition(
+  cloud_storage_fixture& imposter,
+  model::offset min,
+  model::timestamp timestamp,
+  model::offset max,
+  size_t maybe_max_segments,
+  size_t maybe_max_readers) {
+    // The lowres clock could become stale after reactor stall. In this
+    // case, if the reactor stall was longer than 1s and the next the next
+    // call to ss::lowres_clock::now() will result in a sudden jump forward
+    // in time and the timeout for the next operation will be computed
+    // incorrectly.
+    ss::lowres_clock::update();
+    auto conf = imposter.get_configuration();
+    if (maybe_max_segments) {
+        config::shard_local_cfg()
+          .cloud_storage_max_materialized_segments_per_shard.set_value(
+            maybe_max_segments);
+    }
+    if (maybe_max_readers) {
+        config::shard_local_cfg()
+          .cloud_storage_max_segment_readers_per_shard.set_value(
+            maybe_max_readers);
+    }
+    auto manifest = hydrate_manifest(
+      imposter.api.local(), imposter.bucket_name);
+    storage::log_reader_config reader_config(
+      min, max, ss::default_priority_class());
+    reader_config.first_timestamp = timestamp;
+
+    partition_probe probe(manifest.get_ntp());
+    auto manifest_view = ss::make_shared<async_manifest_view>(
+      imposter.api,
+      imposter.cache,
+      manifest,
+      imposter.bucket_name,
+      path_provider);
+    auto manifest_view_stop = ss::defer(
+      [&manifest_view] { manifest_view->stop().get(); });
+
+    manifest_view->start().get();
+    auto partition = ss::make_shared<remote_partition>(
+      manifest_view,
+      imposter.api.local(),
+      imposter.cache.local(),
+      imposter.bucket_name,
+      probe);
+    auto partition_stop = ss::defer([&partition] { partition->stop().get(); });
+
+    partition->start().get();
+
+    auto bytes_read = probe.get_bytes_read();
+    auto bytes_skip = probe.get_bytes_skip();
+    auto bytes_accept = probe.get_bytes_skip();
+    auto records_read = probe.get_records_read();
+
+    auto reader = partition->make_reader(reader_config).get().reader;
+
+    auto headers_read
+      = reader.consume(test_consumer(), model::no_timeout).get();
+    std::move(reader).release();
+
+    return {
+      .headers = std::move(headers_read),
+      .bytes_read = probe.get_bytes_read() - bytes_read,
+      .records_read = probe.get_records_read() - records_read,
+      .bytes_skip = probe.get_bytes_skip() - bytes_skip,
+      .bytes_accept = probe.get_bytes_accept() - bytes_accept,
+    };
+}
+
+std::vector<model::record_batch_header>
+scan_remote_partition_incrementally_with_closest_lso(
+  cloud_storage_fixture& imposter,
+  model::offset base,
+  model::offset max,
+  size_t maybe_max_segments,
+  size_t maybe_max_readers) {
+    ss::lowres_clock::update();
+    auto conf = imposter.get_configuration();
+    if (maybe_max_segments) {
+        config::shard_local_cfg()
+          .cloud_storage_max_materialized_segments_per_shard.set_value(
+            maybe_max_segments);
+    }
+    if (maybe_max_readers) {
+        config::shard_local_cfg()
+          .cloud_storage_max_segment_readers_per_shard.set_value(
+            maybe_max_readers);
+    }
+    auto manifest = hydrate_manifest(
+      imposter.api.local(), imposter.bucket_name);
+    partition_probe probe(manifest.get_ntp());
+
+    auto manifest_view = ss::make_shared<async_manifest_view>(
+      imposter.api,
+      imposter.cache,
+      manifest,
+      imposter.bucket_name,
+      path_provider);
+
+    auto partition = ss::make_shared<remote_partition>(
+      manifest_view,
+      imposter.api.local(),
+      imposter.cache.local(),
+      imposter.bucket_name,
+      probe);
+
+    auto partition_stop = ss::defer([&partition] { partition->stop().get(); });
+
+    partition->start().get();
+
+    std::vector<model::record_batch_header> headers;
+
+    storage::log_reader_config reader_config(
+      base, model::next_offset(base), ss::default_priority_class());
+
+    // starting max_bytes
+    reader_config.max_bytes = 1;
+
+    auto next = base;
+
+    int num_fetches = 0;
+    while (next < max) {
+        reader_config.start_offset = next;
+        reader_config.max_offset = model::next_offset(next);
+        vlog(test_util_log.info, "reader_config {}", reader_config);
+        auto reader = partition->make_reader(reader_config).get().reader;
+        auto headers_read
+          = reader.consume(test_consumer(), model::no_timeout).get();
+        if (headers_read.empty()) {
+            // If the reader returned the empty result then the offset
+            // corresponds to tx-batch. Our own tx-batches looks like offset
+            // gaps to the client. We're always adding tx-batches with only one
+            // record so we can increment the 'next' offset and continue.
+            next = model::next_offset(next);
+            vlog(
+              test_util_log.info,
+              "Reader config: {} produced empty result, next offset set to {}",
+              reader_config,
+              next);
+            // test is prepared to see the gaps in place of tx-fence batches
+            continue;
+        }
+        BOOST_REQUIRE(headers_read.size() == 1);
+        vlog(test_util_log.info, "header {}", headers_read.front());
+        next = headers_read.back().last_offset() + model::offset(1);
+        std::copy(
+          headers_read.begin(),
+          headers_read.end(),
+          std::back_inserter(headers));
+        num_fetches++;
+    }
+    BOOST_REQUIRE(num_fetches > 0);
+    vlog(test_util_log.info, "{} fetch operations performed", num_fetches);
+    return headers;
 }
 
 void reupload_compacted_segments(
@@ -737,21 +978,21 @@ void reupload_compacted_segments(
             // and object store state getting out of sync.
             m.add(s.sname, meta);
 
-            auto url = m.generate_segment_path(*m.get(meta.base_offset));
+            auto url = m.generate_segment_path(
+              *m.get(meta.base_offset), path_provider);
             vlog(test_util_log.debug, "reuploading segment {}", url);
             retry_chain_node rtc(never_abort, 60s, 1s);
             bytes bb;
             bb.resize(body.size());
             std::memcpy(bb.data(), body.data(), body.size());
             auto reset_stream = [body = std::move(bb)] {
-                return ss::make_ready_future<
-                  std::unique_ptr<storage::stream_provider>>(
+                return ss::make_ready_future<std::unique_ptr<stream_provider>>(
                   std::make_unique<storage::segment_reader_handle>(
                     make_iobuf_input_stream(bytes_to_iobuf(body))));
             };
             auto result = fixture.api.local()
                             .upload_segment(
-                              cloud_storage_clients::bucket_name("bucket"),
+                              fixture.bucket_name,
                               url,
                               meta.size_bytes,
                               std::move(reset_stream),

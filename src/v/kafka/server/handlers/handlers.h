@@ -12,6 +12,7 @@
 
 #include "kafka/server/handlers/add_offsets_to_txn.h"
 #include "kafka/server/handlers/add_partitions_to_txn.h"
+#include "kafka/server/handlers/alter_client_quotas.h"
 #include "kafka/server/handlers/alter_configs.h"
 #include "kafka/server/handlers/alter_partition_reassignments.h"
 #include "kafka/server/handlers/api_versions.h"
@@ -23,6 +24,7 @@
 #include "kafka/server/handlers/delete_records.h"
 #include "kafka/server/handlers/delete_topics.h"
 #include "kafka/server/handlers/describe_acls.h"
+#include "kafka/server/handlers/describe_client_quotas.h"
 #include "kafka/server/handlers/describe_configs.h"
 #include "kafka/server/handlers/describe_groups.h"
 #include "kafka/server/handlers/describe_log_dirs.h"
@@ -59,6 +61,12 @@ template<typename... Requests>
 requires(KafkaApiHandler<Requests>, ...)
 using make_request_types = type_list<Requests...>;
 
+/*
+ * This set of handlers defines what the kafka server supports. If you are
+ * adding to this list, then you'll want to also update the list in
+ * kafka/protocol/flex_versions.cc which define properties about the protocol
+ * itself as shared between our client and server.
+ */
 using request_types = make_request_types<
   produce_handler,
   fetch_handler,
@@ -99,7 +107,9 @@ using request_types = make_request_types<
   list_partition_reassignments_handler,
   describe_producers_handler,
   describe_transactions_handler,
-  list_transactions_handler>;
+  list_transactions_handler,
+  alter_client_quotas_handler,
+  describe_client_quotas_handler>;
 
 template<typename... RequestTypes>
 static constexpr size_t max_api_key(type_list<RequestTypes...>) {

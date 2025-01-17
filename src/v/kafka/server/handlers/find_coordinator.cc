@@ -11,9 +11,9 @@
 
 #include "cluster/topics_frontend.h"
 #include "cluster/tx_gateway_frontend.h"
-#include "cluster/tx_registry_frontend.h"
 #include "config/configuration.h"
 #include "kafka/protocol/errors.h"
+#include "kafka/protocol/find_coordinator.h"
 #include "kafka/server/coordinator_ntp_mapper.h"
 #include "kafka/server/rm_group_frontend.h"
 #include "model/metadata.h"
@@ -84,7 +84,15 @@ ss::future<response_ptr> find_coordinator_handler::handle(
 
         transactional_id tx_id(request.data.key);
 
-        if (!ctx.authorized(security::acl_operation::describe, tx_id)) {
+        auto authz = ctx.authorized(security::acl_operation::describe, tx_id);
+
+        if (!ctx.audit()) {
+            return ctx.respond(find_coordinator_response(
+              error_code::broker_not_available,
+              "Broker not available - audit system failure"));
+        }
+
+        if (!authz) {
             return ctx.respond(find_coordinator_response(
               error_code::transactional_id_authorization_failed));
         }
@@ -93,11 +101,8 @@ ss::future<response_ptr> find_coordinator_handler::handle(
           std::move(ctx),
           [request = std::move(request),
            tx_id = std::move(tx_id)](request_context& ctx) mutable {
-              return ctx.tx_registry_frontend()
-                .find_coordinator(
-                  tx_id,
-                  config::shard_local_cfg().find_coordinator_timeout_ms())
-                .then([&ctx](cluster::find_coordinator_reply r) {
+              return ctx.tx_gateway_frontend().find_coordinator(tx_id).then(
+                [&ctx](cluster::find_coordinator_reply r) {
                     if (r.coordinator) {
                         return handle_leader(ctx, *r.coordinator);
                     }
@@ -112,8 +117,16 @@ ss::future<response_ptr> find_coordinator_handler::handle(
           find_coordinator_response(error_code::unsupported_version));
     }
 
-    if (!ctx.authorized(
-          security::acl_operation::describe, group_id(request.data.key))) {
+    auto authz = ctx.authorized(
+      security::acl_operation::describe, group_id(request.data.key));
+
+    if (!ctx.audit()) {
+        return ctx.respond(find_coordinator_response(
+          error_code::broker_not_available,
+          "Broker not available - audit system failure"));
+    }
+
+    if (!authz) {
         return ctx.respond(
           find_coordinator_response(error_code::group_authorization_failed));
     }

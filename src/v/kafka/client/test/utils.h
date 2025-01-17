@@ -11,7 +11,8 @@
 
 #pragma once
 
-#include "raft/types.h"
+#include "bytes/iobuf.h"
+#include "reflection/adl.h"
 #include "storage/record_batch_builder.h"
 
 inline model::record_batch make_batch(model::offset offset, size_t count) {

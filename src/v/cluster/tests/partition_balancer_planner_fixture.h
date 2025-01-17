@@ -11,20 +11,30 @@
 
 #pragma once
 
+#include "base/units.h"
 #include "cluster/commands.h"
+#include "cluster/data_migrated_resources.h"
+#include "cluster/health_monitor_types.h"
 #include "cluster/members_table.h"
 #include "cluster/node_status_table.h"
 #include "cluster/partition_balancer_planner.h"
 #include "cluster/partition_balancer_state.h"
+#include "cluster/scheduling/allocation_node.h"
+#include "cluster/scheduling/partition_allocator.h"
 #include "cluster/tests/utils.h"
 #include "cluster/topic_updates_dispatcher.h"
 #include "cluster/types.h"
+#include "config/configuration.h"
+#include "container/fragmented_vector.h"
+#include "features/feature_table.h"
 #include "model/metadata.h"
+#include "model/namespace.h"
 #include "random/generators.h"
 #include "test_utils/fixture.h"
-#include "units.h"
 
 #include <seastar/core/chunked_fifo.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/shared_ptr.hh>
 
 #include <chrono>
 #include <optional>
@@ -34,8 +44,6 @@ constexpr uint64_t full_node_free_size = 5_MiB;
 constexpr uint64_t nearly_full_node_free_size = 41_MiB;
 constexpr uint64_t default_partition_size = 10_MiB;
 constexpr uint64_t not_full_node_free_size = 150_MiB;
-constexpr uint64_t reallocation_batch_size = default_partition_size * 2 - 1_MiB;
-constexpr uint64_t max_concurrent_actions = 50;
 constexpr std::chrono::seconds node_unavailable_timeout = std::chrono::minutes(
   5);
 
@@ -56,20 +64,33 @@ struct controller_workers {
 public:
     controller_workers()
       : dispatcher(allocator, table, leaders, state) {
-        table.start().get();
+        migrated_resources.start().get();
+        table
+          .start(ss::sharded_parameter(
+            [this] { return std::ref(migrated_resources.local()); }))
+          .get();
         members.start_single().get();
+        features.start().get();
+        features
+          .invoke_on_all(
+            [](features::feature_table& f) { f.testing_activate_all(); })
+          .get();
         allocator
           .start_single(
             std::ref(members),
-            config::mock_binding<std::optional<size_t>>(std::nullopt),
+            std::ref(features),
             config::mock_binding<std::optional<int32_t>>(std::nullopt),
             config::mock_binding<uint32_t>(uint32_t{partitions_per_shard}),
             config::mock_binding<uint32_t>(uint32_t{partitions_reserve_shard0}),
             config::mock_binding<std::vector<ss::sstring>>(
               std::vector<ss::sstring>{
-                {"__audit", "__consumer_offsets", "_schemas"}}),
+                {model::kafka_audit_logging_topic,
+                 "__consumer_offsets",
+                 "_schemas"}}),
             config::mock_binding<bool>(true))
           .get();
+        config::shard_local_cfg().topic_memory_per_partition.set_value(
+          std::nullopt);
         // use node status that is not used in test as self is always available
         node_status_table.start_single(model::node_id{123}).get();
         state
@@ -93,13 +114,14 @@ public:
         cluster::topic_configuration cfg(
           test_ns, model::topic(topic), partitions, replication_factor);
 
-        cluster::allocation_request req(
-          cfg.tp_ns, cluster::partition_allocation_domains::common);
+        cluster::allocation_request req(cfg.tp_ns);
         req.partitions.reserve(partitions);
         for (auto p = 0; p < partitions; ++p) {
             req.partitions.emplace_back(
               model::partition_id(p), replication_factor);
         }
+        // enable topic-aware placement
+        req.existing_replica_counts = cluster::node2count_t{};
 
         auto pas = allocator.local()
                      .allocate(std::move(req))
@@ -111,8 +133,8 @@ public:
     }
 
     void set_maintenance_mode(model::node_id id) {
-        members.local().apply(
-          model::offset{}, cluster::maintenance_mode_cmd(id, true));
+        BOOST_REQUIRE(!members.local().apply(
+          model::offset{}, cluster::maintenance_mode_cmd(id, true)));
         auto broker = members.local().get_node_metadata_ref(id);
         BOOST_REQUIRE(broker);
         BOOST_REQUIRE(
@@ -121,8 +143,8 @@ public:
     }
 
     void set_decommissioning(model::node_id id) {
-        members.local().apply(
-          model::offset{}, cluster::decommission_node_cmd(id, 0));
+        BOOST_REQUIRE(!members.local().apply(
+          model::offset{}, cluster::decommission_node_cmd(id, 0)));
         allocator.local().decommission_node(id);
         auto broker = members.local().get_node_metadata_ref(id);
         BOOST_REQUIRE(broker);
@@ -136,56 +158,43 @@ public:
         node_status_table.stop().get();
         table.stop().get();
         allocator.stop().get();
+        features.stop().get();
         members.stop().get();
+        migrated_resources.stop().get();
     }
 
     ss::sharded<cluster::members_table> members;
+    ss::sharded<features::feature_table> features;
     ss::sharded<cluster::partition_allocator> allocator;
     ss::sharded<cluster::topic_table> table;
     ss::sharded<cluster::partition_leaders_table> leaders;
     ss::sharded<cluster::partition_balancer_state> state;
     ss::sharded<cluster::node_status_table> node_status_table;
     cluster::topic_updates_dispatcher dispatcher;
+    ss::sharded<cluster::data_migrations::migrated_resources>
+      migrated_resources;
 };
 
 struct partition_balancer_planner_fixture {
     cluster::partition_balancer_planner make_planner(
       model::partition_autobalancing_mode mode
-      = model::partition_autobalancing_mode::continuous) {
+      = model::partition_autobalancing_mode::continuous,
+      size_t max_concurrent_actions = 2,
+      bool request_ondemand_rebalance = false) {
         return cluster::partition_balancer_planner(
           cluster::planner_config{
             .mode = mode,
             .soft_max_disk_usage_ratio = 0.8,
             .hard_max_disk_usage_ratio = 0.95,
-            .movement_disk_size_batch = reallocation_batch_size,
             .max_concurrent_actions = max_concurrent_actions,
             .node_availability_timeout_sec = std::chrono::minutes(1),
+            .ondemand_rebalance_requested = request_ondemand_rebalance,
             .segment_fallocation_step = 16,
-            .node_responsiveness_timeout = std::chrono::seconds(10)},
+            .node_responsiveness_timeout = std::chrono::seconds(10),
+            .topic_aware = true,
+          },
           workers.state.local(),
           workers.allocator.local());
-    }
-
-    cluster::topic_configuration_assignment make_tp_configuration(
-      const ss::sstring& topic, int partitions, int16_t replication_factor) {
-        cluster::topic_configuration cfg(
-          test_ns, model::topic(topic), partitions, replication_factor);
-
-        cluster::allocation_request req(
-          cfg.tp_ns, cluster::partition_allocation_domains::common);
-        req.partitions.reserve(partitions);
-        for (auto p = 0; p < partitions; ++p) {
-            req.partitions.emplace_back(
-              model::partition_id(p), replication_factor);
-        }
-
-        auto pas = workers.allocator.local()
-                     .allocate(std::move(req))
-                     .get()
-                     .value()
-                     ->copy_assignments();
-
-        return {cfg, std::move(pas)};
     }
 
     model::topic_namespace make_tp_ns(const ss::sstring& tp) {
@@ -212,7 +221,9 @@ struct partition_balancer_planner_fixture {
           replication_factor);
 
         ss::chunked_fifo<cluster::partition_assignment> assignments;
-        for (size_t i = 0; i < partition_nodes.size(); ++i) {
+        for (model::partition_id::type i = 0;
+             i < static_cast<int>(partition_nodes.size());
+             ++i) {
             const auto& nodes = partition_nodes[i];
             BOOST_REQUIRE_EQUAL(nodes.size(), replication_factor);
             std::vector<model::broker_shard> replicas;
@@ -243,10 +254,7 @@ struct partition_balancer_planner_fixture {
         auto& members_table = workers.members.local();
 
         std::vector<model::broker> new_brokers;
-        for (auto [id, nm] : members_table.nodes()) {
-            new_brokers.push_back(nm.broker);
-        }
-
+        new_brokers.reserve(nodes_amount);
         for (size_t i = 0; i < nodes_amount; ++i) {
             std::optional<model::rack_id> rack_id;
             if (!rack_ids.empty()) {
@@ -255,7 +263,7 @@ struct partition_balancer_planner_fixture {
 
             workers.allocator.local().register_node(
               create_allocation_node(model::node_id(last_node_idx), 4));
-            new_brokers.push_back(model::broker(
+            new_brokers.emplace_back(
               model::node_id(last_node_idx),
               net::unresolved_address{},
               net::unresolved_address{},
@@ -263,12 +271,12 @@ struct partition_balancer_planner_fixture {
               model::broker_properties{
                 .cores = 4,
                 .available_memory_gb = 2,
-                .available_disk_gb = 100}));
+                .available_disk_gb = 100});
             last_node_idx++;
         }
         for (auto& b : new_brokers) {
-            members_table.apply(
-              model::offset{}, cluster::add_node_cmd(b.id(), b));
+            BOOST_REQUIRE(!members_table.apply(
+              model::offset{}, cluster::add_node_cmd(b.id(), b)));
         }
     }
 
@@ -328,7 +336,7 @@ struct partition_balancer_planner_fixture {
     populate_node_status_table(std::set<size_t> unavailable_nodes = {}) {
         std::vector<cluster::node_status> status_updates;
         status_updates.reserve(last_node_idx + 1);
-        for (size_t i = 0; i < last_node_idx; ++i) {
+        for (int i = 0; i < last_node_idx; ++i) {
             auto last_seen = raft::clock_type::now();
             if (unavailable_nodes.contains(i)) {
                 last_seen = last_seen - node_unavailable_timeout;
@@ -350,11 +358,11 @@ struct partition_balancer_planner_fixture {
       const std::set<size_t>& nearly_full_nodes = {},
       uint64_t partition_size = default_partition_size) {
         cluster::cluster_health_report health_report;
-        ss::chunked_fifo<cluster::topic_status> topics;
+        chunked_vector<cluster::topic_status> topics;
         for (const auto& topic : workers.table.local().topics_map()) {
             cluster::topic_status ts;
             ts.tp_ns = topic.second.get_configuration().tp_ns;
-            for (size_t i = 0;
+            for (int i = 0;
                  i < topic.second.get_configuration().partition_count;
                  ++i) {
                 cluster::partition_status ps;
@@ -365,7 +373,6 @@ struct partition_balancer_planner_fixture {
             topics.push_back(ts);
         }
         for (int i = 0; i < last_node_idx; ++i) {
-            cluster::node_health_report node_report;
             storage::disk node_disk{
               .free = not_full_node_free_size, .total = node_size};
             if (full_nodes.contains(i)) {
@@ -373,15 +380,24 @@ struct partition_balancer_planner_fixture {
             } else if (nearly_full_nodes.contains(i)) {
                 node_disk.free = nearly_full_node_free_size;
             }
-            node_report.id = model::node_id(i);
-            node_report.local_state.log_data_size = {
+            cluster::node::local_state local_state;
+            local_state.log_data_size = {
               .data_target_size = node_disk.total,
               .data_current_size = node_disk.total - node_disk.free,
               .data_reclaimable_size = 0};
-            node_report.local_state.set_disk(node_disk);
-            health_report.node_reports.push_back(node_report);
+            local_state.set_disk(node_disk);
+            chunked_vector<cluster::topic_status> node_topics;
+            if (i == 0) {
+                node_topics = topics.copy();
+            }
+            health_report.node_reports.emplace_back(
+              ss::make_lw_shared<cluster::node_health_report>(
+                model::node_id(i),
+                local_state,
+                std::move(node_topics),
+                std::nullopt));
         }
-        health_report.node_reports[0].topics = std::move(topics);
+
         return health_report;
     }
 

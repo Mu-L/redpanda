@@ -45,7 +45,7 @@ only use a single SSO based login.
 }
 
 func validAuths(fs afero.Fs, p *config.Params) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
-	return func(cmd *cobra.Command, _ []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	return func(_ *cobra.Command, _ []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		cfg, err := p.Load(fs)
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
@@ -63,4 +63,14 @@ func validAuths(fs afero.Fs, p *config.Params) func(*cobra.Command, []string, st
 		}
 		return names, cobra.ShellCompDirectiveDefault
 	}
+}
+
+func findName(y *config.RpkYaml, name string) map[int]struct{} {
+	nameMatches := make(map[int]struct{})
+	for i, a := range y.CloudAuths {
+		if a.Name == name {
+			nameMatches[i] = struct{}{}
+		}
+	}
+	return nameMatches
 }

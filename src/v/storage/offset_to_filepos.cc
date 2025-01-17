@@ -11,38 +11,14 @@
 
 #include "storage/offset_to_filepos.h"
 
+#include "base/vlog.h"
+#include "storage/logger.h"
 #include "storage/parser.h"
 #include "storage/segment.h"
 #include "storage/segment_utils.h"
+#include "utils/null_output_stream.h"
 
 #include <seastar/core/iostream.hh>
-
-namespace {
-// Data sink for noop output_stream instance
-// needed to implement scanning
-struct null_data_sink final : ss::data_sink_impl {
-    ss::future<> put(ss::net::packet data) final { return put(data.release()); }
-    ss::future<> put(std::vector<ss::temporary_buffer<char>> all) final {
-        return ss::do_with(
-          std::move(all), [this](std::vector<ss::temporary_buffer<char>>& all) {
-              return ss::do_for_each(
-                all, [this](ss::temporary_buffer<char>& buf) {
-                    return put(std::move(buf));
-                });
-          });
-    }
-    ss::future<> put(ss::temporary_buffer<char>) final { return ss::now(); }
-    ss::future<> flush() final { return ss::now(); }
-    ss::future<> close() final { return ss::now(); }
-};
-
-ss::output_stream<char> make_null_output_stream() {
-    auto ds = ss::data_sink(std::make_unique<null_data_sink>());
-    ss::output_stream<char> ostr(std::move(ds), 4_KiB);
-    return ostr;
-}
-
-} // namespace
 
 namespace storage {
 
@@ -56,16 +32,13 @@ offset_to_filepos_consumer::offset_to_filepos_consumer(
   : _target_last_offset(target)
   , _prev_batch_last_offset(model::prev_offset(log_start_offset))
   , _prev_batch_max_timestamp(initial_timestamp)
-  , _accumulator(initial)
-  , _prev(initial) {}
+  , _prev_end_pos(initial) {}
 
 ss::future<ss::stop_iteration>
 offset_to_filepos_consumer::operator()(::model::record_batch batch) {
-    _prev = _accumulator;
-    _accumulator += batch.size_bytes();
-
-    if (_target_last_offset <= batch.base_offset()) {
-        _filepos = {_prev_batch_last_offset, _prev, _prev_batch_max_timestamp};
+    if (batch.base_offset() >= _target_last_offset) {
+        _filepos = {
+          _prev_batch_last_offset, _prev_end_pos, _prev_batch_max_timestamp};
         co_return ss::stop_iteration::yes;
     }
     if (
@@ -83,6 +56,7 @@ offset_to_filepos_consumer::operator()(::model::record_batch batch) {
     _prev_batch_last_offset = batch.last_offset();
     _prev_batch_max_timestamp = std::max(
       batch.header().first_timestamp, batch.header().max_timestamp);
+    _prev_end_pos += batch.size_bytes();
     co_return ss::stop_iteration::no;
 }
 
@@ -108,7 +82,7 @@ ss::future<result<offset_to_file_pos_result>> convert_begin_offset_to_file_pos(
     auto ix_begin = segment->index().find_nearest(begin_inclusive);
     size_t scan_from = ix_begin ? ix_begin->filepos : 0;
     model::offset sto = ix_begin ? ix_begin->offset
-                                 : segment->offsets().base_offset;
+                                 : segment->offsets().get_base_offset();
 
     model::timestamp ts = base_timestamp;
     bool offset_found = false;
@@ -120,7 +94,7 @@ ss::future<result<offset_to_file_pos_result>> convert_begin_offset_to_file_pos(
       std::move(handle),
       [&begin_inclusive, &sto, &offset_found, &ts, &offset_inside_batch](
         segment_reader_handle& reader_handle) {
-          auto ostr = make_null_output_stream();
+          auto ostr = utils::make_null_output_stream();
           return transform_stream(
             reader_handle.take_stream(),
             std::move(ostr),
@@ -204,7 +178,8 @@ ss::future<result<offset_to_file_pos_result>> convert_end_offset_to_file_pos(
     }
 
     size_t scan_from = ix_end ? ix_end->filepos : 0;
-    model::offset fo = ix_end ? ix_end->offset : segment->offsets().base_offset;
+    model::offset fo = ix_end ? ix_end->offset
+                              : segment->offsets().get_base_offset();
     vlog(
       stlog.debug,
       "Segment index lookup returned: {}, scanning from pos {} - offset {}",
@@ -227,7 +202,7 @@ ss::future<result<offset_to_file_pos_result>> convert_end_offset_to_file_pos(
        &offset_found,
        &ts,
        &offset_inside_batch](segment_reader_handle& handle) {
-          auto ostr = make_null_output_stream();
+          auto ostr = utils::make_null_output_stream();
           return transform_stream(
             handle.take_stream(),
             std::move(ostr),

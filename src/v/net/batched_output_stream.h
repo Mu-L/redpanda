@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "seastarx.h"
+#include "base/seastarx.h"
 #include "ssx/semaphore.h"
 
 #include <seastar/core/iostream.hh>
@@ -25,7 +25,7 @@ class batched_output_stream_closed : std::exception {
 public:
     batched_output_stream_closed(size_t ignored_bytes)
       : msg(fmt::format(
-        "Output stream closed (dropped {} bytes)", ignored_bytes)) {}
+          "Output stream closed (dropped {} bytes)", ignored_bytes)) {}
 
     const char* what() const noexcept final { return msg.c_str(); }
 

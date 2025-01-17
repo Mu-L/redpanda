@@ -124,12 +124,11 @@
                         },
                         "503": {
                             "description": "Test failed to start",
-                            "schema":{
+                            "schema": {
                                 "type": "json"
                             }
                         }
                     }
-
                 }
             ]
         },
@@ -159,7 +158,6 @@
                     ],
                     "parameters": []
                 }
-
             ]
         },
         {
@@ -325,10 +323,10 @@
                     ],
                     "parameters": [
                         {
-                        "name": "service",
-                        "in": "query",
-                        "required": true,
-                        "type": "string"
+                            "name": "service",
+                            "in": "query",
+                            "required": true,
+                            "type": "string"
                         }
                     ],
                     "responses": {
@@ -353,7 +351,7 @@
             "operations": [
                 {
                     "method": "GET",
-                    "summary": "Get partition state for current node",
+                    "summary": "Get low level debug information (on any node) of all replicas of a given partition",
                     "type": "partition_state",
                     "nickname": "get_partition_state",
                     "produces": [
@@ -383,6 +381,46 @@
             ]
         },
         {
+            "path": "/v1/debug/producers/{namespace}/{topic}/{partition}",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get low level debug information about producers producing to the input partition, queried from the leader of the partition.",
+                    "type": "partition_producers",
+                    "nickname": "get_partition_producers",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "required": false,
+                            "type": "long"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
             "path": "/v1/debug/set_storage_failure_injection_enabled",
             "operations": [
                 {
@@ -395,10 +433,10 @@
                     ],
                     "parameters": [
                         {
-                        "name": "value",
-                        "in": "query",
-                        "required": true,
-                        "type": "boolean"
+                            "name": "value",
+                            "in": "query",
+                            "required": true,
+                            "type": "boolean"
                         }
                     ]
                 }
@@ -453,91 +491,91 @@
             ]
         },
         {
-          "path": "/v1/debug/unsafe_reset_metadata/{topic}/{partition}",
-          "operations": [
-            {
-              "method": "POST",
-              "summary": "Resets the manifest, updating all replicas with the given manifest. This is very unsafe, so be sure the provided manifest actually has valid contents. Formatting aside, very little validation will be done on the requested manifest.",
-              "operationId": "unsafe_reset_metadata",
-              "nickname": "unsafe_reset_metadata",
-              "parameters": [
+            "path": "/v1/debug/unsafe_reset_metadata/{topic}/{partition}",
+            "operations": [
                 {
-                  "name": "topic",
-                  "in": "path",
-                  "required": true,
-                  "type": "string"
-                },
-                {
-                  "name": "partition",
-                  "in": "path",
-                  "required": true,
-                  "type": "integer"
-                },
-                {
-                  "name": "body",
-                  "required": true,
-                  "paramType": "body"
+                    "method": "POST",
+                    "summary": "Resets the manifest, updating all replicas with the given manifest. This is very unsafe, so be sure the provided manifest actually has valid contents. Formatting aside, very little validation will be done on the requested manifest.",
+                    "operationId": "unsafe_reset_metadata",
+                    "nickname": "unsafe_reset_metadata",
+                    "parameters": [
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "body",
+                            "required": true,
+                            "paramType": "body"
+                        }
+                    ],
+                    "responseMessages": [
+                        {
+                            "code": 200,
+                            "message": "Partition metadata is reset"
+                        }
+                    ]
                 }
-              ],
-              "responseMessages": [
-                {
-                  "code": 200,
-                  "message": "Partition metadata is reset"
-                }
-              ]
-            }
-          ]
+            ]
         },
         {
-          "path": "/v1/debug/storage/disk_stat/{type}",
-          "operations": [
-            {
-              "method": "GET",
-              "summary": "Return disk space statistics.",
-              "operationId": "get_disk_stat",
-              "nickname": "get_disk_stat",
-              "type": "disk_stat",
-              "produces": [
-                "application/json"
-              ],
-              "parameters": [
+            "path": "/v1/debug/storage/disk_stat/{type}",
+            "operations": [
                 {
-                  "name": "type",
-                  "in": "path",
-                  "required": true,
-                  "type": "string"
-                }
-              ],
-              "responseMessages": [
+                    "method": "GET",
+                    "summary": "Return disk space statistics.",
+                    "operationId": "get_disk_stat",
+                    "nickname": "get_disk_stat",
+                    "type": "disk_stat",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "type",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        }
+                    ],
+                    "responseMessages": [
+                        {
+                            "code": 200
+                        }
+                    ]
+                },
                 {
-                  "code": 200
+                    "method": "PUT",
+                    "summary": "Override disk space statistics.",
+                    "operationId": "put_disk_stat",
+                    "nickname": "put_disk_stat",
+                    "type": "disk_stat_overrides",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "type",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        }
+                    ],
+                    "responseMessages": [
+                        {
+                            "code": 200
+                        }
+                    ]
                 }
-              ]
-            },
-            {
-              "method": "PUT",
-              "summary": "Override disk space statistics.",
-              "operationId": "put_disk_stat",
-              "nickname": "put_disk_stat",
-              "type": "disk_stat_overrides",
-              "produces": [
-                "application/json"
-              ],
-              "parameters": [
-                {
-                  "name": "type",
-                  "in": "path",
-                  "required": true,
-                  "type": "string"
-                }
-              ],
-              "responseMessages": [
-                {
-                  "code": 200
-                }
-              ]
-            }
-          ]
+            ]
         },
         {
             "path": "/v1/debug/storage/offset_translator/{namespace}/{topic}/{partition}",
@@ -547,7 +585,7 @@
                     "summary": "Return list of all local offsets translated",
                     "nickname": "get_local_offsets_translated",
                     "produces": [
-                       "application/json"
+                        "application/json"
                     ],
                     "type": "array",
                     "parameters": [
@@ -601,6 +639,41 @@
                             "required": false,
                             "allowMultiple": false,
                             "type": "long"
+                        },
+                        {
+                            "name": "wait_ms",
+                            "in": "query",
+                            "required": false,
+                            "allowMultiple": false,
+                            "type": "long"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/debug/broker_uuid",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Return current broker id and UUID",
+                    "nickname": "get_broker_uuid",
+                    "produces": [
+                        "application/json"
+                    ]
+                },
+                {
+                    "method": "PUT",
+                    "summary": "Overrides stored broker UUID and ID values",
+                    "nickname": "override_broker_uuid",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "body",
+                            "required": true,
+                            "paramType": "broker_id_override"
                         }
                     ]
                 }
@@ -796,7 +869,15 @@
                 },
                 "test_type": {
                     "type": "string",
-                    "description": "Type of self test, one of either disk/network"
+                    "description": "Type of self test, one of either disk/network/cloud"
+                },
+                "start_time": {
+                    "type": "long",
+                    "description": "Start time of the test run"
+                },
+                "end_time": {
+                    "type": "long",
+                    "description": "End time of the test run"
                 },
                 "duration": {
                     "type": "long",
@@ -823,6 +904,10 @@
                 "status": {
                     "type": "string",
                     "description": "One of either idle / running / unreachable"
+                },
+                "stage": {
+                    "type": "string",
+                    "description": "One of either idle / net / disk / cloud"
                 },
                 "results": {
                     "type": "array",
@@ -857,9 +942,9 @@
                     "type": "long",
                     "description": "Next index"
                 },
-                "last_sent_offset": {
+                "expected_log_end_offset": {
                     "type": "long",
-                    "description": "Last sent offset"
+                    "description": "Follower log end offset expected by the leader"
                 },
                 "heartbeats_failed": {
                     "type": "long",
@@ -896,7 +981,7 @@
             }
         },
         "stm_state": {
-            "id" : "stm_state",
+            "id": "stm_state",
             "description": "Stm related state for a given replica.",
             "properties": {
                 "name": {
@@ -913,6 +998,20 @@
                 }
             }
         },
+        "follower_recovery_state": {
+            "id": "follower_recovery_state",
+            "description": "Follower-side Raft recovery state",
+            "properties": {
+                "is_active": {
+                    "type": "boolean",
+                    "description": "True if recovery is currently allowed by the scheduler"
+                },
+                "pending_offset_count": {
+                    "type": "long",
+                    "description": "Difference between leader and our last offsets"
+                }
+            }
+        },
         "raft_replica_state": {
             "id": "raft_replica_state",
             "description": "Raft level state for a single replica of a partition",
@@ -926,11 +1025,11 @@
                     "description": "Current raft term"
                 },
                 "offset_translator_state": {
-                    "type" : "string",
+                    "type": "string",
                     "description": "State of the offset translator"
                 },
                 "group_configuration": {
-                    "type" : "string",
+                    "type": "string",
                     "description": "Local raft replica configuration"
                 },
                 "confirmed_term": {
@@ -985,10 +1084,26 @@
                     "type": "boolean",
                     "description": "True of voted a leader"
                 },
-                "followers" : {
+                "write_caching_enabled": {
+                    "type": "boolean",
+                    "description": "Whether write caching is enabled for this replica"
+                },
+                "flush_ms": {
+                    "type": "long",
+                    "description": "flush delay ms, used for cached writes."
+                },
+                "flush_bytes": {
+                    "type": "long",
+                    "description": "unflushed bytes size flush trigger, used for cached writes."
+                },
+                "time_since_last_flush": {
+                    "type": "long",
+                    "description": "milliseconds since the last flush attempt."
+                },
+                "followers": {
                     "type": "array",
                     "items": {
-                        "type" : "raft_follower_state"
+                        "type": "raft_follower_state"
                     },
                     "description": "Follower metadata for this leader."
                 },
@@ -998,6 +1113,14 @@
                         "type": "stm_state"
                     },
                     "description": "All snapshottable stms attached to this replica"
+                },
+                "follower_recovery_state": {
+                    "type": "follower_recovery_state",
+                    "description": "Raft recovery state if this replica is a follower in recovery"
+                },
+                "replication_monitor_state": {
+                    "type": "string",
+                    "description": "State of waiters pending replication."
                 }
             }
         },
@@ -1065,8 +1188,12 @@
                     "type": "long",
                     "description": "Next cloud offset"
                 },
+                "iceberg_mode": {
+                    "type": "string",
+                    "description": "Iceberg enablement mode for the topic"
+                },
                 "raft_state": {
-                    "type" : "raft_replica_state",
+                    "type": "raft_replica_state",
                     "description": "Underlying raft replica state of the partition instance"
                 }
             }
@@ -1085,6 +1212,101 @@
                         "type": "partition_replica_state"
                     },
                     "description": "All replicas of this partition"
+                }
+            }
+        },
+        "idempotent_producer_request_state": {
+            "id": "idempotent_producer_request_state",
+            "description": "Debug state of an idempotent producer request to a partition.",
+            "properties": {
+                "first_sequence": {
+                    "type": "int",
+                    "description": "Kafka first sequence of the request"
+                },
+                "last_sequence": {
+                    "type": "int",
+                    "description": "Kafka last sequence of the request"
+                },
+                "term": {
+                    "type": "long",
+                    "description": "Raft term of the idempotent request"
+                }
+            }
+        },
+        "partition_producer_state": {
+            "id": "partition_producer_state",
+            "description": "Debug state of a single producer producing to a partition ",
+            "properties": {
+                "id" : {
+                    "type": "long",
+                    "description": "ID of the producer, assigned by Redpanda."
+                },
+                "epoch": {
+                    "type": "int",
+                    "description": "Epoch of the producer, assigned by Redpanda."
+                },
+                "inflight_idempotent_requests": {
+                    "type": "array",
+                    "items": {
+                        "type": "idempotent_producer_request_state"
+                    },
+                    "description": "List of requests currently in flight."
+                },
+                "finished_idempotent_requests": {
+                    "type": "array",
+                    "items": {
+                        "type": "idempotent_producer_request_state"
+                    },
+                    "description": "List of finished requests."
+                },
+                "last_update_timestamp": {
+                    "type": "long",
+                    "description": "Last update timestamp for this producer."
+                },
+                "transaction_begin_offset": {
+                    "type": "long",
+                    "description": "First offset of the transaction."
+                },
+                "transaction_last_offset": {
+                    "type": "long",
+                    "description": "Last offset of the transaction."
+                },
+                "transaction_sequence": {
+                    "type": "int",
+                    "description": "Sequence number of the transaction."
+                },
+                "transaction_timeout_ms": {
+                    "type": "long",
+                    "description": "Transaction timeout in ms."
+                },
+                "transaction_coordinator_partition": {
+                    "type": "int",
+                    "description": "Transaction coordinator partition coordinating the transaction."
+                },
+                "transaction_group_id": {
+                    "type": "string",
+                    "description": "Group id of transaction, only relevant for group partitions."
+                }
+            }
+        },
+        "partition_producers": {
+            "id": "partition_producers",
+            "description": "Debug information about producers producing to a partition.",
+            "properties": {
+                "ntp": {
+                    "type": "string",
+                    "description": "Partition that is queried"
+                },
+                "total_producer_count": {
+                    "type": "long",
+                    "description": "Total number of producers as tracked by the partition."
+                },
+                "producers": {
+                    "type": "array",
+                    "items": {
+                        "type": "partition_producer_state"
+                    },
+                    "description": "Producers to this partition, a limit is enforced to avoid fetching too many producers. total_producer_count denotes actual number of producers tracked by the partition."
                 }
             }
         },
@@ -1169,6 +1391,38 @@
                 "kafka_offset": {
                     "type": "long",
                     "description": "kafka offset"
+                }
+            }
+        },
+        "broker_uuid": {
+            "id": "broker_uuid",
+            "description": "Broker UUID and assigned id",
+            "properties": {
+                "node_uuid": {
+                    "type": "string",
+                    "description": "Current node UUID"
+                },
+                "node_id": {
+                    "type": "int",
+                    "description": "Assigned node id (may be empty)"
+                }
+            }
+        },
+        "broker_id_override": {
+            "id": "broker_id_override",
+            "description": "An override for broker id and UUID",
+            "properties": {
+                "current_node_uuid": {
+                    "type": "string",
+                    "description": "Current node UUID, used to validate if request is addressed to the correct node"
+                },
+                "new_node_id": {
+                    "type": "int",
+                    "description": "New node id for current node"
+                },
+                "new_node_uuid": {
+                    "type": "string",
+                    "description": "Node unique identifier. UUID is generated when Redpanda starts with empty data folder"
                 }
             }
         }

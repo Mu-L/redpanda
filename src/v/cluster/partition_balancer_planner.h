@@ -10,10 +10,11 @@
 
 #pragma once
 
+#include "cluster/fwd.h"
 #include "cluster/health_monitor_types.h"
 #include "cluster/partition_balancer_types.h"
-#include "cluster/scheduling/partition_allocator.h"
-#include "cluster/topic_table.h"
+#include "cluster/scheduling/types.h"
+#include "cluster/types.h"
 #include "model/metadata.h"
 
 #include <absl/container/flat_hash_map.h>
@@ -22,9 +23,13 @@
 
 namespace cluster {
 
+enum ntp_reassignment_type : int8_t { regular, force };
+
 struct ntp_reassignment {
     model::ntp ntp;
     allocated_partition allocated;
+    reconfiguration_policy reconfiguration_policy;
+    ntp_reassignment_type type;
 };
 
 struct planner_config {
@@ -35,8 +40,6 @@ struct planner_config {
     // Planner won't plan a move that will result in destination node(s) going
     // over this ratio.
     double hard_max_disk_usage_ratio;
-    // Size of partitions that can be planned to move in one request
-    size_t movement_disk_size_batch;
     // Max number of actions that can be scheduled in one planning iteration
     size_t max_concurrent_actions;
     std::chrono::seconds node_availability_timeout_sec;
@@ -53,6 +56,10 @@ struct planner_config {
     // the request but it is not yet considered as a violation of partition
     // balancing rules
     std::chrono::milliseconds node_responsiveness_timeout;
+    // If true, prioritize balancing topic-wise number of
+    // partitions on each node, as opposed to balancing the total number of
+    // partitions.
+    bool topic_aware = false;
 };
 
 class partition_balancer_planner {
@@ -65,7 +72,6 @@ public:
     enum class status {
         empty,
         actions_planned,
-        waiting_for_maintenance_end,
         waiting_for_reports,
         missing_sizes,
     };
@@ -98,6 +104,7 @@ private:
     class request_context;
     class partition;
     class reassignable_partition;
+    class force_reassignable_partition;
     class moving_partition;
     class immutable_partition;
 
@@ -106,6 +113,7 @@ private:
 
     ss::future<> init_ntp_sizes_from_health_report(
       const cluster_health_report& health_report, request_context&);
+    ss::future<> init_topic_node_counts(request_context&);
 
     /// Returns a pair of (total, free) bytes on a given node.
     std::pair<uint64_t, uint64_t> get_node_bytes_info(const node::local_state&);
@@ -118,6 +126,7 @@ private:
     static ss::future<> get_rack_constraint_repair_actions(request_context&);
     static ss::future<> get_full_node_actions(request_context&);
     static ss::future<> get_counts_rebalancing_actions(request_context&);
+    static ss::future<> get_force_repair_actions(request_context&);
 
     static size_t calculate_full_disk_partition_move_priority(
       model::node_id, const reassignable_partition&, const request_context&);

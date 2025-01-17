@@ -12,9 +12,8 @@
 #pragma once
 
 #include "cluster/fwd.h"
-#include "cluster/types.h"
-#include "seastarx.h"
-#include "ssx/metrics.h"
+#include "metrics/metrics.h"
+#include "raft/notification.h"
 
 #include <seastar/core/metrics_registration.hh>
 
@@ -31,8 +30,8 @@ public:
 
 private:
     cluster::controller& _controller;
-    std::unique_ptr<ssx::metrics::metric_groups> _public_metrics;
-    cluster::notification_id_type _leadership_notification_handle;
+    std::unique_ptr<metrics::public_metric_groups> _public_metrics;
+    raft::group_manager_notification_id _leadership_notification_handle;
 };
 
 } // namespace cluster

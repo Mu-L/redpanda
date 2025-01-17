@@ -9,17 +9,17 @@
 
 #include "kafka/server/handlers/offset_for_leader_epoch.h"
 
+#include "cluster/metadata_cache.h"
 #include "cluster/shard_table.h"
+#include "container/fragmented_vector.h"
+#include "kafka/data/partition_proxy.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/offset_for_leader_epoch_response.h"
 #include "kafka/server/handlers/details/leader_epoch.h"
-#include "kafka/server/partition_proxy.h"
 #include "kafka/server/request_context.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "security/acl.h"
-#include "ssx/future-util.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/smp.hh>
@@ -27,7 +27,6 @@
 #include <absl/container/flat_hash_set.h>
 
 #include <algorithm>
-#include <chrono>
 #include <iterator>
 #include <vector>
 
@@ -120,10 +119,10 @@ static ss::future<> fetch_offsets_from_shards(
       });
 }
 
-static ss::future<std::vector<offset_for_leader_topic_result>>
+static ss::future<chunked_vector<offset_for_leader_topic_result>>
 get_offsets_for_leader_epochs(
-  request_context& ctx, std::vector<offset_for_leader_topic> topics) {
-    std::vector<offset_for_leader_topic_result> result;
+  request_context& ctx, chunked_vector<offset_for_leader_topic> topics) {
+    chunked_vector<offset_for_leader_topic_result> result;
     result.reserve(topics.size());
 
     absl::flat_hash_map<ss::shard_id, shard_op_ctx> requests_per_shard;
@@ -132,6 +131,10 @@ get_offsets_for_leader_epochs(
         result.push_back(
           offset_for_leader_topic_result{.topic = request_topic.topic});
         result.back().partitions.reserve(request_topic.partitions.size());
+
+        const auto* disabled_set = ctx.metadata_cache().get_topic_disabled_set(
+          model::topic_namespace_view{
+            model::kafka_namespace, request_topic.topic});
 
         for (auto& request_partition : request_topic.partitions) {
             // add response placeholder
@@ -148,6 +151,15 @@ get_offsets_for_leader_epochs(
                 partition_response = response_t::make_epoch_end_offset(
                   request_partition.partition,
                   error_code::unknown_topic_or_partition);
+                continue;
+            }
+
+            if (
+              disabled_set
+              && disabled_set->is_disabled(request_partition.partition)) {
+                partition_response = response_t::make_epoch_end_offset(
+                  request_partition.partition,
+                  error_code::replica_not_available);
                 continue;
             }
 
@@ -182,6 +194,23 @@ ss::future<response_ptr> offset_for_leader_epoch_handler::handle(
     request.decode(ctx.reader(), ctx.header().version);
     log_request(ctx.header(), request);
 
+    if (unlikely(ctx.recovery_mode_enabled())) {
+        offset_for_leader_epoch_response response;
+        for (const auto& t : request.data.topics) {
+            offset_for_leader_topic_result topic_res{.topic = t.topic};
+            topic_res.partitions.reserve(t.partitions.size());
+            for (const auto& p : t.partitions) {
+                topic_res.partitions.push_back(
+                  response_t::make_epoch_end_offset(
+                    p.partition, error_code::policy_violation));
+            }
+
+            response.data.topics.push_back(std::move(topic_res));
+        }
+
+        co_return co_await ctx.respond(std::move(response));
+    }
+
     std::vector<offset_for_leader_topic_result> unauthorized;
 
     // authorize
@@ -211,14 +240,22 @@ ss::future<response_ptr> offset_for_leader_epoch_handler::handle(
               return res;
           });
         // remove unauthorized topics
-        request.data.topics.erase(it, request.data.topics.end());
+        request.data.topics.erase_to_end(it);
     }
+
+    if (!ctx.audit()) {
+        co_return co_await ctx.respond(offset_for_leader_epoch_response(
+          error_code::broker_not_available,
+          std::move(request),
+          std::move(unauthorized)));
+    }
+
+    offset_for_leader_epoch_response response;
 
     // fetch offsets
     auto results = co_await get_offsets_for_leader_epochs(
       ctx, std::move(request.data.topics));
 
-    offset_for_leader_epoch_response response;
     response.data.topics = std::move(results);
 
     // merge with unauthorized topics

@@ -11,8 +11,10 @@
 
 #pragma once
 
-#include "pandaproxy/schema_registry/types.h"
-#include "utils/string_switch.h"
+#include "base/seastarx.h"
+#include "strings/string_switch.h"
+
+#include <seastar/core/sstring.hh>
 
 namespace pandaproxy::schema_registry {
 

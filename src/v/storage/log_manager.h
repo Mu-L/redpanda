@@ -11,23 +11,24 @@
 
 #pragma once
 
-#include "cluster/topic_table.h"
+#include "base/seastarx.h"
+#include "base/units.h"
 #include "config/property.h"
+#include "container/chunked_hash_map.h"
+#include "container/intrusive_list_helpers.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "random/simple_time_jitter.h"
-#include "seastarx.h"
 #include "storage/batch_cache.h"
 #include "storage/file_sanitizer_types.h"
+#include "storage/key_offset_map.h"
 #include "storage/log.h"
 #include "storage/log_housekeeping_meta.h"
 #include "storage/ntp_config.h"
 #include "storage/storage_resources.h"
 #include "storage/types.h"
 #include "storage/version.h"
-#include "units.h"
-#include "utils/intrusive_list_helpers.h"
 #include "utils/mutex.h"
 
 #include <seastar/core/abort_source.hh>
@@ -46,6 +47,12 @@
 #include <optional>
 
 namespace storage {
+
+class log_manager_probe;
+
+namespace testing_details {
+class log_manager_accessor;
+};
 
 // class log_config {
 struct log_config {
@@ -69,7 +76,7 @@ struct log_config {
       ss::io_priority_class compaction_priority,
       config::binding<std::optional<size_t>> ret_bytes,
       config::binding<std::chrono::milliseconds> compaction_ival,
-      config::binding<std::optional<std::chrono::milliseconds>> del_ret,
+      config::binding<std::optional<std::chrono::milliseconds>> log_ret,
       with_cache c,
       batch_cache::reclaim_options recopts,
       std::chrono::milliseconds rdrs_cache_eviction_timeout,
@@ -97,8 +104,8 @@ struct log_config {
     // same as retention.bytes in kafka
     config::binding<std::optional<size_t>> retention_bytes;
     config::binding<std::chrono::milliseconds> compaction_interval;
-    // same as delete.retention.ms in kafka - default 1 week
-    config::binding<std::optional<std::chrono::milliseconds>> delete_retention;
+    // same as log.retention.ms in kafka - default 1 week
+    config::binding<std::optional<std::chrono::milliseconds>> log_retention;
     with_cache cache = with_cache::yes;
     batch_cache::reclaim_options reclaim_opts{
       .growth_window = std::chrono::seconds(3),
@@ -166,8 +173,12 @@ public:
       kvstore& kvstore,
       storage_resources&,
       ss::sharded<features::feature_table>&) noexcept;
+    ~log_manager();
 
-    ss::future<ss::shared_ptr<log>> manage(ntp_config);
+    ss::future<ss::shared_ptr<log>> manage(
+      ntp_config,
+      raft::group_id = raft::group_id{},
+      std::vector<model::record_batch_type> translator_batch_types = {});
 
     ss::future<> shutdown(model::ntp);
 
@@ -202,6 +213,7 @@ public:
       ss::io_priority_class pc,
       size_t read_buffer_size,
       unsigned read_ahead,
+      size_t segment_size_hint,
       record_version_type = record_version_type::v1);
 
     const log_config& config() const { return _config; }
@@ -220,6 +232,10 @@ public:
     /// Returns all ntp's managed by this instance
     absl::flat_hash_set<model::ntp> get_all_ntps() const;
 
+    // Returns the timestamp that should be retained via log.retention.ms, or 0
+    // if not configured.
+    model::timestamp lowest_ts_to_retain() const;
+
     int64_t compaction_backlog() const;
 
     storage_resources& resources() { return _resources; }
@@ -236,13 +252,18 @@ public:
      */
     void trigger_gc();
 
+    gc_config default_gc_config() const;
+
 private:
     using logs_type
-      = absl::flat_hash_map<model::ntp, std::unique_ptr<log_housekeeping_meta>>;
+      = chunked_hash_map<model::ntp, std::unique_ptr<log_housekeeping_meta>>;
     using compaction_list_type
       = intrusive_list<log_housekeeping_meta, &log_housekeeping_meta::link>;
 
-    ss::future<ss::shared_ptr<log>> do_manage(ntp_config);
+    ss::future<ss::shared_ptr<log>> do_manage(
+      ntp_config,
+      raft::group_id,
+      std::vector<model::record_batch_type> translator_batch_types);
     ss::future<> clean_close(ss::shared_ptr<storage::log>);
 
     /**
@@ -258,23 +279,36 @@ private:
     std::optional<batch_cache_index> create_cache(with_cache);
 
     ss::future<> dispatch_topic_dir_deletion(ss::sstring dir);
-    ss::future<> recover_log_state(const ntp_config&);
+    ss::future<> maybe_clear_kvstore(const ntp_config&);
     ss::future<> async_clear_logs();
 
     ss::future<> housekeeping_scan(model::timestamp);
+
+    void update_log_count();
 
     log_config _config;
     kvstore& _kvstore;
     storage_resources& _resources;
     ss::sharded<features::feature_table>& _feature_table;
     simple_time_jitter<ss::lowres_clock> _jitter;
+    simple_time_jitter<ss::lowres_clock> _trigger_gc_jitter;
     logs_type _logs;
     compaction_list_type _logs_list;
     batch_cache _batch_cache;
-    ss::gate _open_gate;
+
+    // Hash key-map to use across multiple compactions to reuse reserved memory
+    // rather than reallocating repeatedly.
+    std::unique_ptr<hash_key_offset_map> _compaction_hash_key_map;
+
+    // Metrics.
+    std::unique_ptr<log_manager_probe> _probe;
+
+    ss::gate _gate;
     ss::abort_source _abort_source;
 
     friend std::ostream& operator<<(std::ostream&, const log_manager&);
+
+    friend class testing_details::log_manager_accessor;
 };
 
 } // namespace storage

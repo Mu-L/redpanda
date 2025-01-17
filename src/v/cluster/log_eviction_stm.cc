@@ -10,11 +10,14 @@
 #include "cluster/log_eviction_stm.h"
 
 #include "bytes/iostream.h"
+#include "cluster/errc.h"
+#include "cluster/logger.h"
 #include "cluster/prefix_truncate_record.h"
+#include "model/fundamental.h"
 #include "raft/consensus.h"
-#include "raft/types.h"
-#include "serde/serde.h"
-#include "utils/gate_guard.h"
+#include "raft/fundamental.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/iobuf.h"
 
 #include <seastar/core/future-util.hh>
 #include <seastar/core/sleep.hh>
@@ -36,23 +39,20 @@ struct snapshot_data
 };
 
 log_eviction_stm::log_eviction_stm(
-  raft::consensus* raft,
-  ss::logger& logger,
-  ss::abort_source& as,
-  storage::kvstore& kvstore)
-  : persisted_stm("log_eviction_stm.snapshot", logger, raft, kvstore)
-  , _as(as) {}
+  raft::consensus* raft, ss::logger& logger, storage::kvstore& kvstore)
+  : base_t("log_eviction_stm.snapshot", logger, raft, kvstore) {}
 
 ss::future<> log_eviction_stm::start() {
     ssx::spawn_with_gate(_gate, [this] { return monitor_log_eviction(); });
     ssx::spawn_with_gate(
       _gate, [this] { return handle_log_eviction_events(); });
-    return persisted_stm::start();
+    return base_t::start();
 }
 
 ss::future<> log_eviction_stm::stop() {
+    _as.request_abort();
     _has_pending_truncation.broken();
-    co_await persisted_stm::stop();
+    co_await base_t::stop();
 }
 
 ss::future<> log_eviction_stm::handle_log_eviction_events() {
@@ -123,8 +123,6 @@ ss::future<> log_eviction_stm::handle_log_eviction_events() {
         } catch (const ss::gate_closed_exception&) {
             // ignore gate closed exception, shutting down
         } catch (const ss::broken_semaphore&) {
-        } catch (const ss::sleep_aborted&) {
-            // ignore broken sem exception, shutting down
         } catch (const std::exception& e) {
             vlog(
               _log.error,
@@ -188,30 +186,86 @@ log_eviction_stm::do_write_raft_snapshot(model::offset truncation_point) {
           max_collectible_offset,
           truncation_point);
     }
+    if (truncation_point <= _raft->last_snapshot_index()) {
+        vlog(
+          _log.trace,
+          "Skipping writing snapshot as Raft already progressed with the new "
+          "snapshot. Current raft snapshot index: {}, requested truncation "
+          "point: {}",
+          _raft->last_snapshot_index(),
+          truncation_point);
+        co_return;
+    }
     vlog(
       _log.debug,
       "Requesting raft snapshot with final offset: {}",
       truncation_point);
-    co_await _raft->write_snapshot(
-      raft::write_snapshot_cfg(truncation_point, iobuf()));
+    auto snapshot_result = co_await _raft->stm_manager()->take_snapshot(
+      truncation_point);
+    // we need to check snapshot index again as it may already progressed after
+    // snapshot is taken by stm_manager
+    if (truncation_point <= _raft->last_snapshot_index()) {
+        vlog(
+          _log.trace,
+          "Skipping writing snapshot as Raft already progressed with the new "
+          "snapshot. Current raft snapshot index: {}, requested truncation "
+          "point: {}",
+          _raft->last_snapshot_index(),
+          truncation_point);
+        co_return;
+    }
+    co_await _raft->write_snapshot(raft::write_snapshot_cfg(
+      snapshot_result.last_included_offset, std::move(snapshot_result.data)));
 }
 
-ss::future<result<model::offset, std::error_code>>
-log_eviction_stm::sync_start_offset_override(
+kafka::offset log_eviction_stm::kafka_start_offset_override() {
+    if (_cached_kafka_start_offset_override != kafka::offset{}) {
+        return _cached_kafka_start_offset_override;
+    }
+
+    // Since the STM doesn't snapshot `_cached_kafka_start_override` its
+    // possible for it to be lost during restarts. Therefore the raft offset
+    // which is snapshotted will be translated if possible.
+    if (_delete_records_eviction_offset == model::offset{}) {
+        return kafka::offset{};
+    }
+
+    auto raft_start_offset_override = model::next_offset(
+      _delete_records_eviction_offset);
+
+    // This handles an edge case where the stm will not record any raft
+    // offsets that do not land in local storage. Hence returning
+    // `kafka::offset{}` indicates to the caller that the archival stm
+    // should be queried for the offset instead.
+    if (raft_start_offset_override <= _raft->start_offset()) {
+        return kafka::offset{};
+    }
+
+    _cached_kafka_start_offset_override = model::offset_cast(
+      _raft->log()->from_log_offset(raft_start_offset_override));
+
+    return _cached_kafka_start_offset_override;
+}
+
+ss::future<result<kafka::offset, std::error_code>>
+log_eviction_stm::sync_kafka_start_offset_override(
   model::timeout_clock::duration timeout) {
     /// Call this method to ensure followers have processed up until the
     /// most recent known version of the special batch. This is particularly
     /// useful to know if the start offset is up to date in the case
     /// leadership has recently changed for example.
     auto term = _raft->term();
-    if (!co_await sync(timeout)) {
-        if (term != _raft->term()) {
-            co_return errc::not_leader;
-        } else {
-            co_return errc::timeout;
-        }
-    }
-    co_return start_offset_override();
+    return sync(timeout).then(
+      [this, term](bool success) -> result<kafka::offset, std::error_code> {
+          if (!success) {
+              if (term != _raft->term()) {
+                  return errc::not_leader;
+              } else {
+                  return errc::timeout;
+              }
+          }
+          return kafka_start_offset_override();
+      });
 }
 
 model::offset log_eviction_stm::effective_start_offset() const {
@@ -274,10 +328,9 @@ ss::future<log_eviction_stm::offset_result> log_eviction_stm::replicate_command(
   model::record_batch batch,
   ss::lowres_clock::time_point deadline,
   std::optional<std::reference_wrapper<ss::abort_source>> as) {
-    auto fut = _raft->replicate(
-      _raft->term(),
-      model::make_memory_record_batch_reader(std::move(batch)),
-      raft::replicate_options{raft::consistency_level::quorum_ack});
+    auto opts = raft::replicate_options(raft::consistency_level::quorum_ack);
+    opts.set_force_flush();
+    auto fut = _raft->replicate(_raft->term(), std::move(batch), opts);
 
     /// Execute the replicate command bound by timeout and cancellable via
     /// abort_source mechanism
@@ -291,11 +344,17 @@ ss::future<log_eviction_stm::offset_result> log_eviction_stm::replicate_command(
         }
     } catch (const ss::timed_out_error&) {
         result = errc::timeout;
+    } catch (...) {
+        vlog(
+          _log.warn,
+          "Replicating prefix_truncate failed with exception: {}",
+          std::current_exception());
+        result = errc::replication_error;
     }
 
     if (!result) {
         vlog(
-          _log.info,
+          _log.warn,
           "Failed to replicate prefix_truncate command, reason: {}",
           result.error());
         co_return result.error();
@@ -317,7 +376,7 @@ ss::future<log_eviction_stm::offset_result> log_eviction_stm::replicate_command(
     co_return result.value().last_offset;
 }
 
-ss::future<> log_eviction_stm::apply(model::record_batch batch) {
+ss::future<> log_eviction_stm::do_apply(const model::record_batch& batch) {
     if (likely(
           batch.header().type != model::record_batch_type::prefix_truncate)) {
         co_return;
@@ -340,6 +399,7 @@ ss::future<> log_eviction_stm::apply(model::record_batch batch) {
     }
     const auto record = serde::from_iobuf<prefix_truncate_record>(
       batch.copy_records().begin()->release_value());
+    _cached_kafka_start_offset_override = record.kafka_start_offset;
     if (record.rp_start_offset == model::offset{}) {
         // This may happen if the requested offset was not in the local log at
         // time of replicating. We still need to have replicated it though so
@@ -366,23 +426,8 @@ ss::future<> log_eviction_stm::apply(model::record_batch batch) {
     }
 }
 
-ss::future<> log_eviction_stm::handle_raft_snapshot() {
-    /// In the case there is a gap detected in the log, the only path
-    /// forward is to read the raft snapshot and begin processing from the
-    /// raft last_snapshot_index
-    auto raft_snapshot = co_await _raft->open_snapshot();
-    if (!raft_snapshot) {
-        throw std::runtime_error{fmt_with_ctx(
-          fmt::format,
-          "encountered a gap in the raft log (last_applied: {}, log start "
-          "offset: {}), but can't find the snapshot - ntp: {}",
-          last_applied_offset(),
-          _raft->start_offset(),
-          _raft->ntp())};
-    }
-
-    auto last_snapshot_index = raft_snapshot->metadata.last_included_index;
-    co_await raft_snapshot->close();
+ss::future<> log_eviction_stm::apply_raft_snapshot(const iobuf&) {
+    auto last_snapshot_index = model::prev_offset(_raft->start_offset());
     _delete_records_eviction_offset = model::offset{};
     _storage_eviction_offset = last_snapshot_index;
     set_next(model::next_offset(last_snapshot_index));
@@ -390,32 +435,47 @@ ss::future<> log_eviction_stm::handle_raft_snapshot() {
       _log.info,
       "Handled log eviction new effective start offset: {}",
       effective_start_offset());
+    co_return;
 }
 
-ss::future<>
-log_eviction_stm::apply_snapshot(stm_snapshot_header header, iobuf&& data) {
+ss::future<raft::local_snapshot_applied> log_eviction_stm::apply_local_snapshot(
+  raft::stm_snapshot_header header, iobuf&& data) {
     auto snapshot = serde::from_iobuf<snapshot_data>(std::move(data));
     vlog(
       _log.info, "Applying snapshot {} at offset: {}", snapshot, header.offset);
 
     _delete_records_eviction_offset = snapshot.effective_start_offset;
-    _last_snapshot_offset = header.offset;
-    _insync_offset = header.offset;
-    return ss::now();
+    co_return raft::local_snapshot_applied::yes;
 }
 
-ss::future<stm_snapshot> log_eviction_stm::take_snapshot() {
+ss::future<raft::stm_snapshot>
+log_eviction_stm::take_local_snapshot(ssx::semaphore_units apply_units) {
     vlog(_log.trace, "Taking snapshot at offset: {}", last_applied_offset());
     iobuf snap_data = serde::to_iobuf(
       snapshot_data{.effective_start_offset = _delete_records_eviction_offset});
-    co_return stm_snapshot::create(
+    apply_units.return_all();
+    co_return raft::stm_snapshot::create(
       0, last_applied_offset(), std::move(snap_data));
 }
 
-ss::future<> log_eviction_stm::ensure_snapshot_exists(model::offset) {
+ss::future<> log_eviction_stm::ensure_local_snapshot_exists(model::offset) {
     /// This class drives eviction, therefore it cannot wait until its own
     /// snapshot exists until writing a snapshot
     return ss::now();
+}
+
+log_eviction_stm_factory::log_eviction_stm_factory(storage::kvstore& kvstore)
+  : _kvstore(kvstore) {}
+
+bool log_eviction_stm_factory::is_applicable_for(
+  const storage::ntp_config& cfg) const {
+    return !storage::deletion_exempt(cfg.ntp());
+}
+
+void log_eviction_stm_factory::create(
+  raft::state_machine_manager_builder& builder, raft::consensus* raft) {
+    auto stm = builder.create_stm<log_eviction_stm>(raft, clusterlog, _kvstore);
+    raft->log()->stm_manager()->add_stm(stm);
 }
 
 } // namespace cluster

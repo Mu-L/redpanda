@@ -10,6 +10,7 @@
 #pragma once
 
 #include "bytes/iobuf.h"
+#include "container/fragmented_vector.h"
 #include "kafka/client/transport.h"
 #include "kafka/protocol/produce.h"
 #include "kafka/protocol/schemata/produce_request.h"
@@ -19,19 +20,44 @@ namespace tests {
 
 struct kv_t {
     ss::sstring key;
-    ss::sstring val;
+    std::optional<ss::sstring> val;
+    friend std::ostream& operator<<(std::ostream& o, const kv_t& kv);
 
     kv_t(ss::sstring k, ss::sstring v)
       : key(std::move(k))
       , val(std::move(v)) {}
 
-    static std::vector<kv_t> sequence(size_t start, size_t num_records) {
+    kv_t(ss::sstring k)
+      : key(std::move(k))
+      , val(std::nullopt) {}
+
+    friend bool operator==(const kv_t& l, const kv_t& r) {
+        return std::tie(l.key, l.val) == std::tie(r.key, r.val);
+    }
+
+    bool is_tombstone() const { return !val.has_value(); }
+
+    static std::vector<kv_t> sequence(
+      size_t start,
+      size_t num_records,
+      std::optional<size_t> val_start = std::nullopt,
+      size_t key_cardinality = 0,
+      bool produce_tombstones = false) {
+        size_t vstart = val_start.value_or(start);
         std::vector<kv_t> records;
         records.reserve(num_records);
         for (size_t i = 0; i < num_records; i++) {
-            records.emplace_back(
-              ssx::sformat("key{}", start + i),
-              ssx::sformat("val{}", start + i));
+            auto key = start + i;
+            if (key_cardinality > 0) {
+                key = key % key_cardinality;
+            }
+            auto key_str = ssx::sformat("key{}", key);
+            if (produce_tombstones) {
+                records.emplace_back(std::move(key_str));
+            } else {
+                records.emplace_back(
+                  std::move(key_str), ssx::sformat("val{}", vstart + i));
+            }
         }
         return records;
     }
@@ -88,7 +114,7 @@ private:
     // produce requests. Each request, once sent, will correspond to a
     // replicated Raft batch.
     // NOTE: input must remain valid for the lifetimes of the returned requests.
-    static std::vector<kafka::partition_produce_data>
+    static chunked_vector<kafka::partition_produce_data>
     produce_partition_requests(
       const pid_to_kvs_map_t& records_per_partition,
       std::optional<model::timestamp> ts);

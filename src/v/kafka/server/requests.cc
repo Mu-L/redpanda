@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "base/vlog.h"
 #include "kafka/protocol/schemata/api_versions_request.h"
 #include "kafka/protocol/schemata/fetch_request.h"
 #include "kafka/protocol/schemata/produce_request.h"
@@ -16,10 +17,10 @@
 #include "kafka/server/handlers/sasl_authenticate.h"
 #include "kafka/server/handlers/sasl_handshake.h"
 #include "kafka/server/request_context.h"
-#include "kafka/types.h"
 #include "net/types.h"
+#include "security/audit/schemas/iam.h"
+#include "security/audit/schemas/utils.h"
 #include "utils/to_string.h"
-#include "vlog.h"
 
 #include <seastar/core/print.hh>
 #include <seastar/util/log.hh>
@@ -45,7 +46,7 @@ requires(KafkaApiHandler<Request> || KafkaApiTwoPhaseHandler<Request>)
 process_result_stages
 do_process(request_context&& ctx, ss::smp_service_group g) {
     vlog(
-      klog.trace,
+      kwire.trace,
       "[{}:{}] processing name:{}, key:{}, version:{} for {}",
       ctx.connection()->client_host(),
       ctx.connection()->client_port(),
@@ -81,7 +82,7 @@ process_result_stages process_generic(
   ss::smp_service_group g,
   const session_resources& sres) {
     vlog(
-      klog.trace,
+      kwire.trace,
       "[{}:{}] processing name:{}, key:{}, version:{} for {}, mem_units: {}, "
       "ctx_size: {}",
       ctx.connection()->client_host(),
@@ -164,11 +165,14 @@ handle_auth_initial(request_context&& ctx, ss::smp_service_group g) {
     }
 
     default:
+        const auto reason = "Unexpected request during authentication";
+        ss::sstring audit_msg;
+        if (!ctx.audit_authn_failure(reason)) {
+            audit_msg = " - Failed to audit authentication audit message";
+        }
         return ss::make_exception_future<response_ptr>(
           kafka_authentication_exception(fmt_with_ctx(
-            fmt::format,
-            "Unexpected request during authentication: {}",
-            ctx.header().key)));
+            fmt::format, "{}: {}{}", ctx.header().key, reason, audit_msg)));
     }
 }
 
@@ -180,21 +184,41 @@ handle_auth(request_context&& ctx, ss::smp_service_group g) {
 
     case security::sasl_server::sasl_state::handshake:
         if (unlikely(ctx.header().key != sasl_handshake_handler::api::key)) {
-            return ss::make_exception_future<response_ptr>(
-              kafka_authentication_exception(fmt_with_ctx(
-                fmt::format,
-                "Unexpected auth request {} expected handshake",
-                ctx.header().key)));
+            if (!ctx.audit_authn_failure(
+                  "Unexpected auth request, expected handshake")) {
+                return ss::make_exception_future<response_ptr>(
+                  kafka_authentication_exception(fmt_with_ctx(
+                    fmt::format,
+                    "Unexpected auth request {} expected handshake - Failed to "
+                    "audit authentication audit message",
+                    ctx.header().key)));
+            } else {
+                return ss::make_exception_future<response_ptr>(
+                  kafka_authentication_exception(fmt_with_ctx(
+                    fmt::format,
+                    "Unexpected auth request {} expected handshake",
+                    ctx.header().key)));
+            }
         }
         return handle_auth_handshake(std::move(ctx), g);
 
     case security::sasl_server::sasl_state::authenticate: {
         if (unlikely(ctx.header().key != sasl_authenticate_handler::api::key)) {
-            return ss::make_exception_future<response_ptr>(
-              kafka_authentication_exception(fmt_with_ctx(
-                fmt::format,
-                "Unexpected auth request {} expected authenticate",
-                ctx.header().key)));
+            if (!ctx.audit_authn_failure(
+                  "Unexpected auth request, expected authenticate")) {
+                return ss::make_exception_future<response_ptr>(
+                  kafka_authentication_exception(fmt_with_ctx(
+                    fmt::format,
+                    "Unexpected auth request {} expected authenticate - Failed "
+                    "to audit authentication audit message",
+                    ctx.header().key)));
+            } else {
+                return ss::make_exception_future<response_ptr>(
+                  kafka_authentication_exception(fmt_with_ctx(
+                    fmt::format,
+                    "Unexpected auth request {} expected authenticate",
+                    ctx.header().key)));
+            }
         }
         auto conn = ctx.connection();
         return do_process<sasl_authenticate_handler>(std::move(ctx), g)
@@ -249,6 +273,18 @@ process_result_stages process_request(
   request_context&& ctx,
   ss::smp_service_group g,
   const session_resources& sres) {
+    auto key = ctx.header().key;
+
+    if (
+      ctx.sasl() && ctx.sasl()->complete()
+      && key == sasl_handshake_handler::api::key) [[unlikely]] {
+        // This is a client-driven reauthentication
+        vlog(
+          klog.debug,
+          "SASL reauthentication detected - resetting authn server");
+        ctx.sasl_probe().session_reauth();
+        ctx.sasl()->reset();
+    }
     /*
      * requests are handled as normal when auth is disabled. otherwise no
      * request is handled until the auth process has completed.
@@ -266,20 +302,36 @@ process_result_stages process_request(
             }));
     }
 
-    auto& key = ctx.header().key;
-
     if (key == sasl_handshake_handler::api::key) {
-        return process_result_stages::single_stage(ctx.respond(
-          sasl_handshake_response(error_code::illegal_sasl_state, {})));
+        sasl_handshake_response resp(error_code::illegal_sasl_state, {});
+        if (!ctx.audit_authn_failure(
+              "Unexpected SASL handshake message encountered")) {
+            resp.data.error_code = error_code::broker_not_available;
+        }
+
+        return process_result_stages::single_stage(
+          ctx.respond(std::move(resp)));
     }
 
     if (key == sasl_authenticate_handler::api::key) {
-        sasl_authenticate_response_data data{
-          .error_code = error_code::illegal_sasl_state,
-          .error_message = "Authentication process already completed",
-        };
+        sasl_authenticate_response_data data;
+        if (!ctx.audit_authn_failure(
+              "Authentication process already completed")) {
+            data.error_code = error_code::broker_not_available;
+            data.error_message = "Broker not availaable - audit system failure";
+        } else {
+            data.error_code = error_code::illegal_sasl_state;
+            data.error_message = "Authentication process already completed";
+        }
         return process_result_stages::single_stage(
           ctx.respond(sasl_authenticate_response(std::move(data))));
+    }
+
+    if (ctx.sasl() && ctx.sasl()->expired()) [[unlikely]] {
+        throw sasl_session_expired_exception(fmt::format(
+          "Session for client '{}' expired after {}",
+          ctx.header().client_id.value_or(""),
+          ctx.sasl()->max_reauth()));
     }
 
     if (auto handler = handler_for_key(key)) {
@@ -302,20 +354,6 @@ std::ostream& operator<<(std::ostream& os, const request_header& header) {
       (header.tags ? (*header.tags)().size() : 0),
       header.tags_size_bytes);
     return os;
-}
-
-std::ostream& operator<<(std::ostream& os, config_resource_operation t) {
-    switch (t) {
-    case config_resource_operation::set:
-        return os << "set";
-    case config_resource_operation::append:
-        return os << "append";
-    case config_resource_operation::remove:
-        return os << "remove";
-    case config_resource_operation::subtract:
-        return os << "subtract";
-    }
-    return os << "unknown type";
 }
 
 } // namespace kafka

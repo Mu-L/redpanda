@@ -8,6 +8,7 @@
  * https://github.com/vectorizedio/redpanda/blob/master/licenses/rcl.md
  */
 
+#include "base/vlog.h"
 #include "cloud_storage/segment_meta_cstore.h"
 #include "cloud_storage/types.h"
 #include "common_def.h"
@@ -16,7 +17,6 @@
 #include "random/generators.h"
 #include "utils/delta_for.h"
 #include "utils/human.h"
-#include "vlog.h"
 
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
@@ -27,16 +27,10 @@
 #include <algorithm>
 #include <iterator>
 #include <limits>
+#include <ranges>
 
 using namespace cloud_storage;
 static ss::logger test("test-logger-s");
-
-using delta_xor_alg = details::delta_xor;
-using delta_xor_frame = segment_meta_column_frame<int64_t, delta_xor_alg{}>;
-using delta_delta_alg = details::delta_delta<int64_t>;
-using delta_delta_frame = segment_meta_column_frame<int64_t, delta_delta_alg{}>;
-using delta_xor_column = segment_meta_column<int64_t, delta_xor_alg>;
-using delta_delta_column = segment_meta_column<int64_t, delta_delta_alg>;
 
 // The performance of these tests depend on compiler optimizations a lot.
 // The read codepath only works well when the compiler is able to vectorize
@@ -51,533 +45,6 @@ static constexpr size_t long_test_size = 100000;
 static constexpr size_t short_test_size = 1500;
 static constexpr size_t long_test_size = 10'000;
 #endif
-
-template<class column_t>
-void append_test_case(const int64_t num_elements, column_t& column) {
-    size_t total_size = 0;
-    int64_t ix = 0;
-    for (int64_t i = 0; i < num_elements; i++) {
-        ix += random_generators::get_int(1, 100);
-        column.append(ix);
-        total_size++;
-        BOOST_REQUIRE_EQUAL(ix, column.last_value());
-    }
-    BOOST_REQUIRE_EQUAL(total_size, column.size());
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_append_xor) {
-    delta_xor_frame frame{};
-    append_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_append_delta) {
-    delta_delta_frame frame{};
-    append_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_append_xor) {
-    delta_xor_column col{};
-    append_test_case(short_test_size, col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_append_delta) {
-    delta_delta_column col{};
-    append_test_case(short_test_size, col);
-}
-
-template<class column_t>
-void append_tx_test_case(const int64_t num_elements, column_t& column) {
-    size_t total_size = 0;
-    int64_t ix = 0;
-    for (int64_t i = 0; i < num_elements; i++) {
-        ix += random_generators::get_int(1, 100);
-        auto tx = column.append_tx(ix);
-        if (tx) {
-            std::move(*tx).commit();
-        }
-        total_size++;
-        BOOST_REQUIRE_EQUAL(ix, column.last_value());
-    }
-    BOOST_REQUIRE_EQUAL(total_size, column.size());
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_append_tx_xor) {
-    delta_xor_frame frame{};
-    append_tx_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_append_tx_delta) {
-    delta_delta_frame frame{};
-    append_tx_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_append_tx_xor) {
-    delta_xor_column col{};
-    append_tx_test_case(short_test_size, col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_append_tx_delta) {
-    delta_delta_column col{};
-    append_tx_test_case(short_test_size, col);
-}
-
-template<class column_t>
-void iter_test_case(const int64_t num_elements, column_t& column) {
-    size_t total_size = 0;
-    std::vector<int64_t> expected;
-    int64_t ix = 0;
-    for (int64_t i = 0; i < num_elements; i++) {
-        ix += random_generators::get_int(1, 100);
-        column.append(ix);
-        expected.push_back(ix);
-        total_size++;
-    }
-    BOOST_REQUIRE_EQUAL(total_size, column.size());
-
-    int i = 0;
-    for (auto it = column.begin(); it != column.end(); ++it) {
-        BOOST_REQUIRE_EQUAL(it.index(), i);
-        BOOST_REQUIRE_EQUAL(*it, expected[i++]);
-    }
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_iter_xor) {
-    delta_xor_frame frame{};
-    iter_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_iter_delta) {
-    delta_delta_frame frame{};
-    iter_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_iter_xor) {
-    delta_xor_column col{};
-    iter_test_case(short_test_size, col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_iter_delta) {
-    delta_delta_column col{};
-    iter_test_case(short_test_size, col);
-}
-
-template<class column_t>
-void find_test_case(const int64_t num_elements, column_t& column) {
-    size_t total_size = 0;
-    std::vector<int64_t> samples;
-    int64_t ix = 0;
-    for (auto i = 0; i < num_elements; i++) {
-        ix += random_generators::get_int(1, 100);
-        column.append(ix);
-        if (samples.empty() || random_generators::get_int(10) == 0) {
-            samples.push_back(ix);
-        }
-        total_size++;
-    }
-    BOOST_REQUIRE_EQUAL(total_size, column.size());
-    std::random_device rd;
-    std::mt19937 g(rd());
-    std::shuffle(samples.begin(), samples.end(), g);
-
-    for (auto expected : samples) {
-        auto it = column.find(expected);
-        BOOST_REQUIRE(it != column.end());
-        auto actual = *it;
-        BOOST_REQUIRE_EQUAL(actual, expected);
-    }
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_find_xor) {
-    delta_xor_frame frame{};
-    find_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_find_xor_small) {
-    delta_xor_frame frame{};
-    find_test_case(random_generators::get_int(1, 16), frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_find_delta) {
-    delta_delta_frame frame{};
-    find_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_find_delta_small) {
-    delta_delta_frame frame{};
-    find_test_case(random_generators::get_int(1, 16), frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_find_xor) {
-    delta_xor_column col{};
-    find_test_case(short_test_size, col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_find_xor_small) {
-    delta_xor_column col{};
-    find_test_case(random_generators::get_int(1, 16), col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_find_delta) {
-    delta_delta_column col{};
-    find_test_case(short_test_size, col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_find_delta_small) {
-    delta_delta_column col{};
-    find_test_case(random_generators::get_int(1, 16), col);
-}
-
-template<class column_t>
-void lower_bound_test_case(const int64_t num_elements, column_t& column) {
-    size_t total_size = 0;
-    std::vector<int64_t> samples;
-    int64_t last = 0;
-    int64_t ix = 10000;
-    for (auto i = 0; i < num_elements; i++) {
-        ix += random_generators::get_int(1, 100);
-        column.append(ix);
-        last = ix;
-        if (samples.empty() || random_generators::get_int(10) == 0) {
-            samples.push_back(ix);
-        }
-        total_size++;
-    }
-    BOOST_REQUIRE_EQUAL(total_size, column.size());
-    std::random_device rd;
-    std::mt19937 g(rd());
-    std::shuffle(samples.begin(), samples.end(), g);
-
-    {
-        auto it = column.lower_bound(last);
-        BOOST_REQUIRE_EQUAL(last, *it);
-        it = column.lower_bound(last + 1);
-        BOOST_REQUIRE(it == column.end());
-    }
-
-    for (auto expected : samples) {
-        auto it = column.lower_bound(expected);
-        BOOST_REQUIRE(it != column.end());
-        auto actual = *it;
-        BOOST_REQUIRE_EQUAL(actual, expected);
-    }
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_lower_bound_xor) {
-    delta_xor_frame frame{};
-    lower_bound_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_lower_bound_xor_small) {
-    delta_xor_frame frame{};
-    lower_bound_test_case(random_generators::get_int(1, 16), frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_lower_bound_delta) {
-    delta_delta_frame frame{};
-    lower_bound_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_lower_bound_delta_small) {
-    delta_delta_frame frame{};
-    lower_bound_test_case(random_generators::get_int(1, 16), frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_lower_bound_xor) {
-    delta_xor_column col{};
-    lower_bound_test_case(short_test_size, col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_lower_bound_xor_small) {
-    delta_xor_column col{};
-    lower_bound_test_case(random_generators::get_int(1, 16), col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_lower_bound_delta) {
-    delta_delta_column col{};
-    lower_bound_test_case(short_test_size, col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_lower_bound_delta_small) {
-    delta_delta_column col{};
-    lower_bound_test_case(random_generators::get_int(1, 16), col);
-}
-
-template<class column_t>
-void upper_bound_test_case(const int64_t num_elements, column_t& column) {
-    size_t total_size = 0;
-    std::vector<int64_t> samples;
-    int64_t last = 0;
-    int64_t ix = 10000;
-    for (auto i = 0; i < num_elements; i++) {
-        ix += random_generators::get_int(1, 100);
-        column.append(ix);
-        if (samples.empty() || random_generators::get_int(10) == 0) {
-            samples.push_back(ix);
-        }
-        last = ix;
-        total_size++;
-    }
-    BOOST_REQUIRE_EQUAL(total_size, column.size());
-    std::random_device rd;
-    std::mt19937 g(rd());
-    std::shuffle(samples.begin(), samples.end(), g);
-
-    {
-        auto it = column.upper_bound(last);
-        BOOST_REQUIRE(it == column.end());
-    }
-
-    for (auto expected : samples) {
-        auto it = column.upper_bound(expected - 1);
-        BOOST_REQUIRE(it != column.end());
-        auto actual = *it;
-        BOOST_REQUIRE_EQUAL(actual, expected);
-    }
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_upper_bound_xor) {
-    delta_xor_frame frame{};
-    upper_bound_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_upper_bound_xor_small) {
-    delta_xor_frame frame{};
-    upper_bound_test_case(random_generators::get_int(1, 16), frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_upper_bound_delta) {
-    delta_delta_frame frame{};
-    upper_bound_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_upper_bound_delta_small) {
-    delta_delta_frame frame{};
-    upper_bound_test_case(random_generators::get_int(1, 16), frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_upper_bound_xor) {
-    delta_xor_column col{};
-    upper_bound_test_case(short_test_size, col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_upper_bound_xor_small) {
-    delta_xor_column col{};
-    upper_bound_test_case(random_generators::get_int(1, 16), col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_upper_bound_delta) {
-    delta_delta_column col{};
-    upper_bound_test_case(short_test_size, col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_upper_bound_delta_small) {
-    delta_delta_column col{};
-    upper_bound_test_case(random_generators::get_int(1, 16), col);
-}
-
-template<class column_t>
-void at_test_case(const int64_t num_elements, column_t& column) {
-    size_t total_size = 0;
-    std::vector<std::pair<int64_t, size_t>> samples;
-    int64_t value = 0;
-    for (int64_t i = 0; i < num_elements; i++) {
-        value += random_generators::get_int(1, 100);
-        column.append(value);
-        if (samples.empty() || random_generators::get_int(10) == 0) {
-            samples.emplace_back(value, total_size);
-        }
-        total_size++;
-    }
-    BOOST_REQUIRE_EQUAL(total_size, column.size());
-    std::random_device rd;
-    std::mt19937 g(rd());
-    std::shuffle(samples.begin(), samples.end(), g);
-
-    for (auto [expected, index] : samples) {
-        auto it = column.at_index(index);
-        BOOST_REQUIRE(it != column.end());
-        auto actual = *it;
-        BOOST_REQUIRE_EQUAL(actual, expected);
-        BOOST_REQUIRE_EQUAL(it.index(), index);
-    }
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_at_xor) {
-    delta_xor_frame frame{};
-    at_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_at_xor_small) {
-    delta_xor_frame frame{};
-    at_test_case(random_generators::get_int(16), frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_at_delta) {
-    delta_delta_frame frame{};
-    at_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_at_delta_small) {
-    delta_delta_frame frame{};
-    at_test_case(random_generators::get_int(16), frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_at_xor) {
-    delta_xor_column col{};
-    at_test_case(short_test_size, col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_at_xor_small) {
-    delta_xor_column col{};
-    at_test_case(random_generators::get_int(16), col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_at_delta) {
-    delta_delta_column col{};
-    at_test_case(short_test_size, col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_at_delta_small) {
-    delta_delta_column col{};
-    at_test_case(random_generators::get_int(16), col);
-}
-
-template<class column_t>
-void prefix_truncate_test_case(const int64_t num_elements, column_t& column) {
-    size_t total_size = 0;
-    struct sample_t {
-        int64_t sample;
-        int64_t index;
-    };
-    std::vector<sample_t> samples;
-    int64_t value = 0;
-    for (int64_t i = 0; i < num_elements; i++) {
-        value += random_generators::get_int(1, 100);
-        column.append(value);
-        if (samples.empty() || random_generators::get_int(10) == 0) {
-            vlog(test.info, "Add sample {} at {}", value, i);
-            samples.push_back(sample_t{
-              .sample = value,
-              .index = i,
-            });
-        }
-        total_size++;
-    }
-    BOOST_REQUIRE_EQUAL(total_size, column.size());
-
-    int64_t num_truncated = 0;
-    for (auto value : samples) {
-        auto delta = value.index - num_truncated;
-        vlog(
-          test.info,
-          "Truncating at {}, sample {}, {}",
-          delta,
-          value.sample,
-          value.index);
-        column.prefix_truncate_ix(delta);
-        num_truncated += delta;
-        auto it = column.begin();
-        BOOST_REQUIRE(it != column.end());
-        auto actual = *it;
-        vlog(test.info, "Found value {}", actual);
-        BOOST_REQUIRE_EQUAL(actual, value.sample);
-    }
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_prefix_truncate_xor) {
-    delta_xor_frame frame{};
-    prefix_truncate_test_case(10, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_prefix_truncate_delta) {
-    delta_delta_frame frame{};
-    prefix_truncate_test_case(10, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_prefix_truncate_xor) {
-    delta_xor_column col{};
-    prefix_truncate_test_case(10, col);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_prefix_truncate_delta) {
-    delta_delta_column col{};
-    prefix_truncate_test_case(10, col);
-}
-
-template<class column_t>
-void at_with_hint_test_case(const int64_t num_elements, column_t& column) {
-    struct hint_t {
-        std::optional<typename column_t::hint_t> pos;
-        uint32_t index;
-    };
-    size_t total_size = 0;
-    std::vector<hint_t> hints;
-    std::vector<std::pair<int64_t, size_t>> samples;
-    int64_t value = 0;
-    for (int64_t i = 0; i < num_elements; i++) {
-        value += random_generators::get_int(1, 100);
-        column.append(value);
-        if (random_generators::get_int(10) == 0) {
-            samples.emplace_back(value, total_size);
-        }
-        if (i % 16 == 0) {
-            auto hint = column.get_current_stream_pos();
-            hints.push_back(hint_t{
-              .pos = hint,
-              .index = static_cast<uint32_t>(i),
-            });
-        }
-        total_size++;
-    }
-    BOOST_REQUIRE_EQUAL(total_size, column.size());
-    std::random_device rd;
-    std::mt19937 g(rd());
-    std::shuffle(samples.begin(), samples.end(), g);
-
-    size_t num_skips = 0;
-    for (auto [expected, index] : samples) {
-        auto h_it = std::lower_bound(
-          hints.rbegin(),
-          hints.rend(),
-          hint_t{.index = static_cast<uint32_t>(index)},
-          [](const hint_t& lhs, const hint_t& rhs) {
-              return lhs.index > rhs.index;
-          });
-        if (h_it == hints.rend()) {
-            // We won't be able to find the hint for the first row
-            num_skips++;
-            continue;
-        }
-        auto it = h_it->pos.has_value()
-                    ? column.at_index(index, h_it->pos.value())
-                    : column.at_index(index);
-        BOOST_REQUIRE(it != column.end());
-        auto actual = *it;
-        BOOST_REQUIRE_EQUAL(actual, expected);
-        BOOST_REQUIRE_EQUAL(it.index(), index);
-    }
-    BOOST_REQUIRE_LE(num_skips, 16);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_at_with_hint_xor) {
-    delta_xor_frame frame{};
-    at_with_hint_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_frame_at_with_hint_delta) {
-    delta_delta_frame frame{};
-    at_with_hint_test_case(short_test_size, frame);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_at_with_hint_xor) {
-    delta_xor_column column{};
-    at_with_hint_test_case(short_test_size, column);
-}
-
-BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_col_at_with_hint_delta) {
-    delta_delta_column column{};
-    at_with_hint_test_case(short_test_size, column);
-}
 
 std::vector<segment_meta> generate_metadata(size_t sz) {
     // #include "cloud_storage/tests/7_333.json.h"
@@ -859,14 +326,14 @@ BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_prefix_truncate_full) {
 BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_prefix_truncate_complete) {
     segment_meta_cstore store;
     auto manifest = generate_metadata(short_test_size);
-    for (auto const& sm : manifest) {
+    for (const auto& sm : manifest) {
         store.insert(sm);
     }
 
     store.prefix_truncate(model::offset::max());
     BOOST_REQUIRE(store.empty());
 
-    for (auto const& sm : manifest) {
+    for (const auto& sm : manifest) {
         store.insert(sm);
     }
     store.prefix_truncate(manifest.back().committed_offset + model::offset{1});
@@ -876,7 +343,7 @@ BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_prefix_truncate_complete) {
 BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_serde_roundtrip) {
     segment_meta_cstore store{};
     auto manifest = generate_metadata(10007);
-    for (auto const& sm : manifest) {
+    for (const auto& sm : manifest) {
         store.insert(sm);
     }
     {
@@ -1008,7 +475,7 @@ BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_insert_replacements) {
       manifest.begin(),
       manifest.end(),
       false,
-      [&](bool generating_replacement, auto const& in) {
+      [&](bool generating_replacement, const auto& in) {
           if (generating_replacement) {
               if (random_generators::get_int(1) == 1) {
                   // absorb "in" and keep generating
@@ -1106,4 +573,238 @@ BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_insert_replacements) {
       store_result.end(),
       merged_result.begin(),
       merged_result.end()));
+}
+
+BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_insert_in_gap) {
+    auto make_seg = [](auto base) {
+        return segment_meta{
+          .is_compacted = false,
+          .size_bytes = 812,
+          .base_offset = model::offset(base),
+          .committed_offset = model::offset(base + 9),
+          .base_timestamp = model::timestamp(1646430092103),
+          .max_timestamp = model::timestamp(1646430092103),
+          .delta_offset = model::offset_delta(0),
+          .archiver_term = model::term_id(2),
+          .segment_term = model::term_id(0),
+          .delta_offset_end = model::offset_delta(0),
+          .sname_format = segment_name_format::v3,
+          .metadata_size_hint = 0,
+        };
+    };
+
+    std::vector<size_t> baseline_entries{0, 13, 16, 17, 29, 30, 31, 32};
+    for (size_t entries : baseline_entries) {
+        auto base_offset = 0;
+        std::vector<segment_meta> metas;
+        segment_meta_cstore store{};
+
+        // Insert different number of baseline entries to get differrent
+        // frame configurations.
+        for (size_t i = 0; i < entries; ++i) {
+            auto seg = make_seg(base_offset);
+            base_offset += 10;
+
+            metas.push_back(seg);
+            store.insert(seg);
+        }
+
+        auto next_seg = make_seg(base_offset);
+        auto next_next_seg = make_seg(base_offset + 10);
+        auto next_next_next_seg = make_seg(base_offset + 20);
+
+        metas.push_back(next_seg);
+        metas.push_back(next_next_seg);
+        metas.push_back(next_next_next_seg);
+
+        // Insert two segments and create a gap between them
+        store.insert(next_seg);
+        store.insert(next_next_next_seg);
+
+        // Flush the write buffer such that the next insert does
+        // not get re-ordered in the right place.
+        store.flush_write_buffer();
+
+        // Insert in the gap
+        store.insert(next_next_seg);
+
+        BOOST_CHECK_EQUAL(store.size(), metas.size());
+        BOOST_CHECK(*store.begin() == metas[0]);
+        BOOST_CHECK_EQUAL(
+          store.last_segment().value(), metas[metas.size() - 1]);
+
+        auto expected_iter = metas.begin();
+        auto cstore_iter = store.begin();
+
+        for (; expected_iter != metas.end(); ++expected_iter, ++cstore_iter) {
+            BOOST_CHECK_EQUAL(*expected_iter, *cstore_iter);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_overlap_no_replace) {
+    auto make_seg = [](auto base, std::optional<int64_t> last) {
+        return segment_meta{
+          .is_compacted = false,
+          .size_bytes = 812,
+          .base_offset = model::offset(base),
+          .committed_offset = model::offset(last ? *last : base + 9),
+          .base_timestamp = model::timestamp(1646430092103),
+          .max_timestamp = model::timestamp(1646430092103),
+          .delta_offset = model::offset_delta(0),
+          .archiver_term = model::term_id(2),
+          .segment_term = model::term_id(0),
+          .delta_offset_end = model::offset_delta(0),
+          .sname_format = segment_name_format::v3,
+          .metadata_size_hint = 0,
+        };
+    };
+
+    std::vector<size_t> baseline_entries{1, 13, 16, 17, 29, 30, 31, 32};
+    for (size_t entries : baseline_entries) {
+        auto base_offset = 0;
+        std::vector<segment_meta> metas;
+        segment_meta_cstore store{};
+
+        // Insert different number of baseline entries to get differrent
+        // frame configurations.
+        for (size_t i = 0; i < entries; ++i) {
+            auto seg = make_seg(base_offset, std::nullopt);
+            base_offset += 10;
+
+            metas.push_back(seg);
+            store.insert(seg);
+        }
+
+        auto last_seg = store.last_segment();
+        BOOST_REQUIRE(last_seg.has_value());
+
+        // Select a segment that is fully contained by the last segment.
+        auto next_seg = make_seg(
+          last_seg->base_offset() - 5, last_seg->base_offset() + 5);
+        metas.insert(--metas.end(), next_seg);
+
+        // Flush the write buffer such that the next insert does
+        // not get re-ordered in the right place.
+        store.flush_write_buffer();
+
+        // Insert the overlapping segment
+        store.insert(next_seg);
+
+        BOOST_CHECK_EQUAL(store.size(), metas.size());
+        BOOST_CHECK(*store.begin() == metas[0]);
+        BOOST_CHECK_EQUAL(
+          store.last_segment().value(), metas[metas.size() - 1]);
+
+        auto expected_iter = metas.begin();
+        auto cstore_iter = store.begin();
+
+        for (; expected_iter != metas.end(); ++expected_iter, ++cstore_iter) {
+            BOOST_CHECK_EQUAL(*expected_iter, *cstore_iter);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_overlap_with_replace) {
+    auto make_seg = [](auto base, std::optional<int64_t> last) {
+        return segment_meta{
+          .is_compacted = false,
+          .size_bytes = 812,
+          .base_offset = model::offset(base),
+          .committed_offset = model::offset(last ? *last : base + 9),
+          .base_timestamp = model::timestamp(1646430092103),
+          .max_timestamp = model::timestamp(1646430092103),
+          .delta_offset = model::offset_delta(0),
+          .archiver_term = model::term_id(2),
+          .segment_term = model::term_id(0),
+          .delta_offset_end = model::offset_delta(0),
+          .sname_format = segment_name_format::v3,
+          .metadata_size_hint = 0,
+        };
+    };
+
+    std::vector<size_t> baseline_entries{13, 16, 17, 29, 30, 31, 32};
+    for (size_t entries : baseline_entries) {
+        auto base_offset = 0;
+        std::vector<segment_meta> metas;
+        segment_meta_cstore store{};
+
+        // Insert different number of baseline entries to get differrent
+        // frame configurations.
+        for (size_t i = 0; i < entries; ++i) {
+            auto seg = make_seg(base_offset, std::nullopt);
+            base_offset += 10;
+
+            metas.push_back(seg);
+            store.insert(seg);
+        }
+
+        auto replaced_seg = metas[metas.size() - 2];
+
+        // Select a segment that fully includes the penultimate segment.
+        auto next_seg = make_seg(
+          replaced_seg.base_offset() - 5, replaced_seg.committed_offset() + 5);
+        metas.insert(metas.end() - 2, next_seg);
+        metas.erase(metas.end() - 2);
+
+        // Flush the write buffer such that the next insert does
+        // not get re-ordered in the right place.
+        store.flush_write_buffer();
+
+        // Insert the overlapping segment
+        store.insert(next_seg);
+
+        BOOST_CHECK_EQUAL(store.size(), metas.size());
+        BOOST_CHECK(*store.begin() == metas[0]);
+        BOOST_CHECK_EQUAL(
+          store.last_segment().value(), metas[metas.size() - 1]);
+
+        auto expected_iter = metas.begin();
+        auto cstore_iter = store.begin();
+
+        for (; expected_iter != metas.end(); ++expected_iter, ++cstore_iter) {
+            BOOST_CHECK_EQUAL(*expected_iter, *cstore_iter);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_segment_meta_cstore_append_retrieve_edge_case) {
+    // test to trigger a corner case, where the _hints vector is misaligned with
+    // the frames basically the first element of a frame is not tracked by a
+    // hint. this can happen with prefix_truncate, that will break the invariant
+    // that closed frames are max_frame_size big the content of metadata is not
+    // important, only the quantity. this should construct 3 frames, first two
+    // complete and the third one open (but with enough data to have
+    // compression)
+    auto metadata = generate_metadata(
+      cloud_storage::cstore_max_frame_size * 2 + details::FOR_buffer_depth);
+    segment_meta_cstore store{};
+    // step 1: generate two frames
+    for (auto& m :
+         metadata
+           | std::views::take(cloud_storage::cstore_max_frame_size * 2)) {
+        store.insert(m);
+    }
+    // step 1.5 make sure that data is compressed
+    BOOST_REQUIRE(store.size() == cloud_storage::cstore_max_frame_size * 2);
+    // step 2: prefix truncate to misalign hints vector
+    store.prefix_truncate(metadata[1].base_offset);
+    BOOST_REQUIRE(store.size() == cloud_storage::cstore_max_frame_size * 2 - 1);
+
+    // step 3: elements to the new frame
+    for (auto& m :
+         metadata
+           | std::views::drop(cloud_storage::cstore_max_frame_size * 2)) {
+        store.insert(m);
+    }
+    BOOST_REQUIRE(store.size() == metadata.size() - 1);
+
+    // retrieving this offset via lower_bound will first returns a _hint that
+    // belongs to the previous frame. without the fix, this would cause an
+    // out_of_range exception the fix is in
+    // segment_meta_cstore.cc::column_store::materialize() `_hint_initial <
+    // _hint_threashold -> return nullopt`
+    auto last_frame_first_offset
+      = metadata[cloud_storage::cstore_max_frame_size * 2].base_offset;
+    BOOST_CHECK_NO_THROW(store.lower_bound(last_frame_first_offset));
 }

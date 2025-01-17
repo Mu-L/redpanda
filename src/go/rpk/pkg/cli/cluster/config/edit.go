@@ -15,6 +15,8 @@ import (
 	"os"
 	"os/exec"
 
+	"github.com/kballard/go-shellquote"
+	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -44,10 +46,10 @@ to edit all properties including these tunables.
 		Args: cobra.ExactArgs(0),
 		Run: func(cmd *cobra.Command, _ []string) {
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
-			out.CheckExitCloudAdmin(p)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
+			config.CheckExitCloudAdmin(p)
 
-			client, err := adminapi.NewClient(fs, p)
+			client, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			// GET the schema
@@ -68,9 +70,9 @@ to edit all properties including these tunables.
 
 func executeEdit(
 	ctx context.Context,
-	client *adminapi.AdminAPI,
-	schema adminapi.ConfigSchema,
-	currentConfig adminapi.Config,
+	client *rpadmin.AdminAPI,
+	schema rpadmin.ConfigSchema,
+	currentConfig rpadmin.Config,
 	all *bool,
 ) error {
 	// Generate a yaml template for editing
@@ -107,7 +109,12 @@ func executeEdit(
 		}
 	}
 
-	child := exec.Command(editor, filename)
+	// Fix: Issue #17386
+	eArgs, err := editorAndArguments(editor, filename)
+	if err != nil {
+		return fmt.Errorf("error opening file %s on editor %s: %v", filename, editor, err)
+	}
+	child := exec.Command(eArgs[0], eArgs[1:]...)
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
 	child.Stdin = os.Stdin
@@ -122,4 +129,17 @@ func executeEdit(
 		return fmt.Errorf("error updating config: %v", err)
 	}
 	return nil
+}
+
+// Split the editor environment variable to see if it has editor options e.g. code -w, where editor is "code" and its options is "-w"
+// TODO: Open up this method in case other modules require to open the editor and options
+
+func editorAndArguments(editor string, filename string) ([]string, error) {
+	eArgs, err := shellquote.Split(editor)
+	if err != nil {
+		return nil, err
+	}
+	eArgs = append(eArgs, filename)
+
+	return eArgs, err
 }

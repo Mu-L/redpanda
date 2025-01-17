@@ -9,28 +9,25 @@
 
 #include "raft/types.h"
 
+#include "base/vassert.h"
+#include "model/async_adl_serde.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/timeout_clock.h"
 #include "raft/consensus_utils.h"
 #include "raft/errc.h"
 #include "raft/group_configuration.h"
+#include "raft/transfer_leadership.h"
 #include "reflection/adl.h"
 #include "reflection/async_adl.h"
-#include "serde/serde.h"
-#include "utils/to_string.h"
-#include "vassert.h"
-#include "vlog.h"
 
 #include <seastar/coroutine/maybe_yield.hh>
 
+#include <fmt/format.h>
 #include <fmt/ostream.h>
 
 #include <chrono>
-#include <type_traits>
-
 namespace {
 template<typename T>
 T decode_signed(T value) {
@@ -43,7 +40,6 @@ T varlong_reader(iobuf_parser& in) {
     return T(val);
 }
 
-namespace internal {
 struct hbeat_soa {
     explicit hbeat_soa(size_t n)
       : groups(n)
@@ -120,7 +116,6 @@ T read_one_varint_delta(iobuf_parser& in, const T& prev) {
     auto dst = varlong_reader<T>(in);
     return prev + dst;
 }
-} // namespace internal
 } // namespace
 
 namespace raft {
@@ -133,68 +128,103 @@ replicate_stages::replicate_stages(
 replicate_stages::replicate_stages(raft::errc ec)
   : request_enqueued(ss::now())
   , replicate_finished(
-      ss::make_ready_future<result<replicate_result>>(make_error_code(ec))){};
+      ss::make_ready_future<result<replicate_result>>(make_error_code(ec))) {};
 
 void follower_index_metadata::reset() {
     last_dirty_log_index = model::offset{};
     last_flushed_log_index = model::offset{};
-    last_sent_offset = model::offset{};
+    expected_log_end_offset = model::offset{};
     match_index = model::offset{};
     next_index = model::offset{};
     heartbeats_failed = 0;
     last_sent_seq = follower_req_seq{0};
     last_received_seq = follower_req_seq{0};
     last_successful_received_seq = follower_req_seq{0};
-    last_suppress_heartbeats_seq = follower_req_seq{0};
-    suppress_heartbeats = heartbeats_suppressed::no;
+    inflight_append_request_count = 0;
+    last_sent_protocol_meta.reset();
+    follower_state_change.broadcast();
 }
 
 std::ostream& operator<<(std::ostream& o, const vnode& id) {
-    return o << "{id: " << id.id() << ", revision: " << id.revision() << "}";
+    fmt::print(o, "{{id: {}, revision: {}}}", id.id(), id.revision());
+    return o;
 }
 
 std::ostream& operator<<(std::ostream& o, const append_entries_reply& r) {
-    return o << "{node_id: " << r.node_id << ", target_node_id"
-             << r.target_node_id << ", group: " << r.group
-             << ", term:" << r.term
-             << ", last_dirty_log_index:" << r.last_dirty_log_index
-             << ", last_flushed_log_index:" << r.last_flushed_log_index
-             << ", last_term_base_offset:" << r.last_term_base_offset
-             << ", result: " << r.result << "}";
+    fmt::print(
+      o,
+      "{{node_id: {}, target_node_id: {}, group: {}, term: {}, "
+      "last_dirty_log_index: {}, last_flushed_log_index: {}, "
+      "last_term_base_offset: {}, result: {}, may_recover: {}}}",
+      r.node_id,
+      r.target_node_id,
+      r.group,
+      r.term,
+      r.last_dirty_log_index,
+      r.last_flushed_log_index,
+      r.last_term_base_offset,
+      r.result,
+      r.may_recover);
+    return o;
 }
 
 std::ostream& operator<<(std::ostream& o, const vote_request& r) {
-    return o << "{node_id: " << r.node_id << ", target_node_id"
-             << r.target_node_id << ", group: " << r.group
-             << ", term:" << r.term << ", prev_log_index:" << r.prev_log_index
-             << ", prev_log_term: " << r.prev_log_term
-             << ", leadership_xfer: " << r.leadership_transfer << "}";
+    fmt::print(
+      o,
+      "{{node_id: {}, target_node_id: {}, group: {}, term: {}, prev_log_index: "
+      "{}, prev_log_term: {}, leadership_xfer: {}}}",
+      r.node_id,
+      r.target_node_id,
+      r.group,
+      r.term,
+      r.prev_log_index,
+      r.prev_log_term,
+      r.leadership_transfer);
+    return o;
 }
 std::ostream& operator<<(std::ostream& o, const follower_index_metadata& i) {
-    return o << "{node_id: " << i.node_id
-             << ", last_committed_log_idx: " << i.last_flushed_log_index
-             << ", last_dirty_log_idx: " << i.last_dirty_log_index
-             << ", match_index: " << i.match_index
-             << ", next_index: " << i.next_index
-             << ", is_learner: " << i.is_learner
-             << ", is_recovering: " << i.is_recovering << "}";
+    fmt::print(
+      o,
+      "{{node_id: {}, last_flushed_log_index: {}, last_dirty_log_index: {}, "
+      "match_index: {}, next_index: {}, expected_log_end_offset: {}, "
+      "heartbeats_failed: {}, last_sent_seq: {}, last_received_seq: {}, "
+      "last_successful_received_seq: {}, is_learner: {}, is_recovering: {}}}",
+      i.node_id,
+      i.last_flushed_log_index,
+      i.last_dirty_log_index,
+      i.match_index,
+      i.next_index,
+      i.expected_log_end_offset,
+      i.heartbeats_failed,
+      i.last_sent_seq,
+      i.last_received_seq,
+      i.last_successful_received_seq,
+      i.is_learner,
+      i.is_recovering);
+    return o;
+}
+std::ostream& operator<<(std::ostream& o, const heartbeat_metadata& hm) {
+    fmt::print(
+      o,
+      "{{node_id: {}, target_node_id: {}, protocol_metadata: {}}}",
+      hm.node_id,
+      hm.target_node_id,
+      hm.meta);
+    return o;
 }
 
 std::ostream& operator<<(std::ostream& o, const heartbeat_request& r) {
-    o << "{meta:(" << r.heartbeats.size() << ") [";
-    for (auto& m : r.heartbeats) {
-        o << "meta: " << m.meta << ","
-          << "node_id: " << m.node_id << ","
-          << "target_node_id: " << m.target_node_id << ",";
-    }
-    return o << "]}";
+    fmt::print(
+      o,
+      "{{meta: ({}) [{}]}}",
+      r.heartbeats.size(),
+      fmt::join(r.heartbeats, ","));
+    return o;
 }
+
 std::ostream& operator<<(std::ostream& o, const heartbeat_reply& r) {
-    o << "{meta:[";
-    for (auto& m : r.meta) {
-        o << m << ",";
-    }
-    return o << "]}";
+    fmt::print(o, "{{meta: [{}] }}", fmt::join(r.meta, ","));
+    return o;
 }
 
 std::ostream& operator<<(std::ostream& o, const consistency_level& l) {
@@ -214,30 +244,45 @@ std::ostream& operator<<(std::ostream& o, const consistency_level& l) {
     return o;
 }
 std::ostream& operator<<(std::ostream& o, const protocol_metadata& m) {
-    return o << "{raft_group:" << m.group << ", commit_index:" << m.commit_index
-             << ", term:" << m.term << ", prev_log_index:" << m.prev_log_index
-             << ", prev_log_term:" << m.prev_log_term
-             << ", last_visible_index:" << m.last_visible_index << "}";
+    fmt::print(
+      o,
+      "{{group: {}, commit_index: {}, term: {}, prev_log_index: {}, "
+      "prev_log_term: {}, last_visible_index: {}, dirty_offset: {}, "
+      "prev_log_delta: {}}}",
+      m.group,
+      m.commit_index,
+      m.term,
+      m.prev_log_index,
+      m.prev_log_term,
+      m.last_visible_index,
+      m.dirty_offset,
+      m.prev_log_delta);
+    return o;
 }
+
 std::ostream& operator<<(std::ostream& o, const vote_reply& r) {
-    return o << "{term:" << r.term << ", target_node_id" << r.target_node_id
-             << ", vote_granted: " << r.granted << ", log_ok:" << r.log_ok
-             << "}";
+    fmt::print(
+      o,
+      "{{term: {}, target_node: {}, vote_granted: {}, log_ok: {}}}",
+      r.term,
+      r.target_node_id,
+      r.granted,
+      r.log_ok);
+    return o;
 }
-std::ostream&
-operator<<(std::ostream& o, const append_entries_reply::status& r) {
+std::ostream& operator<<(std::ostream& o, const reply_result& r) {
     switch (r) {
-    case append_entries_reply::status::success:
+    case reply_result::success:
         o << "success";
         return o;
-    case append_entries_reply::status::failure:
+    case reply_result::failure:
         o << "failure";
         return o;
-    case append_entries_reply::status::group_unavailable:
+    case reply_result::group_unavailable:
         o << "group_unavailable";
         return o;
-    case append_entries_reply::status::timeout:
-        o << "timeout";
+    case reply_result::follower_busy:
+        o << "follower_busy";
         return o;
     }
     __builtin_unreachable();
@@ -248,7 +293,7 @@ std::ostream& operator<<(std::ostream& o, const install_snapshot_request& r) {
       o,
       "{{term: {}, group: {}, target_node_id: {}, node_id: {}, "
       "last_included_index: {}, "
-      "file_offset: {}, chunk_size: {}, done: {}}}",
+      "file_offset: {}, chunk_size: {}, done: {}, dirty_offset: {}}}",
       r.term,
       r.group,
       r.target_node_id,
@@ -256,7 +301,8 @@ std::ostream& operator<<(std::ostream& o, const install_snapshot_request& r) {
       r.last_included_index,
       r.file_offset,
       r.chunk.size_bytes(),
-      r.done);
+      r.done,
+      r.dirty_offset);
     return o;
 }
 
@@ -290,7 +336,7 @@ ss::future<> heartbeat_request::serde_async_write(iobuf& dst) {
 
     co_await ss::coroutine::maybe_yield();
 
-    internal::hbeat_soa encodee(request.heartbeats.size());
+    hbeat_soa encodee(request.heartbeats.size());
     // target physical node id is always the same it differs only by
     // revision
 
@@ -326,20 +372,14 @@ ss::future<> heartbeat_request::serde_async_write(iobuf& dst) {
     write(out, request.heartbeats.front().target_node_id.id());
     write(out, static_cast<uint32_t>(size));
 
-    internal::encode_one_delta_array<raft::group_id>(out, encodee.groups);
-    internal::encode_one_delta_array<model::offset>(
-      out, encodee.commit_indices);
-    internal::encode_one_delta_array<model::term_id>(out, encodee.terms);
-    internal::encode_one_delta_array<model::offset>(
-      out, encodee.prev_log_indices);
-    internal::encode_one_delta_array<model::term_id>(
-      out, encodee.prev_log_terms);
-    internal::encode_one_delta_array<model::offset>(
-      out, encodee.last_visible_indices);
-    internal::encode_one_delta_array<model::revision_id>(
-      out, encodee.revisions);
-    internal::encode_one_delta_array<model::revision_id>(
-      out, encodee.target_revisions);
+    encode_one_delta_array<raft::group_id>(out, encodee.groups);
+    encode_one_delta_array<model::offset>(out, encodee.commit_indices);
+    encode_one_delta_array<model::term_id>(out, encodee.terms);
+    encode_one_delta_array<model::offset>(out, encodee.prev_log_indices);
+    encode_one_delta_array<model::term_id>(out, encodee.prev_log_terms);
+    encode_one_delta_array<model::offset>(out, encodee.last_visible_indices);
+    encode_one_delta_array<model::revision_id>(out, encodee.revisions);
+    encode_one_delta_array<model::revision_id>(out, encodee.target_revisions);
 
     write(dst, std::move(out));
 }
@@ -361,39 +401,37 @@ void heartbeat_request::serde_read(
     const size_t max = req.heartbeats.size();
     req.heartbeats[0].meta.group = varlong_reader<raft::group_id>(in);
     for (size_t i = 1; i < max; ++i) {
-        req.heartbeats[i].meta.group
-          = internal::read_one_varint_delta<raft::group_id>(
-            in, req.heartbeats[i - 1].meta.group);
+        req.heartbeats[i].meta.group = read_one_varint_delta<raft::group_id>(
+          in, req.heartbeats[i - 1].meta.group);
     }
     req.heartbeats[0].meta.commit_index = varlong_reader<model::offset>(in);
     for (size_t i = 1; i < max; ++i) {
         req.heartbeats[i].meta.commit_index
-          = internal::read_one_varint_delta<model::offset>(
+          = read_one_varint_delta<model::offset>(
             in, req.heartbeats[i - 1].meta.commit_index);
     }
     req.heartbeats[0].meta.term = varlong_reader<model::term_id>(in);
     for (size_t i = 1; i < max; ++i) {
-        req.heartbeats[i].meta.term
-          = internal::read_one_varint_delta<model::term_id>(
-            in, req.heartbeats[i - 1].meta.term);
+        req.heartbeats[i].meta.term = read_one_varint_delta<model::term_id>(
+          in, req.heartbeats[i - 1].meta.term);
     }
     req.heartbeats[0].meta.prev_log_index = varlong_reader<model::offset>(in);
     for (size_t i = 1; i < max; ++i) {
         req.heartbeats[i].meta.prev_log_index
-          = internal::read_one_varint_delta<model::offset>(
+          = read_one_varint_delta<model::offset>(
             in, req.heartbeats[i - 1].meta.prev_log_index);
     }
     req.heartbeats[0].meta.prev_log_term = varlong_reader<model::term_id>(in);
     for (size_t i = 1; i < max; ++i) {
         req.heartbeats[i].meta.prev_log_term
-          = internal::read_one_varint_delta<model::term_id>(
+          = read_one_varint_delta<model::term_id>(
             in, req.heartbeats[i - 1].meta.prev_log_term);
     }
     req.heartbeats[0].meta.last_visible_index = varlong_reader<model::offset>(
       in);
     for (size_t i = 1; i < max; ++i) {
         req.heartbeats[i].meta.last_visible_index
-          = internal::read_one_varint_delta<model::offset>(
+          = read_one_varint_delta<model::offset>(
             in, req.heartbeats[i - 1].meta.last_visible_index);
     }
 
@@ -402,7 +440,7 @@ void heartbeat_request::serde_read(
     for (size_t i = 1; i < max; ++i) {
         req.heartbeats[i].node_id = raft::vnode(
           node_id,
-          internal::read_one_varint_delta<model::revision_id>(
+          read_one_varint_delta<model::revision_id>(
             in, req.heartbeats[i - 1].node_id.revision()));
     }
 
@@ -411,7 +449,7 @@ void heartbeat_request::serde_read(
     for (size_t i = 1; i < max; ++i) {
         req.heartbeats[i].target_node_id = raft::vnode(
           target_node,
-          internal::read_one_varint_delta<model::revision_id>(
+          read_one_varint_delta<model::revision_id>(
             in, req.heartbeats[i - 1].target_node_id.revision()));
     }
 
@@ -420,6 +458,8 @@ void heartbeat_request::serde_read(
         hb.meta.commit_index = decode_signed(hb.meta.commit_index);
         hb.meta.prev_log_term = decode_signed(hb.meta.prev_log_term);
         hb.meta.last_visible_index = decode_signed(hb.meta.last_visible_index);
+        // for heartbeats dirty_offset and prev_log_index are always the same.
+        hb.meta.dirty_offset = hb.meta.prev_log_index;
         hb.node_id = raft::vnode(
           hb.node_id.id(), decode_signed(hb.node_id.revision()));
         hb.target_node_id = raft::vnode(
@@ -474,7 +514,7 @@ void heartbeat_reply::serde_write(iobuf& dst) {
         write(out, reply.meta.front().target_node_id.id());
     }
 
-    internal::hbeat_response_array encodee(reply.meta.size());
+    hbeat_response_array encodee(reply.meta.size());
 
     for (size_t i = 0; i < reply.meta.size(); ++i) {
         encodee.groups[i] = reply.meta[i].group;
@@ -491,22 +531,19 @@ void heartbeat_reply::serde_write(iobuf& dst) {
         encodee.target_revisions[i] = std::max(
           model::revision_id(-1), reply.meta[i].target_node_id.revision());
     }
-    internal::encode_one_delta_array<raft::group_id>(out, encodee.groups);
-    internal::encode_one_delta_array<model::term_id>(out, encodee.terms);
+    encode_one_delta_array<raft::group_id>(out, encodee.groups);
+    encode_one_delta_array<model::term_id>(out, encodee.terms);
 
-    internal::encode_one_delta_array<model::offset>(
-      out, encodee.last_flushed_log_index);
-    internal::encode_one_delta_array<model::offset>(
-      out, encodee.last_dirty_log_index);
-    internal::encode_one_delta_array<model::offset>(
-      out, encodee.last_term_base_offset);
-    internal::encode_one_delta_array<model::revision_id>(
-      out, encodee.revisions);
-    internal::encode_one_delta_array<model::revision_id>(
-      out, encodee.target_revisions);
+    encode_one_delta_array<model::offset>(out, encodee.last_flushed_log_index);
+    encode_one_delta_array<model::offset>(out, encodee.last_dirty_log_index);
+    encode_one_delta_array<model::offset>(out, encodee.last_term_base_offset);
+    encode_one_delta_array<model::revision_id>(out, encodee.revisions);
+    encode_one_delta_array<model::revision_id>(out, encodee.target_revisions);
     for (auto& m : reply.meta) {
         write(out, m.result);
     }
+    // Don't bother serializing m.may_recover because nodes that will have
+    // meaningful may_recover are expected to use lightweight heartbeats anyway.
 
     write(dst, std::move(out));
 }
@@ -531,33 +568,33 @@ void heartbeat_reply::serde_read(iobuf_parser& src, const serde::header& hdr) {
     size_t size = reply.meta.size();
     reply.meta[0].group = varlong_reader<raft::group_id>(in);
     for (size_t i = 1; i < size; ++i) {
-        reply.meta[i].group = internal::read_one_varint_delta<raft::group_id>(
+        reply.meta[i].group = read_one_varint_delta<raft::group_id>(
           in, reply.meta[i - 1].group);
     }
     reply.meta[0].term = varlong_reader<model::term_id>(in);
     for (size_t i = 1; i < size; ++i) {
-        reply.meta[i].term = internal::read_one_varint_delta<model::term_id>(
+        reply.meta[i].term = read_one_varint_delta<model::term_id>(
           in, reply.meta[i - 1].term);
     }
 
     reply.meta[0].last_flushed_log_index = varlong_reader<model::offset>(in);
     for (size_t i = 1; i < size; ++i) {
         reply.meta[i].last_flushed_log_index
-          = internal::read_one_varint_delta<model::offset>(
+          = read_one_varint_delta<model::offset>(
             in, reply.meta[i - 1].last_flushed_log_index);
     }
 
     reply.meta[0].last_dirty_log_index = varlong_reader<model::offset>(in);
     for (size_t i = 1; i < size; ++i) {
         reply.meta[i].last_dirty_log_index
-          = internal::read_one_varint_delta<model::offset>(
+          = read_one_varint_delta<model::offset>(
             in, reply.meta[i - 1].last_dirty_log_index);
     }
 
     reply.meta[0].last_term_base_offset = varlong_reader<model::offset>(in);
     for (size_t i = 1; i < size; ++i) {
         reply.meta[i].last_term_base_offset
-          = internal::read_one_varint_delta<model::offset>(
+          = read_one_varint_delta<model::offset>(
             in, reply.meta[i - 1].last_term_base_offset);
     }
 
@@ -566,7 +603,7 @@ void heartbeat_reply::serde_read(iobuf_parser& src, const serde::header& hdr) {
     for (size_t i = 1; i < size; ++i) {
         reply.meta[i].node_id = raft::vnode(
           node_id,
-          internal::read_one_varint_delta<model::revision_id>(
+          read_one_varint_delta<model::revision_id>(
             in, reply.meta[i - 1].node_id.revision()));
     }
 
@@ -575,13 +612,12 @@ void heartbeat_reply::serde_read(iobuf_parser& src, const serde::header& hdr) {
     for (size_t i = 1; i < size; ++i) {
         reply.meta[i].target_node_id = raft::vnode(
           target_node_id,
-          internal::read_one_varint_delta<model::revision_id>(
+          read_one_varint_delta<model::revision_id>(
             in, reply.meta[i - 1].target_node_id.revision()));
     }
 
     for (size_t i = 0; i < size; ++i) {
-        reply.meta[i].result = read_nested<raft::append_entries_reply::status>(
-          in, 0U);
+        reply.meta[i].result = read_nested<raft::reply_result>(in, 0U);
     }
 
     for (auto& m : reply.meta) {
@@ -593,6 +629,31 @@ void heartbeat_reply::serde_read(iobuf_parser& src, const serde::header& hdr) {
         m.target_node_id = raft::vnode(
           m.target_node_id.id(), decode_signed(m.target_node_id.revision()));
     }
+}
+append_entries_request::append_entries_request(
+  vnode src,
+  protocol_metadata m,
+  model::record_batch_reader r,
+  size_t size,
+  flush_after_append f) noexcept
+  : append_entries_request(src, vnode{}, m, std::move(r), size, f) {}
+
+append_entries_request::append_entries_request(
+  vnode src,
+  vnode target,
+  protocol_metadata m,
+  model::record_batch_reader r,
+  size_t size,
+  flush_after_append f) noexcept
+  : _source_node(src)
+  , _target_node_id(target)
+  , _meta(m)
+  , _flush(f)
+  , _batches(std::move(r))
+  , _total_size(size + sizeof(append_entries_request)) {}
+
+size_t append_entries_request::batches_size() const {
+    return total_size() - sizeof(append_entries_request);
 }
 
 ss::future<> append_entries_request::serde_async_write(iobuf& dst) {
@@ -631,19 +692,20 @@ ss::future<> append_entries_request::serde_async_write(iobuf& dst) {
 
 ss::future<append_entries_request>
 append_entries_request::serde_async_direct_read(
-  iobuf_parser& src, size_t bytes_left_limit) {
+  iobuf_parser& src, serde::header h) {
     using serde::read_async_nested;
     using serde::read_nested;
 
-    auto tmp = co_await read_async_nested<iobuf>(src, bytes_left_limit);
+    auto tmp = co_await read_async_nested<iobuf>(src, h._bytes_left_limit);
     iobuf_parser in(std::move(tmp));
 
     auto batch_count = read_nested<uint32_t>(in, 0U);
     // use chunked fifo as usually batches size is small
     fragmented_vector<model::record_batch> batches{};
-
+    size_t batches_size{0};
     for (uint32_t i = 0; i < batch_count; ++i) {
         auto b = co_await reflection::async_adl<model::record_batch>{}.from(in);
+        batches_size += b.size_bytes();
         batches.push_back(std::move(b));
         co_await ss::coroutine::maybe_yield();
     }
@@ -659,6 +721,7 @@ append_entries_request::serde_async_direct_read(
       meta,
       model::make_foreign_fragmented_memory_record_batch_reader(
         std::move(batches)),
+      batches_size,
       flush);
 }
 
@@ -668,11 +731,13 @@ append_entries_request::make_foreign(append_entries_request&& req) {
     auto target_node = req._target_node_id;
     auto metadata = req._meta;
     auto flush = req._flush;
+    auto raw_size = req.batches_size();
     return {
       src_node,
       target_node,
       metadata,
       model::make_foreign_record_batch_reader(std::move(req).release_batches()),
+      raw_size,
       flush};
 }
 
@@ -710,7 +775,7 @@ append_entries_request_serde_wrapper::serde_async_write(iobuf& dst) {
 
 ss::future<append_entries_request_serde_wrapper>
 append_entries_request_serde_wrapper::serde_async_direct_read(
-  iobuf_parser& src, size_t bytes_left_limit) {
+  iobuf_parser& src, serde::header h) {
     using serde::read_async_nested;
     using serde::read_nested;
 
@@ -721,10 +786,11 @@ append_entries_request_serde_wrapper::serde_async_direct_read(
     auto batch_count = read_nested<uint32_t>(src, 0U);
 
     fragmented_vector<model::record_batch> batches{};
-
+    size_t batches_size{0};
     for (uint32_t i = 0; i < batch_count; ++i) {
         auto b = co_await serde::read_async_nested<model::record_batch>(
-          src, bytes_left_limit);
+          src, h._bytes_left_limit);
+        batches_size += b.size_bytes();
         batches.push_back(std::move(b));
         co_await ss::coroutine::maybe_yield();
     }
@@ -735,6 +801,7 @@ append_entries_request_serde_wrapper::serde_async_direct_read(
       meta,
       model::make_foreign_fragmented_memory_record_batch_reader(
         std::move(batches)),
+      batches_size,
       flush);
 }
 
@@ -749,38 +816,16 @@ std::ostream& operator<<(std::ostream& o, const append_entries_request& r) {
     return o;
 }
 
+std::ostream&
+operator<<(std::ostream& o, const transfer_leadership_request& r) {
+    fmt::print(
+      o, "group {} target {} timeout {}", r.group, r.target, r.timeout);
+    return o;
+}
+
 } // namespace raft
 
 namespace reflection {
-
-void adl<raft::protocol_metadata>::to(
-  iobuf& out, raft::protocol_metadata request) {
-    std::array<bytes::value_type, 6 * vint::max_length> staging{};
-    auto idx = vint::serialize(request.group(), staging.data());
-    idx += vint::serialize(request.commit_index(), staging.data() + idx);
-    idx += vint::serialize(request.term(), staging.data() + idx);
-
-    // varint the delta-encoded value
-    idx += vint::serialize(request.prev_log_index(), staging.data() + idx);
-    idx += vint::serialize(request.prev_log_term(), staging.data() + idx);
-    idx += vint::serialize(request.last_visible_index(), staging.data() + idx);
-
-    out.append(
-      // NOLINTNEXTLINE
-      reinterpret_cast<const char*>(staging.data()),
-      idx);
-}
-
-raft::protocol_metadata adl<raft::protocol_metadata>::from(iobuf_parser& in) {
-    raft::protocol_metadata ret;
-    ret.group = varlong_reader<raft::group_id>(in);
-    ret.commit_index = varlong_reader<model::offset>(in);
-    ret.term = varlong_reader<model::term_id>(in);
-    ret.prev_log_index = varlong_reader<model::offset>(in);
-    ret.prev_log_term = varlong_reader<model::term_id>(in);
-    ret.last_visible_index = varlong_reader<model::offset>(in);
-    return ret;
-}
 
 raft::snapshot_metadata adl<raft::snapshot_metadata>::from(iobuf_parser& in) {
     auto last_included_index = adl<model::offset>{}.from(in);
@@ -795,7 +840,7 @@ raft::snapshot_metadata adl<raft::snapshot_metadata>::from(iobuf_parser& in) {
         in.skip(sizeof(int8_t));
     }
 
-    auto cfg = adl<raft::group_configuration>{}.from(in);
+    auto cfg = raft::details::deserialize_nested_configuration(in);
     ss::lowres_clock::time_point cluster_time{
       adl<std::chrono::milliseconds>{}.from(in)};
 
@@ -814,11 +859,14 @@ raft::snapshot_metadata adl<raft::snapshot_metadata>::from(iobuf_parser& in) {
 void adl<raft::snapshot_metadata>::to(
   iobuf& out, raft::snapshot_metadata&& md) {
     reflection::serialize(
+      out, md.last_included_index, md.last_included_term, md.version);
+
+    auto cfg_buffer = raft::details::serialize_configuration(
+      std::move(md.latest_configuration));
+    out.append_fragments(std::move(cfg_buffer));
+
+    reflection::serialize(
       out,
-      md.last_included_index,
-      md.last_included_term,
-      md.version,
-      md.latest_configuration,
       std::chrono::duration_cast<std::chrono::milliseconds>(
         md.cluster_time.time_since_epoch()),
       md.log_start_delta);

@@ -10,11 +10,12 @@
  */
 #pragma once
 
-#include "config/configuration.h"
-#include "seastarx.h"
-#include "ssx/metrics.h"
-#include "utils/token_bucket.h"
+#include "base/seastarx.h"
+#include "config/property.h"
+#include "metrics/metrics.h"
+#include "ssx/semaphore.h"
 
+#include <seastar/core/gate.hh>
 #include <seastar/core/sharded.hh>
 
 namespace raft {
@@ -132,10 +133,8 @@ private:
     ss::gate _gate;
     ss::timer<clock_t> _coordinator;
 
-    ssx::metrics::metric_groups _internal_metrics
-      = ssx::metrics::metric_groups::make_internal();
-    ssx::metrics::metric_groups _public_metrics
-      = ssx::metrics::metric_groups::make_public();
+    metrics::internal_metric_groups _internal_metrics;
+    metrics::public_metric_groups _public_metrics;
 };
 
 } // namespace raft

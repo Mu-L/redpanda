@@ -1,4 +1,4 @@
-#include "seastarx.h"
+#include "base/seastarx.h"
 #include "ssx/semaphore.h"
 #include "utils/rwlock.h"
 
@@ -49,5 +49,17 @@ SEASTAR_THREAD_TEST_CASE(test_rwlock_unit_move) {
     some_processing(std::move(unit1.value()));
 
     auto unit2 = rwlock.attempt_write_lock();
+    BOOST_REQUIRE(unit2);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_rwlock_assign) {
+    ssx::rwlock rwlock;
+    auto unit1 = rwlock.attempt_write_lock();
+    BOOST_REQUIRE(unit1);
+    BOOST_REQUIRE(unit1.value());
+
+    ssx::rwlock_unit unit2 = std::move(unit1.value());
+
+    BOOST_REQUIRE(!unit1.value());
     BOOST_REQUIRE(unit2);
 }

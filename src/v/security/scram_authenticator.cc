@@ -10,10 +10,11 @@
  */
 #include "security/scram_authenticator.h"
 
+#include "base/vlog.h"
+#include "random/generators.h"
 #include "security/credential_store.h"
 #include "security/errc.h"
 #include "security/logger.h"
-#include "vlog.h"
 
 namespace security {
 
@@ -26,6 +27,7 @@ scram_authenticator<T>::handle_client_first(bytes_view auth_bytes) {
 
     // lookup credentials for this user
     auto authid = _client_first->username_normalized();
+    _audit_user.name = authid;
     auto credential = _credentials.get<scram_credential>(
       credential_user(authid));
     if (!credential) {
@@ -34,6 +36,8 @@ scram_authenticator<T>::handle_client_first(bytes_view auth_bytes) {
     _principal = credential->principal().value_or(
       acl_principal{principal_type::user, authid});
     _credential = std::make_unique<scram_credential>(std::move(*credential));
+    _audit_user.name = _principal.name();
+    _audit_user.type_id = audit::user::type::user;
 
     if (
       !_client_first->authzid().empty() && _client_first->authzid() != authid) {
@@ -52,7 +56,7 @@ scram_authenticator<T>::handle_client_first(bytes_view auth_bytes) {
     // build server reply
     _server_first = std::make_unique<server_first_message>(
       _client_first->nonce(),
-      random_generators::gen_alphanum_string(nonce_size),
+      random_generators::gen_alphanum_string(nonce_size, true),
       _credential->salt(),
       _credential->iterations());
 
@@ -73,7 +77,7 @@ scram_authenticator<T>::handle_client_final(bytes_view auth_bytes) {
 
     auto computed_stored_key = scram::computed_stored_key(
       client_signature,
-      bytes(client_final.proof().begin(), client_final.proof().end()));
+      bytes(client_final.proof().cbegin(), client_final.proof().cend()));
 
     if (computed_stored_key != _credential->stored_key()) {
         vlog(
@@ -132,5 +136,23 @@ scram_authenticator<T>::authenticate(bytes auth_bytes) {
 
 template class scram_authenticator<scram_sha256>;
 template class scram_authenticator<scram_sha512>;
+
+std::optional<std::string_view> validate_scram_credential(
+  const scram_credential& cred, const credential_password& password) {
+    std::optional<std::string_view> sasl_mechanism;
+    if (
+      cred.stored_key().size() == security::scram_sha256::key_size
+      && security::scram_sha256::validate_password(
+        password, cred.stored_key(), cred.salt(), cred.iterations())) {
+        sasl_mechanism = security::scram_sha256_authenticator::name;
+    } else if (
+      cred.stored_key().size() == security::scram_sha512::key_size
+      && security::scram_sha512::validate_password(
+        password, cred.stored_key(), cred.salt(), cred.iterations())) {
+        sasl_mechanism = security::scram_sha512_authenticator::name;
+    }
+
+    return sasl_mechanism;
+}
 
 } // namespace security

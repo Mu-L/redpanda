@@ -11,65 +11,77 @@
 
 #pragma once
 
-#include "archival/fwd.h"
 #include "cloud_storage/fwd.h"
-#include "cluster/archival_metadata_stm.h"
-#include "cluster/id_allocator_stm.h"
-#include "cluster/log_eviction_stm.h"
+#include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/fwd.h"
+#include "cluster/fwd.h"
 #include "cluster/partition_probe.h"
-#include "cluster/rm_stm.h"
-#include "cluster/tm_stm.h"
+#include "cluster/partition_properties_stm.h"
 #include "cluster/types.h"
-#include "config/configuration.h"
-#include "config/property.h"
-#include "features/feature_table.h"
-#include "model/fundamental.h"
-#include "model/metadata.h"
+#include "features/fwd.h"
 #include "model/record_batch_reader.h"
 #include "model/timeout_clock.h"
-#include "raft/consensus.h"
-#include "raft/consensus_utils.h"
-#include "raft/group_configuration.h"
-#include "raft/types.h"
+#include "raft/replicate.h"
+#include "storage/ntp_config.h"
 #include "storage/translating_reader.h"
 #include "storage/types.h"
-#include "utils/fragmented_vector.h"
+#include "utils/rwlock.h"
 
 #include <seastar/core/shared_ptr.hh>
+
+namespace experimental::cloud_topics {
+class dl_stm_api;
+};
 
 namespace cluster {
 class partition_manager;
 
+// A struct holding in-memory state that can make starting the partition
+// instance on the destination shard of the x-shard transfer easier. Note that
+// it is strictly an optimization, as the partition must always be able to
+// perform a "cold start" from persistent state only.
+struct xshard_transfer_state {
+    raft::xshard_transfer_state raft;
+};
+
 /// holds cluster logic that is not raft related
 /// all raft logic is proxied transparently
-class partition {
+class partition : public ss::enable_lw_shared_from_this<partition> {
 public:
     partition(
       consensus_ptr r,
-      ss::sharded<cluster::tx_gateway_frontend>&,
       ss::sharded<cloud_storage::remote>&,
       ss::sharded<cloud_storage::cache>&,
       ss::lw_shared_ptr<const archival::configuration>,
       ss::sharded<features::feature_table>&,
-      ss::sharded<cluster::tm_stm_cache_manager>&,
       ss::sharded<archival::upload_housekeeping_service>&,
-      storage::kvstore&,
-      config::binding<uint64_t>,
       std::optional<cloud_storage_clients::bucket_name> read_replica_bucket
       = std::nullopt);
 
-    ~partition();
+    ~partition() = default;
 
-    raft::group_id group() const { return _raft->group(); }
-    ss::future<> start();
+    raft::group_id group() const;
+    ss::future<>
+    start(state_machine_registry&, const std::optional<xshard_transfer_state>&);
     ss::future<> stop();
 
+    /// This method exposes reset mutex for the external subsystem
+    ///
+    /// The method is supposed to be used by the archiver_service.
+    /// Archiver service needs a mechanism to postpone partition shutdown
+    /// until the 'ntp_archiver' is stopping. Without this the 'ntp_archiver'
+    /// may access stopped/disposed partition.
+    std::optional<ssx::semaphore_units> get_archiver_reset_units() {
+        return ss::try_get_units(_archiver_reset_mutex, 1);
+    };
+
+    bool should_construct_archiver();
     /// Part of constructor that we may sometimes need to do again
     /// after a configuration change.
     void maybe_construct_archiver();
 
-    ss::future<result<kafka_result>>
-    replicate(model::record_batch_reader&&, raft::replicate_options);
+    ss::future<result<kafka_result>> replicate(
+      chunked_vector<model::record_batch> batches, raft::replicate_options);
 
     /// Truncate the beginning of the log up until a given offset
     /// Can only be performed on logs that are deletable and non internal
@@ -78,7 +90,7 @@ public:
 
     kafka_stages replicate_in_stages(
       model::batch_identity,
-      model::record_batch_reader&&,
+      model::record_batch batch,
       raft::replicate_options);
 
     /**
@@ -88,58 +100,19 @@ public:
      */
     ss::future<model::record_batch_reader> make_reader(
       storage::log_reader_config config,
-      std::optional<model::timeout_clock::time_point> deadline = std::nullopt) {
-        return _raft->make_reader(std::move(config), deadline);
-    }
-
+      std::optional<model::timeout_clock::time_point> debounce_deadline
+      = std::nullopt);
     ss::future<result<model::offset, std::error_code>>
-    sync_kafka_start_offset_override(model::timeout_clock::duration timeout) {
-        if (_log_eviction_stm && !is_read_replica_mode_enabled()) {
-            auto offset_res
-              = co_await _log_eviction_stm->sync_start_offset_override(timeout);
-            if (offset_res.has_failure()) {
-                co_return offset_res.as_failure();
-            }
-            // The eviction STM only keeps track of DeleteRecords truncations
-            // as Raft offsets. Translate if possible.
-            auto offset_translator_state = get_offset_translator_state();
-            if (
-              offset_res.value() != model::offset{}
-              && _raft->start_offset() < offset_res.value()) {
-                auto start_kafka_offset
-                  = offset_translator_state->from_log_offset(
-                    offset_res.value());
-                co_return start_kafka_offset;
-            }
-            // If a start override is no longer in the offset translator state,
-            // it may have been uploaded and persisted in the manifest.
-        }
-        if (_archival_meta_stm) {
-            auto term = _raft->term();
-            if (!co_await _archival_meta_stm->sync(timeout)) {
-                if (term != _raft->term()) {
-                    co_return errc::not_leader;
-                } else {
-                    co_return errc::timeout;
-                }
-            }
-            auto start_kafka_offset = _archival_meta_stm->manifest()
-                                        .get_start_kafka_offset_override();
-            if (start_kafka_offset != kafka::offset{}) {
-                co_return kafka::offset_cast(start_kafka_offset);
-            }
-        }
-        co_return model::offset{};
-    }
+    sync_kafka_start_offset_override(model::timeout_clock::duration timeout);
 
-    model::offset raft_start_offset() const { return _raft->start_offset(); }
+    model::offset raft_start_offset() const;
 
     /**
      * The returned value of last committed offset should not be used to
      * do things like initialize a reader (use partition::make_reader). Instead
      * it can be used to report upper offset bounds to clients.
      */
-    model::offset committed_offset() const { return _raft->committed_offset(); }
+    model::offset committed_offset() const;
 
     /**
      * <kafka>The last stable offset (LSO) is defined as the first offset such
@@ -159,153 +132,105 @@ public:
      *   2) "first offset such that all lower offsets have been decided". this
      *   is describing a strictly greater than relationship.
      */
-    model::offset last_stable_offset() const {
-        if (_rm_stm) {
-            return _rm_stm->last_stable_offset();
-        }
-
-        return high_watermark();
-    }
-
+    model::offset last_stable_offset() const;
     /**
      * All batches with offets smaller than high watermark are visible to
      * consumers. Named high_watermark to be consistent with Kafka nomenclature.
      */
-    model::offset high_watermark() const {
-        return model::next_offset(_raft->last_visible_index());
-    }
+    model::offset high_watermark() const;
 
-    model::offset leader_high_watermark() const {
-        return model::next_offset(_raft->last_leader_visible_index());
-    }
+    model::offset leader_high_watermark() const;
 
-    model::term_id term() { return _raft->term(); }
+    model::term_id term() const;
 
-    model::offset dirty_offset() const {
-        return _raft->log()->offsets().dirty_offset;
-    }
+    model::offset dirty_offset() const;
 
     /// Return the offset up to which the storage layer would like to
     /// prefix truncate the log, if any.  This may be consumed as an indicator
     /// that any truncation-delaying activitiy (like uploading to tiered
     /// storage) could be expedited to enable local disk space to be reclaimed.
-    std::optional<model::offset> eviction_requested_offset() {
-        if (_log_eviction_stm) {
-            return _log_eviction_stm->eviction_requested_offset();
-        } else {
-            return std::nullopt;
-        }
-    }
+    std::optional<model::offset> eviction_requested_offset();
 
-    const model::ntp& ntp() const { return _raft->ntp(); }
+    const model::ntp& ntp() const;
 
-    ss::shared_ptr<storage::log> log() const { return _raft->log(); }
+    ss::shared_ptr<storage::log> log() const;
 
     ss::shared_ptr<const cloud_storage::remote_partition>
-    remote_partition() const {
-        return _cloud_storage_partition;
-    }
+    remote_partition() const;
 
     ss::future<std::optional<storage::timequery_result>>
       timequery(storage::timequery_config);
 
-    bool is_elected_leader() const { return _raft->is_elected_leader(); }
-    bool is_leader() const { return _raft->is_leader(); }
-    bool has_followers() const { return _raft->has_followers(); }
+    bool is_elected_leader() const;
+    bool is_leader() const;
+    bool has_followers() const;
+    void block_new_leadership() const;
+    void unblock_new_leadership() const;
 
-    void block_new_leadership() const { _raft->block_new_leadership(); }
-    void unblock_new_leadership() const { _raft->unblock_new_leadership(); }
-
-    ss::future<result<model::offset>> linearizable_barrier() {
-        return _raft->linearizable_barrier();
-    }
+    ss::future<result<model::offset>> linearizable_barrier();
 
     ss::future<std::error_code>
-      transfer_leadership(transfer_leadership_request);
+      transfer_leadership(raft::transfer_leadership_request);
 
     ss::future<std::error_code> update_replica_set(
       std::vector<raft::broker_revision> brokers,
-      model::revision_id new_revision_id) {
-        return _raft->replace_configuration(
-          std::move(brokers), new_revision_id);
-    }
+      model::revision_id new_revision_id);
+
     ss::future<std::error_code> update_replica_set(
-      std::vector<raft::vnode> nodes, model::revision_id new_revision_id) {
-        return _raft->replace_configuration(std::move(nodes), new_revision_id);
-    }
+      std::vector<raft::vnode> nodes,
+      model::revision_id new_revision_id,
+      std::optional<model::offset> learner_start_offset);
 
     ss::future<std::error_code> force_update_replica_set(
-      std::vector<raft::vnode> nodes, model::revision_id new_revision_id) {
-        return _raft->force_replace_configuration_locally(
-          std::move(nodes), new_revision_id);
-    }
+      std::vector<raft::vnode> voters,
+      std::vector<raft::vnode> learners,
+      model::revision_id new_revision_id);
 
-    raft::group_configuration group_configuration() const {
-        return _raft->config();
-    }
-
+    raft::group_configuration group_configuration() const;
     partition_probe& probe() { return _probe; }
 
-    model::revision_id get_revision_id() const {
-        return _raft->config().revision_id();
-    }
+    model::revision_id get_revision_id() const;
+    model::revision_id get_log_revision_id() const;
+    model::revision_id get_topic_revision_id() const;
 
-    std::optional<model::node_id> get_leader_id() const {
-        return _raft->get_leader_id();
-    }
+    std::optional<model::node_id> get_leader_id() const;
 
-    std::optional<uint8_t> get_under_replicated() const {
-        return _raft->get_under_replicated();
-    }
+    std::optional<uint8_t> get_under_replicated() const;
 
-    model::offset get_latest_configuration_offset() const {
-        return _raft->get_latest_configuration_offset();
-    }
+    model::offset get_latest_configuration_offset() const;
 
-    ss::shared_ptr<cluster::id_allocator_stm> id_allocator_stm() {
-        return _id_allocator_stm;
-    }
+    ss::shared_ptr<cluster::id_allocator_stm> id_allocator_stm() const;
 
     ss::lw_shared_ptr<const storage::offset_translator_state>
-    get_offset_translator_state() const {
-        return _raft->get_offset_translator_state();
-    }
+    get_offset_translator_state() const;
 
     ss::shared_ptr<cluster::rm_stm> rm_stm();
 
-    size_t size_bytes() const { return _raft->log()->size_bytes(); }
+    ss::shared_ptr<experimental::cloud_topics::dl_stm_api> dl_stm_api();
+
+    size_t size_bytes() const;
+
+    size_t reclaimable_size_bytes() const;
 
     uint64_t non_log_disk_size_bytes() const;
 
     ss::future<> update_configuration(topic_properties);
 
-    const storage::ntp_config& get_ntp_config() const {
-        return _raft->log()->config();
-    }
+    const storage::ntp_config& get_ntp_config() const;
+    ss::shared_ptr<cluster::tm_stm> tm_stm();
 
-    ss::shared_ptr<cluster::tm_stm> tm_stm() { return _tm_stm; }
+    ss::future<fragmented_vector<model::tx_range>>
+    aborted_transactions(model::offset from, model::offset to);
 
-    ss::future<fragmented_vector<rm_stm::tx_range>>
-    aborted_transactions(model::offset from, model::offset to) {
-        if (!_rm_stm) {
-            return ss::make_ready_future<fragmented_vector<rm_stm::tx_range>>(
-              fragmented_vector<rm_stm::tx_range>());
-        }
-        return _rm_stm->aborted_transactions(from, to);
-    }
-
-    ss::future<std::vector<rm_stm::tx_range>>
+    ss::future<std::vector<model::tx_range>>
     aborted_transactions_cloud(const cloud_storage::offset_range& offsets);
 
-    const ss::shared_ptr<cluster::archival_metadata_stm>&
-    archival_meta_stm() const {
-        return _archival_meta_stm;
-    }
+    model::producer_id highest_producer_id();
 
-    bool is_read_replica_mode_enabled() const {
-        const auto& cfg = _raft->log_config();
-        return cfg.is_read_replica_mode_enabled();
-    }
+    const ss::shared_ptr<cluster::archival_metadata_stm>&
+    archival_meta_stm() const;
+
+    bool is_read_replica_mode_enabled() const;
 
     cloud_storage_clients::bucket_name get_read_replica_bucket() const {
         return _read_replica_bucket.value();
@@ -314,6 +239,8 @@ public:
     cloud_storage_mode get_cloud_storage_mode() const;
 
     partition_cloud_storage_status get_cloud_storage_status() const;
+
+    std::optional<cloud_storage::anomalies> get_cloud_storage_anomalies() const;
 
     /// Return true if shadow indexing is enabled for the partition
     bool is_remote_fetch_enabled() const;
@@ -338,51 +265,34 @@ public:
       storage::log_reader_config config,
       std::optional<model::timeout_clock::time_point> deadline = std::nullopt);
 
-    std::optional<model::offset> kafka_start_offset_override() const {
-        if (_log_eviction_stm && !is_read_replica_mode_enabled()) {
-            auto o = _log_eviction_stm->start_offset_override();
-            if (o != model::offset{} && _raft->start_offset() < o) {
-                auto offset_translator_state = get_offset_translator_state();
-                auto start_kafka_offset
-                  = offset_translator_state->from_log_offset(o);
-                return start_kafka_offset;
-            }
-            // If a start override is no longer in the offset translator state,
-            // it may have been uploaded and persisted in the manifest.
-        }
-        if (_archival_meta_stm) {
-            auto o = _archival_meta_stm->manifest()
-                       .get_start_kafka_offset_override();
-            if (o != kafka::offset{}) {
-                return kafka::offset_cast(o);
-            }
-        }
-        return std::nullopt;
-    }
+    std::optional<model::offset> kafka_start_offset_override() const;
 
     ss::future<> remove_persistent_state();
     ss::future<> finalize_remote_partition(ss::abort_source& as);
 
     std::optional<model::offset> get_term_last_offset(model::term_id) const;
 
-    model::term_id get_term(model::offset o) const {
-        return _raft->get_term(o);
-    }
-
+    model::term_id get_term(model::offset o) const;
     ss::future<std::optional<model::offset>>
     get_cloud_term_last_offset(model::term_id term) const;
 
     ss::future<std::error_code>
-    cancel_replica_set_update(model::revision_id rev) {
-        return _raft->cancel_configuration_change(rev);
-    }
+    cancel_replica_set_update(model::revision_id rev);
 
     ss::future<std::error_code>
-    force_abort_replica_set_update(model::revision_id rev) {
-        return _raft->abort_configuration_change(rev);
-    }
+    force_abort_replica_set_update(model::revision_id rev);
 
-    consensus_ptr raft() const { return _raft; }
+    /**
+     * Downloads partition manifest to query for latest offset available in
+     * object store.
+     *
+     * IMPORTANT: this may not be the last offset of last segment uploaded to
+     * the cloud as partition manifest is eventually consistent.
+     */
+    ss::future<result<model::offset>> fetch_latest_cloud_offset_from_manifest(
+      model::timeout_clock::time_point deadline);
+
+    consensus_ptr raft() const;
 
     std::optional<std::reference_wrapper<archival::ntp_archiver>> archiver() {
         if (_archiver) {
@@ -411,50 +321,84 @@ public:
     //
     // Note that the caller must keep the stream alive until the future
     // completes.
-    static constexpr std::chrono::seconds manifest_serialization_timeout{3s};
+    static constexpr std::chrono::seconds manifest_serialization_timeout
+      = std::chrono::seconds(3);
     ss::future<>
     serialize_json_manifest_to_output_stream(ss::output_stream<char>& output);
 
     std::optional<std::reference_wrapper<cluster::topic_configuration>>
-    get_topic_config() {
-        if (_topic_cfg) {
-            return std::ref(*_topic_cfg);
-        } else {
-            return std::nullopt;
-        }
-    }
+    get_topic_config();
 
-    ss::sharded<features::feature_table>& feature_table() const {
-        return _feature_table;
-    }
+    ss::sharded<features::feature_table>& feature_table() const;
 
     result<std::vector<raft::follower_metrics>> get_follower_metrics() const;
 
-    ss::future<> unsafe_reset_remote_partition_manifest(iobuf buf);
+    // Attempt to reset the partition manifest of a cloud storage partition
+    // from an iobuf containing the JSON representation of the manifest.
+    //
+    // Warning: in order to call this safely, one must stop the archiver
+    // manually whilst ensuring that the max collectible offset reported
+    // by the archival metadata STM remains stable. Prefer its sibling
+    // which resets from the cloud state.
+    //
+    // Returns a failed future if unsuccessful.
+    ss::future<>
+    unsafe_reset_remote_partition_manifest_from_json(iobuf json_buf);
+
+    // Attempt to reset the partition manifest of a cloud storage partition
+    // to the one last uploaded to cloud storage.
+    //
+    // If `force` is true, the safety checks will be disregarded, which
+    // may lead to data loss.
+    //
+    // Returns a failed future if unsuccessful.
+    ss::future<> unsafe_reset_remote_partition_manifest_from_cloud(bool force);
+
+    // Expose async_manifest_view
+    //
+    // The instance is used by the read path and also by the write path to
+    // perform housekeeping.
+    ss::shared_ptr<cloud_storage::async_manifest_view>
+    get_cloud_storage_manifest_view();
+
+    ss::future<std::error_code> set_writes_disabled(
+      partition_properties_stm::writes_disabled disable,
+      model::timeout_clock::time_point deadline);
+
+    bool started() const noexcept { return _started; }
+    void mark_started() noexcept { _started = true; }
 
 private:
+    ss::future<result<ssx::rwlock_unit>> hold_writes_enabled();
+
+    ss::future<>
+    replicate_unsafe_reset(cloud_storage::partition_manifest manifest);
+
+    ss::future<>
+    do_unsafe_reset_remote_partition_manifest_from_cloud(bool force);
+
     ss::future<std::optional<storage::timequery_result>>
       cloud_storage_timequery(storage::timequery_config);
 
     bool may_read_from_cloud() const;
 
     ss::future<std::optional<storage::timequery_result>>
-      local_timequery(storage::timequery_config);
+    local_timequery(storage::timequery_config, bool allow_cloud_fallback);
+
+    // Restarts the archiver
+    // If should_notify_topic_config is set, it marks the topic_manifest as
+    // dirty so that it gets reuploaded
+    ss::future<> restart_archiver(bool should_notify_topic_config);
 
     consensus_ptr _raft;
-    ss::shared_ptr<util::mem_tracker> _partition_mem_tracker;
     ss::shared_ptr<cluster::log_eviction_stm> _log_eviction_stm;
-    ss::shared_ptr<cluster::id_allocator_stm> _id_allocator_stm;
     ss::shared_ptr<cluster::rm_stm> _rm_stm;
-    ss::shared_ptr<cluster::tm_stm> _tm_stm;
     ss::shared_ptr<archival_metadata_stm> _archival_meta_stm;
+    ss::shared_ptr<partition_properties_stm> _partition_properties_stm;
+    ss::shared_ptr<experimental::cloud_topics::dl_stm_api> _dl_stm_api;
     ss::abort_source _as;
     partition_probe _probe;
-    ss::sharded<cluster::tx_gateway_frontend>& _tx_gateway_frontend;
     ss::sharded<features::feature_table>& _feature_table;
-    ss::sharded<cluster::tm_stm_cache_manager>& _tm_stm_cache_manager;
-    bool _is_tx_enabled{false};
-    bool _is_idempotence_enabled{false};
     ss::lw_shared_ptr<const archival::configuration> _archival_conf;
     ss::sharded<cloud_storage::remote>& _cloud_storage_api;
     ss::sharded<cloud_storage::cache>& _cloud_storage_cache;
@@ -462,7 +406,12 @@ private:
     ss::shared_ptr<cloud_storage::async_manifest_view>
       _cloud_storage_manifest_view;
     ss::shared_ptr<cloud_storage::remote_partition> _cloud_storage_partition;
+
+    static constexpr auto archiver_reset_mutex_timeout = std::chrono::seconds(
+      10);
+    ssx::semaphore _archiver_reset_mutex{1, "archiver_reset"};
     std::unique_ptr<archival::ntp_archiver> _archiver;
+
     std::optional<cloud_storage_clients::bucket_name> _read_replica_bucket{
       std::nullopt};
     bool _remote_delete_enabled{storage::ntp_config::default_remote_delete};
@@ -472,8 +421,17 @@ private:
     std::unique_ptr<cluster::topic_configuration> _topic_cfg;
 
     ss::sharded<archival::upload_housekeeping_service>& _upload_housekeeping;
+    config::binding<model::cleanup_policy_bitflags> _log_cleanup_policy;
 
-    storage::kvstore& _kvstore;
+    // Used in `sync_kafka_start_offset_override` to avoid having to re-sync the
+    // `archival_meta_stm`.
+    bool _has_synced_archival_for_start_override{false};
+
+    // acquire shared ("read") for produce,
+    // exclusive ("write") for enabling/disabling writes
+    ssx::rwlock _produce_lock;
+
+    bool _started{false};
 
     friend std::ostream& operator<<(std::ostream& o, const partition& x);
 };

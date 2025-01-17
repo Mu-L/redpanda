@@ -7,9 +7,11 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+import re
 import time
 import random
 import operator
+from rptest.services.redpanda import MetricsEndpoint, RedpandaService
 from rptest.clients.rpk import RpkTool
 from requests.exceptions import HTTPError
 from rptest.services.cluster import cluster
@@ -26,7 +28,7 @@ from functools import reduce
 from rptest.services.admin import Admin
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.clients.types import TopicSpec
-from rptest.utils.functional import flat_map
+from rptest.utils.functional import flat_map, flatten
 
 
 class UsageWindow:
@@ -84,9 +86,8 @@ def assert_usage_consistency(node, a, b):
         return {(x.begin, x.end): x for x in ws}
 
     def compare(x, y, fn):
-        return fn(x.bytes_sent, y.bytes_sent) and fn(
-            x.bytes_received, y.bytes_received) and fn(
-                x.bytes_in_cloud_storage, y.bytes_in_cloud_storage)
+        return fn(x.bytes_sent, y.bytes_sent) and fn(x.bytes_received,
+                                                     y.bytes_received)
 
     # Windows from group 'a' are expected to be from a previous request
     grp_a = group_windows(a)
@@ -95,8 +96,15 @@ def assert_usage_consistency(node, a, b):
         a_value = grp_a.get(key, None)
         if a_value is not None:
             fn = operator.le if a_value.is_open else operator.eq
-            assert compare(a_value, x,
-                           fn), f"node: {node} a: {str(a_value)} b:{str(x)}"
+            assert compare(
+                a_value, x, fn
+            ), f"Failed to compare historical values, node: {node} a: {str(a_value)} b:{str(x)}"
+
+            # Can only assert on value of cloud storage if the windows are closed, since across
+            # the time of an open window, leadership may change and the value of the cs_bytes field
+            # depends on if the broker is the controller leader or not
+            if a_value.is_closed and x.is_closed:
+                assert a_value.bytes_in_cloud_storage == x.bytes_in_cloud_storage, f"Failed bytes_in_cs compare node: {node} a: {str(a_value)} b:{str(x)}"
 
 
 class UsageTest(RedpandaTest):
@@ -111,6 +119,7 @@ class UsageTest(RedpandaTest):
                                           window_interval=3,
                                           disk_write_interval=5)
         super(UsageTest, self).__init__(test_context=test_context,
+                                        log_level='debug',
                                         extra_rp_conf=self._settings)
         self._ctx = test_context
         self._admin = Admin(self.redpanda)
@@ -282,6 +291,43 @@ class UsageTest(RedpandaTest):
         consumer.stop()
         return total_produced
 
+    def _grab_log_lines(self, pattern):
+        def search_log_lines(node):
+            lines = []
+            for line in node.account.ssh_capture(
+                    f"grep \"{pattern}\" {RedpandaService.STDOUT_STDERR_CAPTURE} || true",
+                    timeout_sec=60):
+                lines.append(line.strip())
+            return lines
+
+        return [search_log_lines(node) for node in self.redpanda.nodes]
+
+    def _validate_timer_interval(self):
+        log_lines = self._grab_log_lines("Usage based billing window_close*")
+
+        assert len(log_lines) > 0, "Debug logging not enabled"
+        self.redpanda.logger.debug(f"Log lines: {log_lines}")
+
+        # Remove the first element as it is expected to not be aligned
+        log_lines = flatten([xs[1:] for xs in log_lines])
+
+        regex = re.compile(r".*delta: (?P<delta>\d*)")
+
+        # Parse the value from the log line for lines across all nodes
+        def delta_parse(x):
+            v = regex.match(x)
+            if v is None:
+                raise RuntimeError(f"Unexpected log line: {x}")
+            return int(v[1])
+
+        # Parse the contents to just grab the value of `delta` within the log
+        fire_times = [delta_parse(x) for x in log_lines]
+
+        # Ensure all deltas are 0 meaning there is no skew
+        # Make an exception for 1 second delta to account for late timers
+        # in debug builds
+        return all([x == 0 or x == 1 for x in fire_times])
+
     @cluster(num_nodes=3)
     def test_usage_metrics_collection(self):
         # Assert windows are closing
@@ -317,6 +363,10 @@ class UsageTest(RedpandaTest):
 
             prev_usage = usage
             iterations += 1
+
+        # Additional validation to ensure there were no gaps and the timer fired exactly on time
+        assert self._validate_timer_interval(
+        ), "A timer skew of greater then 1s has been detected within a usage fiber"
 
     @cluster(num_nodes=4)
     def test_usage_collection_restart(self):
@@ -388,12 +438,6 @@ class UsageTestCloudStorageMetrics(RedpandaTest):
     ]
 
     def __init__(self, test_context):
-        self.si_settings = SISettings(
-            test_context,
-            log_segment_size=self.log_segment_size,
-            cloud_storage_housekeeping_interval_ms=2000,
-            fast_uploads=True)
-
         # Parameters to ensure timely reporting of cloud usage stats via
         # the kafka::usage_manager
         extra_rp_conf = dict(health_monitor_max_metadata_age=2000,
@@ -403,10 +447,13 @@ class UsageTestCloudStorageMetrics(RedpandaTest):
                              log_compaction_interval_ms=2000,
                              compacted_log_segment_size=self.log_segment_size)
 
-        super(UsageTestCloudStorageMetrics,
-              self).__init__(test_context=test_context,
-                             extra_rp_conf=extra_rp_conf,
-                             si_settings=self.si_settings)
+        super(UsageTestCloudStorageMetrics, self).__init__(
+            test_context=test_context,
+            extra_rp_conf=extra_rp_conf,
+            si_settings=SISettings(test_context,
+                                   log_segment_size=self.log_segment_size,
+                                   cloud_storage_housekeeping_interval_ms=2000,
+                                   fast_uploads=True))
 
         self.rpk = RpkTool(self.redpanda)
         self.admin = Admin(self.redpanda)
@@ -451,6 +498,19 @@ class UsageTestCloudStorageMetrics(RedpandaTest):
 
         bucket_view = BucketView(self.redpanda)
 
+        def fetch_metric_usage():
+            total_usage = 0
+            for topic in self.topics:
+                usage = self.redpanda.metric_sum(
+                    "redpanda_cloud_storage_cloud_log_size",
+                    metrics_endpoint=MetricsEndpoint.PUBLIC_METRICS,
+                    topic=topic.name) / topic.replication_factor
+                self.logger.info(
+                    f"Metric reported cloud storage usage for topic {topic.name}: {usage}"
+                )
+                total_usage += usage
+            return int(total_usage)
+
         def check_usage():
             # Check that the usage reporting system has reported correct values
             manifest_usage = bucket_view.cloud_log_sizes_sum().total(
@@ -467,12 +527,19 @@ class UsageTestCloudStorageMetrics(RedpandaTest):
             self.logger.info(
                 f"Max reported usages via kafka/usage_manager: {max(reported_usages)}"
             )
-            return manifest_usage in reported_usages
+            if manifest_usage not in reported_usages:
+                self.logger.info(
+                    f"Reported usages: {reported_usages} does not contain {manifest_usage}"
+                )
+                return False
 
-        wait_until(
-            check_usage,
-            timeout_sec=30,
-            backoff_sec=1,
-            err_msg=
-            "Reported cloud storage usage (via usage endpoint) did not match the manifest inferred usage"
-        )
+            metric_usage = fetch_metric_usage()
+            self.logger.info(
+                f"Metric reported cloud storage usage: {metric_usage}")
+
+            return manifest_usage == metric_usage
+
+        wait_until(check_usage,
+                   timeout_sec=30,
+                   backoff_sec=1,
+                   err_msg="Inconsistent cloud storage usage reported")

@@ -38,7 +38,7 @@ class ReplicationFactorChangeTest(RedpandaTest):
 
     @cluster(num_nodes=4)
     def simple_test(self):
-        self.replication_factor = 4
+        self.replication_factor = 3
         self._rpk.alter_topic_config(self.topic_name, self.rf_property,
                                      self.replication_factor)
         self.check_rf(self.replication_factor)
@@ -51,7 +51,7 @@ class ReplicationFactorChangeTest(RedpandaTest):
                    backoff_sec=2,
                    err_msg="Can not wait end of reconfiguration")
 
-        self.replication_factor = 2
+        self.replication_factor = 1
         self._rpk.alter_topic_config(self.topic_name, self.rf_property,
                                      self.replication_factor)
         self.check_rf(self.replication_factor)
@@ -76,6 +76,7 @@ class ReplicationFactorChangeTest(RedpandaTest):
                 or "INVALID_CONFIG" in e.msg):
             self._rpk.alter_topic_config(self.topic_name, self.rf_property,
                                          new_rf)
+
         assert len(self.admin.list_reconfigurations()) == 0
         self.check_rf(self.replication_factor)
 
@@ -85,5 +86,28 @@ class ReplicationFactorChangeTest(RedpandaTest):
                 or "INVALID_CONFIG" in e.msg):
             self._rpk.alter_topic_config(self.topic_name, self.rf_property,
                                          new_rf)
+        assert len(self.admin.list_reconfigurations()) == 0
+        self.check_rf(self.replication_factor)
+
+        new_rf = 4
+        with expect_exception(
+                RpkException, lambda e: "INVALID_REPLICATION_FACTOR" in e.msg
+                or "INVALID_CONFIG" in e.msg):
+            self._rpk.alter_topic_config(self.topic_name, self.rf_property,
+                                         new_rf)
+        assert len(self.admin.list_reconfigurations()) == 0
+        self.check_rf(self.replication_factor)
+
+        self.redpanda.set_cluster_config(
+            {'default_topic_replications': str(3)})
+        self.redpanda.set_cluster_config(
+            {'minimum_topic_replications': str(3)})
+        new_rf = 1
+        with expect_exception(
+                RpkException, lambda e: "INVALID_REPLICATION_FACTOR" in e.msg
+                or "INVALID_CONFIG" in e.msg):
+            self._rpk.alter_topic_config(self.topic_name, self.rf_property,
+                                         new_rf)
+
         assert len(self.admin.list_reconfigurations()) == 0
         self.check_rf(self.replication_factor)

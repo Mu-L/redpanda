@@ -11,15 +11,15 @@
 
 #pragma once
 
+#include "base/likely.h"
+#include "base/outcome.h"
+#include "base/seastarx.h"
+#include "base/vassert.h"
 #include "bytes/iobuf.h"
-#include "likely.h"
 #include "net/types.h"
-#include "net/unresolved_address.h"
-#include "outcome.h"
-#include "seastarx.h"
 #include "ssx/semaphore.h"
 #include "utils/log_hist.h"
-#include "vassert.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/iostream.hh>
@@ -68,7 +68,7 @@ struct timeout_spec {
      * timeout_at() will return time_point::max(), i.e., the furthest possible
      * point in the future.
      */
-    const static timeout_spec none;
+    static const timeout_spec none;
 
     constexpr timeout_spec(
       clock_type::time_point timeout_point, clock_type::duration timeout_period)
@@ -113,7 +113,7 @@ struct timeout_spec {
         return timeout_period == max_duration
                  ? none
                  : timeout_spec{
-                   clock_type::now() + timeout_period, timeout_period};
+                     clock_type::now() + timeout_period, timeout_period};
     }
 
     /**

@@ -31,8 +31,29 @@ std::ostream& operator<<(std::ostream& s, manifest_type t) {
     case manifest_type::spillover:
         s << "spillover";
         break;
+    case manifest_type::topic_mount:
+        s << "topic_mount";
+        break;
     }
     return s;
+}
+
+std::ostream& operator<<(std::ostream& os, manifest_format f) {
+    switch (f) {
+    case manifest_format::json:
+        return os << "json";
+    case manifest_format::serde:
+        return os << "serde";
+    }
+}
+
+ss::future<serialized_data_stream> base_manifest::serialize() const {
+    auto buf = co_await serialize_buf();
+    auto size = buf.size_bytes();
+    co_return serialized_data_stream{
+      .stream = make_iobuf_input_stream(std::move(buf)),
+      .size_bytes = size,
+    };
 }
 
 } // namespace cloud_storage

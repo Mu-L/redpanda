@@ -12,7 +12,11 @@
 // fixture
 #include "test_utils/fixture.h"
 
+#include <seastar/util/defer.hh>
+
 #include <optional>
+
+using namespace std::literals;
 
 struct gc_fixture {
     storage::disk_log_builder builder;
@@ -26,31 +30,38 @@ FIXTURE_TEST(empty_log_garbage_collect, gc_fixture) {
 }
 
 FIXTURE_TEST(retention_test_time, gc_fixture) {
-    auto base_ts = model::timestamp{123000};
+    auto base_ts = model::timestamp::now();
+    ss::sleep(5s).get();
     builder.set_time(base_ts);
     builder | storage::start() | storage::add_segment(0)
       | storage::add_random_batch(0, 100, storage::maybe_compress_batches::yes)
-      | storage::add_random_batch(100, 2, storage::maybe_compress_batches::yes)
-      | storage::add_segment(102)
-      | storage::add_random_batch(102, 2, storage::maybe_compress_batches::yes)
-      | storage::add_segment(104) | storage::add_random_batches(104, 3);
+      | storage::add_random_batch(100, 2, storage::maybe_compress_batches::yes);
+
+    ss::sleep(5s).get();
+
+    builder | storage::add_segment(102)
+      | storage::add_random_batch(102, 2, storage::maybe_compress_batches::yes);
+
+    ss::sleep(5s).get();
+    builder | storage::add_segment(104) | storage::add_random_batches(104, 3);
     BOOST_TEST_MESSAGE(
       "Should not collect segments with timestamp older than 1");
     BOOST_CHECK_EQUAL(builder.get_log()->segment_count(), 3);
-    builder | storage::garbage_collect(model::timestamp(1), std::nullopt);
+
+    builder | storage::garbage_collect(base_ts, std::nullopt);
     BOOST_CHECK_EQUAL(builder.get_log()->segment_count(), 3);
 
     BOOST_TEST_MESSAGE("Should not collect segments because size is infinity");
     builder
       | storage::garbage_collect(
-        model::timestamp(1),
+        base_ts,
         std::make_optional<size_t>(std::numeric_limits<size_t>::max()));
     BOOST_CHECK_EQUAL(builder.get_log()->segment_count(), 3);
 
     BOOST_TEST_MESSAGE("Should leave one active segment");
     builder
       | storage::garbage_collect(
-        model::timestamp{base_ts() + 1000}, std::nullopt)
+        model::timestamp{base_ts() + 15'000}, std::nullopt)
       | storage::stop();
 
     BOOST_CHECK_EQUAL(builder.get_log()->segment_count(), 1);
@@ -80,6 +91,27 @@ FIXTURE_TEST(retention_test_size, gc_fixture) {
     BOOST_CHECK_EQUAL(builder.get_log()->segment_count(), 0);
 }
 
+FIXTURE_TEST(retention_test_size_with_one_segment, gc_fixture) {
+    builder | storage::start() | storage::add_segment(0)
+      | storage::add_random_batch(0, 100, storage::maybe_compress_batches::yes)
+      | storage::add_random_batch(100, 2, storage::maybe_compress_batches::yes);
+    BOOST_TEST_MESSAGE("Should not collect the segment because size equal to "
+                       "current partition size");
+    builder
+      | storage::garbage_collect(
+        model::timestamp(1),
+        std::make_optional(
+          builder.get_disk_log_impl().get_probe().partition_size()));
+    BOOST_CHECK_EQUAL(builder.get_log()->segment_count(), 1);
+
+    BOOST_TEST_MESSAGE("Should not collect the segment");
+    builder
+      | storage::garbage_collect(model::timestamp(1), std::optional<size_t>(0))
+      | storage::stop();
+
+    BOOST_CHECK_EQUAL(builder.get_log()->segment_count(), 1);
+}
+
 /*
  * test that both time and size are applied. the test works like this:
  *
@@ -99,9 +131,6 @@ FIXTURE_TEST(retention_test_size, gc_fixture) {
 FIXTURE_TEST(retention_test_size_time, gc_fixture) {
     const auto last_week = model::to_timestamp(
       model::timestamp_clock::now() - std::chrono::days(7));
-
-    const auto yesterday = model::to_timestamp(
-      model::timestamp_clock::now() - std::chrono::days(1));
 
     const size_t num_records = 10;
     const auto part_size = [this] {
@@ -125,14 +154,16 @@ FIXTURE_TEST(retention_test_size_time, gc_fixture) {
         offset += model::offset(num_records);
     }
 
-    BOOST_CHECK_LT(
+    BOOST_CHECK_LE(
       (builder.disk_usage(model::timestamp::now(), 0).get().reclaim.retention
        - 2_MiB),
-      20_KiB);
-    BOOST_CHECK_LT(
+      builder.storage().resources().get_falloc_step({})
+        * builder.get_disk_log_impl().segments().size());
+    BOOST_CHECK_LE(
       (builder.disk_usage(model::timestamp::now(), 0).get().usage.total()
        - 2_MiB),
-      20_KiB);
+      builder.storage().resources().get_falloc_step({})
+        * builder.get_disk_log_impl().segments().size());
 
     // second segment
     builder | storage::add_segment(offset);
@@ -151,14 +182,16 @@ FIXTURE_TEST(retention_test_size_time, gc_fixture) {
     }
 
     // the first segment is now eligible for reclaim
-    BOOST_CHECK_LT(
+    BOOST_CHECK_LE(
       (builder.disk_usage(model::timestamp::now(), 0).get().reclaim.retention
        - 3_MiB),
-      20_KiB);
-    BOOST_CHECK_LT(
+      builder.storage().resources().get_falloc_step({})
+        * builder.get_disk_log_impl().segments().size());
+    BOOST_CHECK_LE(
       (builder.disk_usage(model::timestamp::now(), 0).get().usage.total()
        - 3_MiB),
-      20_KiB);
+      builder.storage().resources().get_falloc_step({})
+        * builder.get_disk_log_impl().segments().size());
 
     // third segment
     builder | storage::add_segment(offset);
@@ -177,14 +210,16 @@ FIXTURE_TEST(retention_test_size_time, gc_fixture) {
     }
 
     // the first,second segment is now eligible for reclaim
-    BOOST_CHECK_LT(
+    BOOST_CHECK_LE(
       (builder.disk_usage(model::timestamp::now(), 0).get().reclaim.retention
        - 4_MiB),
-      20_KiB);
-    BOOST_CHECK_LT(
+      builder.storage().resources().get_falloc_step({})
+        * builder.get_disk_log_impl().segments().size());
+    BOOST_CHECK_LE(
       (builder.disk_usage(model::timestamp::now(), 0).get().usage.total()
        - 4_MiB),
-      20_KiB);
+      builder.storage().resources().get_falloc_step({})
+        * builder.get_disk_log_impl().segments().size());
 
     // active segment
     builder | storage::add_segment(offset);
@@ -203,16 +238,18 @@ FIXTURE_TEST(retention_test_size_time, gc_fixture) {
     }
 
     // the first,second segment is now eligible for reclaim
-    BOOST_CHECK_LT(
+    BOOST_CHECK_LE(
       (builder.disk_usage(model::timestamp::now(), 0).get().reclaim.retention
        - 5_MiB),
-      20_KiB);
-    BOOST_CHECK_LT(
+      builder.storage().resources().get_falloc_step({})
+        * builder.get_disk_log_impl().segments().size());
+    BOOST_CHECK_LE(
       (builder.disk_usage(model::timestamp::now(), 0).get().usage.total()
        - 5_MiB),
-      20_KiB);
+      builder.storage().resources().get_falloc_step({})
+        * builder.get_disk_log_impl().segments().size());
 
-    builder | storage::garbage_collect(yesterday, 4_MiB);
+    builder | storage::garbage_collect(model::timestamp::now(), 4_MiB);
 
     // right after gc runs there shouldn't be anything reclaimable
     BOOST_CHECK_EQUAL(
@@ -248,6 +285,8 @@ FIXTURE_TEST(retention_by_size_with_remote_write, gc_fixture) {
      */
 
     config::shard_local_cfg().get("cloud_storage_enabled").set_value(true);
+    auto reset_cfg = ss::defer(
+      [] { config::shard_local_cfg().get("cloud_storage_enabled").reset(); });
 
     size_t size_limit = 1000;
 
@@ -259,21 +298,21 @@ FIXTURE_TEST(retention_by_size_with_remote_write, gc_fixture) {
     overrides.retention_local_target_bytes = tristate<size_t>{size_limit};
     config.set_overrides(overrides);
 
-    auto batch_builder = [](size_t offset, size_t size) {
+    auto batch_builder = [](model::offset offset, size_t size) {
         return model::test::make_random_batch(
-          model::offset{offset},
+          offset,
           1,
           true,
           model::record_batch_type::raft_data,
           std::vector<size_t>{size});
     };
 
-    auto partition_size = 0;
-    size_t dirty_offset = 0;
+    size_t partition_size = 0;
+    model::offset dirty_offset{0};
 
     builder.start(std::move(config)).get();
     while (partition_size <= size_limit) {
-        builder.add_segment(model::offset{dirty_offset}).get();
+        builder.add_segment(dirty_offset).get();
         builder.add_batch(batch_builder(dirty_offset, 100)).get();
 
         ++dirty_offset;
@@ -316,6 +355,11 @@ FIXTURE_TEST(retention_by_time_with_remote_write, gc_fixture) {
     // this test assumes that retention overrides are applied, which they are
     // not, if operating in nonstrict mode.
     config::shard_local_cfg().get("retention_local_strict").set_value(true);
+
+    auto reset_cfg = ss::defer([] {
+        config::shard_local_cfg().get("cloud_storage_enabled").reset();
+        config::shard_local_cfg().get("retention_local_strict").reset();
+    });
 
     storage::ntp_config config{
       storage::log_builder_ntp(), builder.get_log_config().base_dir};
@@ -421,10 +465,11 @@ FIXTURE_TEST(non_collectible_disk_usage_test, gc_fixture) {
     BOOST_CHECK_EQUAL(
       builder.disk_usage(model::timestamp::now(), 0).get().reclaim.retention,
       0);
-    BOOST_CHECK_LT(
+    BOOST_CHECK_LE(
       (builder.disk_usage(model::timestamp::now(), 0).get().usage.total()
        - 3_MiB),
-      20_KiB);
+      builder.storage().resources().get_falloc_step({})
+        * builder.get_disk_log_impl().segments().size());
 
     builder | storage::stop();
 }

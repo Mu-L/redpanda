@@ -11,6 +11,9 @@
 
 #include "cluster/node/local_monitor.h"
 
+#include "base/seastarx.h"
+#include "base/vassert.h"
+#include "base/vlog.h"
 #include "cluster/logger.h"
 #include "cluster/node/types.h"
 #include "config/configuration.h"
@@ -19,9 +22,7 @@
 #include "storage/node.h"
 #include "storage/types.h"
 #include "utils/human.h"
-#include "vassert.h"
-#include "version.h"
-#include "vlog.h"
+#include "version/version.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
@@ -34,7 +35,6 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
-#include <seastarx.h>
 
 using namespace std::chrono_literals;
 
@@ -46,11 +46,9 @@ constexpr ss::lowres_clock::duration tick_period = 1s;
 local_monitor::local_monitor(
   config::binding<size_t> alert_bytes,
   config::binding<unsigned> alert_percent,
-  config::binding<size_t> min_bytes,
   ss::sharded<storage::node>& node_api)
   : _free_bytes_alert_threshold(std::move(alert_bytes))
   , _free_percent_alert_threshold(std::move(alert_percent))
-  , _min_free_bytes(std::move(min_bytes))
   , _storage_node_api(node_api) {}
 
 ss::future<> local_monitor::_update_loop() {
@@ -82,6 +80,7 @@ ss::future<> local_monitor::update_state() {
       .redpanda_version = application_version(ss::sstring(redpanda_version())),
       .uptime = std::chrono::duration_cast<std::chrono::milliseconds>(
         ss::engine().uptime()),
+      .recovery_mode_enabled = config::node().recovery_mode_enabled(),
     };
     co_await update_disks(new_state);
     update_alert_state(new_state);
@@ -160,25 +159,29 @@ void local_monitor::maybe_log_space_error(const storage::disk& disk) {
     if (disk.alert == storage::disk_space_alert::ok) {
         return;
     }
-    size_t min_by_bytes = _free_bytes_alert_threshold();
-    size_t min_by_percent = alert_percent_in_bytes(
+    size_t alert_min_by_bytes = _free_bytes_alert_threshold();
+    size_t alert_min_by_percent = alert_percent_in_bytes(
       _free_percent_alert_threshold(), disk.total);
+    size_t degraded_min_bytes
+      = config::shard_local_cfg().storage_min_free_bytes();
 
-    auto min_space = std::min(min_by_percent, min_by_bytes);
+    auto min_space = std::min(alert_min_by_percent, alert_min_by_bytes);
     constexpr auto alert_text = "avoid running out of space";
     constexpr auto degraded_text = "allow writing again";
     clusterlog.log(
       ss::log_level::error,
       _despam_interval,
-      "{}: free space at {:.3f}\% on {}: {} total, {} free, min. free {}. "
-      "Please adjust retention policies as needed to {}",
+      "{}: free space at {:.3f}\% on {}: {} total, {} free, min. free for "
+      "alert {}, min. free for degraded {}. Please adjust retention policies "
+      "as needed to {}",
       stable_alert_string,
       percent_free(disk),
       disk.path,
       // TODO: generalize human::bytes for unsigned long
-      human::bytes(disk.total), // NOLINT narrowing conv.
-      human::bytes(disk.free),  // NOLINT  "  "
-      human::bytes(min_space),  // NOLINT  "  "
+      human::bytes(disk.total),         // NOLINT narrowing conv.
+      human::bytes(disk.free),          // NOLINT  "  "
+      human::bytes(min_space),          // NOLINT  "  "
+      human::bytes(degraded_min_bytes), // NOLINT  "  "
       disk.alert == storage::disk_space_alert::degraded ? degraded_text
                                                         : alert_text);
 }

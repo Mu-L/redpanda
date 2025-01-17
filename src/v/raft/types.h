@@ -11,18 +11,15 @@
 
 #pragma once
 
-#include "model/adl_serde.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
-#include "model/record.h"
 #include "model/record_batch_reader.h"
-#include "model/timeout_clock.h"
-#include "outcome.h"
-#include "raft/errc.h"
-#include "raft/fwd.h"
+#include "raft/fundamental.h"
 #include "raft/group_configuration.h"
-#include "reflection/async_adl.h"
-#include "serde/envelope.h"
+#include "raft/replicate.h"
+#include "reflection/adl.h"
+#include "serde/rw/bool_class.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/scalar.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/condition-variable.hh>
@@ -35,26 +32,23 @@
 #include <boost/range/join.hpp>
 
 #include <cstdint>
-#include <exception>
 
 namespace raft {
-using clock_type = ss::lowres_clock;
-using duration_type = typename clock_type::duration;
-using timer_type = ss::timer<clock_type>;
-static constexpr clock_type::time_point no_timeout
-  = clock_type::time_point::max();
 
-using group_id = named_type<int64_t, struct raft_group_id_type>;
+using election_success = ss::bool_class<struct election_success_tag>;
 
 struct protocol_metadata
   : serde::
-      envelope<protocol_metadata, serde::version<0>, serde::compat_version<0>> {
+      envelope<protocol_metadata, serde::version<2>, serde::compat_version<0>> {
     group_id group;
     model::offset commit_index;
     model::term_id term;
     model::offset prev_log_index;
     model::term_id prev_log_term;
     model::offset last_visible_index;
+    model::offset dirty_offset;
+    // offset delta corresponding to the prev_log_index
+    model::offset_delta prev_log_delta{};
 
     friend std::ostream&
     operator<<(std::ostream& o, const protocol_metadata& m);
@@ -69,13 +63,14 @@ struct protocol_metadata
           term,
           prev_log_index,
           prev_log_term,
-          last_visible_index);
+          last_visible_index,
+          dirty_offset,
+          prev_log_delta);
     }
 };
 
 // The sequence used to track the order of follower append entries request
 using follower_req_seq = named_type<uint64_t, struct follower_req_seq_tag>;
-using heartbeats_suppressed = ss::bool_class<struct enable_suppression_tag>;
 struct follower_index_metadata {
     explicit follower_index_metadata(vnode node)
       : node_id(node) {}
@@ -86,6 +81,14 @@ struct follower_index_metadata {
     follower_index_metadata& operator=(follower_index_metadata&&) = delete;
     // resets the follower state i.e. all indicies and sequence numbers
     void reset();
+
+    bool has_inflight_appends() const {
+        return inflight_append_request_count > 0;
+    }
+
+    follower_req_seq next_follower_sequence() { return ++last_sent_seq; }
+
+    static bool is_first_request(follower_req_seq seq) { return seq() == 1; }
 
     vnode node_id;
     // index of last known log for this follower
@@ -100,7 +103,10 @@ struct follower_index_metadata {
     }
     // next index to send to this follower
     model::offset next_index;
-    model::offset last_sent_offset;
+    // field indicating end offset of follower log after current pending
+    // append_entries_requests are successfully delivered and processed by the
+    // follower.
+    model::offset expected_log_end_offset;
     // timestamp of last append_entries_rpc call
     clock_type::time_point last_sent_append_entries_req_timestamp;
     clock_type::time_point last_received_reply_timestamp;
@@ -171,16 +177,19 @@ struct follower_index_metadata {
      * checking if recovery may be finished
      */
     ss::condition_variable follower_state_change;
+
     /**
-     * We prevent race conditions accessing suppress_heartbeats with MVCC based
-     * on last_suppress_heartbeats_seq field.
+     * We prevent race conditions by counting the number of suppressing requests
+     * in flight.
      */
-    heartbeats_suppressed suppress_heartbeats = heartbeats_suppressed::no;
-    follower_req_seq last_suppress_heartbeats_seq{0};
+    size_t inflight_append_request_count = 0;
+
+    std::optional<protocol_metadata> last_sent_protocol_meta;
 
     friend std::ostream&
     operator<<(std::ostream& o, const follower_index_metadata& i);
 };
+
 /**
  * class containing follower statistics, this may be helpful for debugging,
  * metrics and querying for follower status
@@ -212,23 +221,16 @@ struct append_entries_request
       vnode src,
       protocol_metadata m,
       model::record_batch_reader r,
-      flush_after_append f = flush_after_append::yes) noexcept
-      : _source_node(src)
-      , _meta(m)
-      , _flush(f)
-      , _batches(std::move(r)) {}
+      size_t batches_size,
+      flush_after_append f = flush_after_append::yes) noexcept;
 
     append_entries_request(
       vnode src,
       vnode target,
       protocol_metadata m,
       model::record_batch_reader r,
-      flush_after_append f = flush_after_append::yes) noexcept
-      : _source_node(src)
-      , _target_node_id(target)
-      , _meta(m)
-      , _flush(f)
-      , _batches(std::move(r)) {}
+      size_t batches_size,
+      flush_after_append f = flush_after_append::yes) noexcept;
 
     ~append_entries_request() noexcept = default;
     append_entries_request(const append_entries_request&) = delete;
@@ -249,6 +251,7 @@ struct append_entries_request
         return std::move(_batches);
     }
 
+    model::record_batch_reader& batches() { return _batches; }
     const model::record_batch_reader& batches() const { return _batches; }
 
     static append_entries_request make_foreign(append_entries_request&& req);
@@ -259,7 +262,12 @@ struct append_entries_request
     ss::future<> serde_async_write(iobuf& out);
 
     static ss::future<append_entries_request>
-    serde_async_direct_read(iobuf_parser&, size_t bytes_left_limit);
+    serde_async_direct_read(iobuf_parser&, serde::header);
+    /// Returns a size of batches and append entries request metadata
+    size_t total_size() const { return _total_size; }
+    /// Returns a size of batches only. This does not include the size of append
+    /// entries metadata
+    size_t batches_size() const;
 
 private:
     vnode _source_node;
@@ -267,6 +275,9 @@ private:
     protocol_metadata _meta;
     flush_after_append _flush;
     model::record_batch_reader _batches;
+
+    // not serialized field used for accounting in raft internals
+    size_t _total_size;
 };
 
 class append_entries_request_serde_wrapper
@@ -284,7 +295,7 @@ public:
     ss::future<> serde_async_write(iobuf& out);
 
     static ss::future<append_entries_request_serde_wrapper>
-    serde_async_direct_read(iobuf_parser&, size_t bytes_left_limit);
+    serde_async_direct_read(iobuf_parser&, serde::header);
 
 private:
     append_entries_request _request;
@@ -299,15 +310,10 @@ private:
 struct append_entries_reply
   : serde::envelope<
       append_entries_reply,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
-    enum class status : uint8_t {
-        success,
-        failure,
-        group_unavailable,
-        timeout
-    };
+
     // node id to validate on receiver
     vnode target_node_id;
     /// \brief callee's node_id; work-around for batched heartbeats
@@ -324,7 +330,14 @@ struct append_entries_reply
     // only valid for not successfull append_entries reply
     model::offset last_term_base_offset;
     /// \brief did the rpc succeed or not
-    status result = status::failure;
+    reply_result result = reply_result::failure;
+
+    // Hint from follower to leader, indicating they are ready for
+    // recovery traffic (false if they may not have enough resources to
+    // handle recovery).
+    // This is true by default to reflect the legacy case, where
+    // older nodes are always ready for recovery.
+    bool may_recover = true;
 
     friend std::ostream&
     operator<<(std::ostream& o, const append_entries_reply& r);
@@ -342,7 +355,8 @@ struct append_entries_reply
           last_flushed_log_index,
           last_dirty_log_index,
           last_term_base_offset,
-          result);
+          result,
+          may_recover);
     }
 };
 
@@ -353,6 +367,8 @@ struct heartbeat_metadata {
 
     friend bool operator==(const heartbeat_metadata&, const heartbeat_metadata&)
       = default;
+    friend std::ostream&
+    operator<<(std::ostream& o, const heartbeat_metadata& r);
 };
 
 /// \brief this is our _biggest_ modification to how raft works
@@ -474,37 +490,6 @@ struct leadership_status {
     std::optional<vnode> current_leader;
 };
 
-struct replicate_result {
-    /// used by the kafka API to produce a kafka reply to produce request.
-    /// see produce_request.cc
-    model::offset last_offset;
-};
-struct replicate_stages {
-    replicate_stages(ss::future<>, ss::future<result<replicate_result>>);
-    explicit replicate_stages(raft::errc);
-    // after this future is ready, request in enqueued in raft and it will not
-    // be reorderd
-    ss::future<> request_enqueued;
-    // after this future is ready, request was successfully replicated with
-    // requested consistency level
-    ss::future<result<replicate_result>> replicate_finished;
-};
-
-enum class consistency_level { quorum_ack, leader_ack, no_ack };
-
-struct replicate_options {
-    explicit replicate_options(consistency_level l)
-      : consistency(l)
-      , timeout(std::nullopt) {}
-
-    replicate_options(consistency_level l, std::chrono::milliseconds timeout)
-      : consistency(l)
-      , timeout(timeout) {}
-
-    consistency_level consistency;
-    std::optional<std::chrono::milliseconds> timeout;
-};
-
 struct transfer_leadership_options {
     std::chrono::milliseconds recovery_timeout;
 };
@@ -536,7 +521,7 @@ struct snapshot_metadata {
 struct install_snapshot_request
   : serde::envelope<
       install_snapshot_request,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
     // node id to validate on receiver
@@ -555,6 +540,8 @@ struct install_snapshot_request
     iobuf chunk;
     // true if this is the last chunk
     bool done;
+    // leader dirty offset
+    model::offset dirty_offset;
 
     raft::group_id target_group() const { return group; }
     vnode source_node() const { return node_id; }
@@ -575,7 +562,8 @@ struct install_snapshot_request
           last_included_index,
           file_offset,
           chunk,
-          done);
+          done,
+          dirty_offset);
     }
 };
 
@@ -586,7 +574,7 @@ public:
     explicit install_snapshot_request_foreign_wrapper(
       install_snapshot_request&& req)
       : _ptr(ss::make_foreign(
-        std::make_unique<install_snapshot_request>(std::move(req)))) {}
+          std::make_unique<install_snapshot_request>(std::move(req)))) {}
 
     install_snapshot_request copy() const {
         // make copy on target core
@@ -598,7 +586,8 @@ public:
           .last_included_index = _ptr->last_included_index,
           .file_offset = _ptr->file_offset,
           .chunk = _ptr->chunk.copy(),
-          .done = _ptr->done};
+          .done = _ptr->done,
+          .dirty_offset = _ptr->dirty_offset};
     }
     raft::group_id target_group() const { return _ptr->target_group(); }
     vnode target_node() const { return _ptr->target_node_id; }
@@ -724,55 +713,6 @@ struct timeout_now_reply
     }
 };
 
-// if not target is specified then the most up-to-date node will be selected
-struct transfer_leadership_request
-  : serde::envelope<
-      transfer_leadership_request,
-      serde::version<1>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-    group_id group;
-    std::optional<model::node_id> target;
-    std::optional<std::chrono::milliseconds> timeout;
-
-    raft::group_id target_group() const { return group; }
-
-    friend bool operator==(
-      const transfer_leadership_request&, const transfer_leadership_request&)
-      = default;
-
-    auto serde_fields() { return std::tie(group, target, timeout); }
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const transfer_leadership_request& r) {
-        fmt::print(
-          o, "group {} target {} timeout {}", r.group, r.target, r.timeout);
-        return o;
-    }
-};
-
-struct transfer_leadership_reply
-  : serde::envelope<
-      transfer_leadership_reply,
-      serde::version<0>,
-      serde::compat_version<0>> {
-    using rpc_adl_exempt = std::true_type;
-    bool success{false};
-    raft::errc result;
-
-    friend bool operator==(
-      const transfer_leadership_reply&, const transfer_leadership_reply&)
-      = default;
-
-    auto serde_fields() { return std::tie(success, result); }
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const transfer_leadership_reply& r) {
-        fmt::print(o, "success {} result {}", r.success, r.result);
-        return o;
-    }
-};
-
 // key types used to store data in key-value store
 enum class metadata_key : int8_t {
     voted_for = 0,
@@ -788,9 +728,9 @@ enum class metadata_key : int8_t {
 using voter_priority = named_type<uint32_t, struct voter_priority_tag>;
 
 // zero priority doesn't allow node to become a leader
-static constexpr voter_priority zero_voter_priority = voter_priority{0};
+inline constexpr voter_priority zero_voter_priority = voter_priority{0};
 // 1 is smallest possible priority allowing node to become a leader
-static constexpr voter_priority min_voter_priority = voter_priority{1};
+inline constexpr voter_priority min_voter_priority = voter_priority{1};
 
 /**
  * Raft scheduling_config contains Seastar scheduling and IO priority
@@ -818,22 +758,25 @@ struct scheduling_config {
 };
 
 std::ostream& operator<<(std::ostream& o, const consistency_level& l);
-std::ostream& operator<<(std::ostream& o, const append_entries_reply::status&);
+std::ostream& operator<<(std::ostream& o, const reply_result&);
 
 using with_learner_recovery_throttle
   = ss::bool_class<struct with_recovery_throttle_tag>;
 
 using keep_snapshotted_log = ss::bool_class<struct keep_snapshotted_log_tag>;
 
+// Raft part of the struct that makes starting the partition
+// instance on the destination shard of the x-shard transfer easier.
+struct xshard_transfer_state {
+    // If before the transfer, this partition was the leader, will contain the
+    // corresponding term. It will be used to try to immediately regain the
+    // leadership on the destination shard.
+    std::optional<model::term_id> leader_term;
+};
+
 } // namespace raft
 
 namespace reflection {
-
-template<>
-struct adl<raft::protocol_metadata> {
-    void to(iobuf& out, raft::protocol_metadata request);
-    raft::protocol_metadata from(iobuf_parser& in);
-};
 
 template<>
 struct adl<raft::snapshot_metadata> {

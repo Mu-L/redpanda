@@ -8,7 +8,8 @@
 # by the Apache License, Version 2.0
 
 from rptest.tests.redpanda_test import RedpandaTest
-from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST
+from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST, RedpandaInstaller
+from rptest.services.redpanda_installer import ver_triple, RedpandaVersionTriple, RedpandaVersionLine
 from rptest.services.cluster import cluster
 from rptest.services.admin import Admin
 from rptest.services.admin_ops_fuzzer import AdminOperationsFuzzer
@@ -19,14 +20,12 @@ from ducktape.mark import matrix
 from ducktape.utils.util import wait_until
 
 import random
+import time
 
 
 class ControllerSnapshotPolicyTest(RedpandaTest):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args,
-                         num_brokers=3,
-                         extra_rp_conf={'controller_snapshot_max_age_sec': 5},
-                         **kwargs)
+        super().__init__(*args, num_brokers=3, **kwargs)
 
     def setUp(self):
         # start the nodes manually
@@ -38,6 +37,7 @@ class ControllerSnapshotPolicyTest(RedpandaTest):
         Test that Redpanda creates a controller snapshot some time after controller commands appear.
         """
         admin = Admin(self.redpanda)
+        self.redpanda.set_extra_rp_conf({'controller_snapshot_max_age_sec': 5})
         self.redpanda.start()
         self.redpanda.set_feature_active('controller_snapshots',
                                          False,
@@ -75,7 +75,8 @@ class ControllerState:
         self.features_response = admin.get_features(node=node)
         self.features_map = dict(
             (f['name'], f) for f in self.features_response['features'])
-        self.config_response = admin.get_cluster_config(node=node)
+        self.config_response = admin.get_cluster_config(node=node,
+                                                        include_defaults=False)
         self.users = set(admin.list_users(node=node))
         self.acls = rpk.acl_list().strip().split('\n')
 
@@ -96,17 +97,33 @@ class ControllerState:
             'internal_rpc_status', 'internal_rpc_port'
         ]
         self.brokers = dict()
-        for broker in admin.get_brokers(node=node):
+        brokers_resp = admin.get_brokers(node=node)
+        for broker in brokers_resp:
             self.brokers[broker['node_id']] = dict(
                 (k, broker.get(k)) for k in broker_fields)
 
-    def _check_features(self, other):
+        # New brokers may not report the version yet, so gather the cluster version
+        # based on multiple brokers' reported version
+        versions = list(
+            set(broker['version'] for broker in brokers_resp
+                if 'version' in broker))
+        assert len(versions) == 1, f"Unexpected versions: {versions}"
+        self.version_line = versions[0]
+
+        self.version = ver_triple(self.version_line)
+
+    def _check_features(self, other, allow_upgrade_changes=False):
         for k, v in self.features_response.items():
             if k == 'features':
                 continue
             new_v = other.features_response.get(k)
-            assert new_v == v, \
-                f"features response mismatch (key: {k}): got {new_v}, expected {v}"
+            if allow_upgrade_changes and k in ('cluster_version',
+                                               'node_latest_version',
+                                               'node_earliest_version'):
+                assert new_v >= v, f"unexpected value, ({k=}, {new_v=}, {v=})"
+            else:
+                assert new_v == v, \
+                    f"features response mismatch (key: {k}): got {new_v}, expected {v}"
 
         for f, v in self.features_map.items():
             new_v = other.features_map.get(f)
@@ -122,15 +139,34 @@ class ControllerState:
         assert len(
             symdiff) == 0, f"config responses differ, symdiff: {symdiff}"
 
-    def _check_topics(self, other):
+    def _check_topics(self, other, allow_upgrade_changes=False):
         symdiff = self.topics ^ other.topics
         assert len(symdiff) == 0, f"topics differ, symdiff: {symdiff}"
 
+        def to_set(configs):
+            if allow_upgrade_changes:
+                return set((k, v) for k, v in configs.items()
+                           if v[1] != 'DEFAULT_CONFIG')
+            else:
+                return set(configs.items())
+
         for t in self.topics:
-            configs = self.topic_configs[t]
-            other_configs = other.topic_configs[t]
-            assert configs == other_configs, \
-                f"topic configs differ for topic {t}: {configs} vs {other_configs}"
+            symdiff = to_set(self.topic_configs[t]) ^ to_set(
+                other.topic_configs[t])
+
+            # Newer versions include a bugfix to change the source type of cleanup.policy from
+            # DYNAMIC_TOPIC_CONFIG to DEFAULT_CONFIG if the cleanup.policy wasn't specified as
+            # a config value when the topic is created.
+            # All versions newer that are at least as new as 24.2.1 will have the fix, and so
+            # they don't need this explicit ignore.
+            MIN_VERSION_WITH_ALL_LATER_VERSIONS_FIXED = RedpandaVersionTriple(
+                (24, 2, 1))
+            if self.version < MIN_VERSION_WITH_ALL_LATER_VERSIONS_FIXED:
+                symdiff -= set({('cleanup.policy', ('delete',
+                                                    'DYNAMIC_TOPIC_CONFIG'))})
+
+            assert len(symdiff) == 0, f"configs differ, symdiff: {symdiff}"
+
             partitions = self.topic_partitions[t]
             other_partitions = other.topic_partitions[t]
             assert partitions == other_partitions, \
@@ -147,10 +183,10 @@ class ControllerState:
         assert self.users == other.users
         assert self.acls == other.acls
 
-    def check(self, other):
-        self._check_features(other)
+    def check(self, other, allow_upgrade_changes=False):
+        self._check_features(other, allow_upgrade_changes)
         self._check_config(other)
-        self._check_topics(other)
+        self._check_topics(other, allow_upgrade_changes)
         self._check_brokers(other)
         self._check_security(other)
 
@@ -243,6 +279,18 @@ class ControllerSnapshotTest(RedpandaTest):
 
         self.logger.info("cluster restarted successfully")
 
+    def _wait_for_everything_snapshotted(self, nodes):
+        controller_max_offset = max(
+            Admin(self.redpanda).get_controller_status(n)['committed_index']
+            for n in nodes)
+        self.logger.info(f"controller max offset is {controller_max_offset}")
+
+        for n in nodes:
+            self.redpanda.wait_for_controller_snapshot(
+                node=n, prev_start_offset=(controller_max_offset - 1))
+
+        return controller_max_offset
+
     @cluster(num_nodes=4, log_allow_list=RESTART_LOG_ALLOW_LIST)
     def test_join_restart_catch_up(self):
         """
@@ -285,21 +333,8 @@ class ControllerSnapshotTest(RedpandaTest):
         ops_fuzzer = AdminOperationsFuzzer(self.redpanda, min_replication=3)
         ops_fuzzer.create_initial_entities()
 
-        def wait_for_everything_snapshotted(nodes):
-            controller_max_offset = max(
-                admin.get_controller_status(n)['committed_index']
-                for n in nodes)
-            self.logger.info(
-                f"controller max offset is {controller_max_offset}")
-
-            for n in nodes:
-                self.redpanda.wait_for_controller_snapshot(
-                    node=n, prev_start_offset=(controller_max_offset - 1))
-
-            return controller_max_offset
-
         admin.put_feature("controller_snapshots", {"state": "active"})
-        wait_for_everything_snapshotted(seed_nodes)
+        self._wait_for_everything_snapshotted(seed_nodes)
 
         # check initial state
         initial_state = ControllerState(self.redpanda, seed_nodes[0])
@@ -352,13 +387,21 @@ class ControllerSnapshotTest(RedpandaTest):
         for iter in range(5):
             self.redpanda.stop_node(joiner)
 
+            # wait for the joiner to step down in case it was the controller
+            joiner_id = self.redpanda.node_id(joiner)
+            admin.await_stable_leader(namespace='redpanda',
+                                      topic='controller',
+                                      check=lambda id: id != joiner_id,
+                                      timeout_s=30)
+
             executed = 0
             to_execute = random.randint(1, 5)
             while executed < to_execute:
                 if ops_fuzzer.execute_one():
                     executed += 1
 
-            controller_max_offset = wait_for_everything_snapshotted(seed_nodes)
+            controller_max_offset = self._wait_for_everything_snapshotted(
+                seed_nodes)
 
             # start joiner and wait until it catches up
             self.redpanda.start_node(joiner)
@@ -375,3 +418,50 @@ class ControllerSnapshotTest(RedpandaTest):
 
             self.logger.info(
                 f"iteration {iter} done (executed {to_execute} ops).")
+
+    @cluster(num_nodes=4)
+    def test_upgrade_compat(self):
+        """
+        Test that redpanda can start with a controller snapshot created by the previous version.
+        """
+
+        # turn off partition balancing to minimize the number of internally-generated
+        # controller commands
+        self.redpanda.add_extra_rp_conf(
+            {'partition_autobalancing_mode': 'off'})
+
+        installer = self.redpanda._installer
+        initial_ver = installer.highest_from_prior_feature_version(
+            RedpandaInstaller.HEAD)
+        self.logger.info(
+            f"will test compatibility with redpanda v. {initial_ver}")
+        installer.install(self.redpanda.nodes, initial_ver)
+        self.redpanda.start()
+
+        admin = Admin(self.redpanda)
+        rpk = RpkTool(self.redpanda)
+
+        # issue some controller commands
+
+        # could be any non-default value for any property
+        self.redpanda.set_cluster_config(
+            {'controller_snapshot_max_age_sec': 7})
+
+        rpk.create_topic('test_topic')
+
+        admin.create_user(username='test',
+                          password='p4ssw0rd',
+                          algorithm='SCRAM-SHA-256')
+        rpk.acl_create_allow_cluster(username='test', op='describe')
+
+        self._wait_for_everything_snapshotted(self.redpanda.nodes)
+
+        expected_state = ControllerState(self.redpanda, self.redpanda.nodes[0])
+
+        installer.install(self.redpanda.nodes, RedpandaInstaller.HEAD)
+
+        self.redpanda.restart_nodes(self.redpanda.nodes)
+        self.redpanda.wait_for_membership(first_start=False)
+
+        state = ControllerState(self.redpanda, self.redpanda.nodes[1])
+        expected_state.check(state, allow_upgrade_changes=True)

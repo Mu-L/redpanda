@@ -1,5 +1,5 @@
 <!--
-See https://github.com/redpanda-data/redpanda/blob/dev/CONTRIBUTING.md##pull-request-body
+See https://github.com/redpanda-data/redpanda/blob/dev/CONTRIBUTING.md#pull-request-body
 for more details and examples of what is expected in a PR body.
 
 Content in this top section is REQUIRED. Describe, in plain language, the motivation
@@ -21,9 +21,9 @@ If this PR is a backport, link to the original with `Backport of PR`, e.g.
 - [ ] none - this is a backport
 - [ ] none - issue does not exist in previous branches
 - [ ] none - papercut/not impactful enough to backport
-- [ ] v23.2.x
-- [ ] v23.1.x
-- [ ] v22.3.x
+- [ ] v24.3.x
+- [ ] v24.2.x
+- [ ] v24.1.x
 
 ## Release Notes
 

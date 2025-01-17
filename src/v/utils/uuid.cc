@@ -10,11 +10,15 @@
 
 #include "bytes/details/out_of_range.h"
 
+#include <seastar/core/sstring.hh>
+
 #include <boost/uuid/random_generator.hpp>
+#include <boost/uuid/string_generator.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <fmt/ostream.h>
 
-#include <ostream>
+#include <iostream>
+#include <string>
 
 uuid_t::uuid_t(const std::vector<uint8_t>& v) {
     if (v.size() != length) {
@@ -29,8 +33,27 @@ uuid_t uuid_t::create() {
     return uuid_t(uuid_gen());
 }
 
+uuid_t uuid_t::from_string(std::string_view str) {
+    static thread_local ::boost::uuids::string_generator gen;
+
+    return uuid_t(gen(str.begin(), str.end()));
+}
+
 std::ostream& operator<<(std::ostream& os, const uuid_t& u) {
     return os << fmt::format("{}", u._uuid);
 }
 
+std::istream& operator>>(std::istream& is, uuid_t& u) {
+    std::string s;
+    is >> s;
+    try {
+        u = uuid_t::from_string(s);
+    } catch (const std::runtime_error&) {
+        is.setstate(std::ios::failbit);
+    }
+    return is;
+}
+
 uuid_t::operator ss::sstring() const { return fmt::format("{}", _uuid); }
+
+bool operator<(const uuid_t& l, const uuid_t& r) { return l.uuid() < r.uuid(); }

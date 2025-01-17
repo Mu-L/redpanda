@@ -8,12 +8,13 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
-#include "archival/ntp_archiver_service.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage/tests/s3_imposter.h"
+#include "cluster/archival/ntp_archiver_service.h"
 #include "cluster/cloud_metadata/cluster_manifest.h"
 #include "cluster/cloud_metadata/key_utils.h"
 #include "cluster/cloud_metadata/manifest_downloads.h"
+#include "cluster/cloud_metadata/tests/manual_mixin.h"
 #include "model/fundamental.h"
 #include "redpanda/application.h"
 #include "redpanda/tests/fixture.h"
@@ -29,12 +30,14 @@ using namespace cluster::cloud_metadata;
 
 class cluster_metadata_fixture
   : public s3_imposter_fixture
+  , public manual_metadata_upload_mixin
   , public redpanda_thread_fixture
   , public enable_cloud_storage_fixture {
 public:
     cluster_metadata_fixture()
       : redpanda_thread_fixture(
-        redpanda_thread_fixture::init_cloud_storage_tag{}, httpd_port_number())
+          redpanda_thread_fixture::init_cloud_storage_tag{},
+          httpd_port_number())
       , remote(app.cloud_storage_api.local())
       , bucket(cloud_storage_clients::bucket_name("test-bucket")) {
         set_expectations_and_listen({});
@@ -74,6 +77,7 @@ FIXTURE_TEST(test_download_manifest, cluster_metadata_fixture) {
           .upload_manifest(
             cloud_storage_clients::bucket_name("test-bucket"),
             manifest,
+            manifest.get_manifest_path(),
             retry_node)
           .get();
 
@@ -94,4 +98,65 @@ FIXTURE_TEST(test_download_manifest, cluster_metadata_fixture) {
               .get();
     BOOST_CHECK(m_res.has_error());
     BOOST_CHECK_EQUAL(error_outcome::list_failed, m_res.error());
+}
+
+FIXTURE_TEST(
+  test_download_highest_manifest_in_bucket, cluster_metadata_fixture) {
+    retry_chain_node retry_node(
+      never_abort, ss::lowres_clock::time_point::max(), 10ms);
+    auto m_res
+      = download_highest_manifest_in_bucket(remote, bucket, retry_node).get();
+    BOOST_REQUIRE(m_res.has_error());
+    BOOST_REQUIRE_EQUAL(m_res.error(), error_outcome::no_matching_metadata);
+
+    cluster_metadata_manifest manifest;
+    manifest.cluster_uuid = cluster_uuid;
+    manifest.metadata_id = cluster_metadata_id(10);
+    remote
+      .upload_manifest(
+        cloud_storage_clients::bucket_name("test-bucket"),
+        manifest,
+        manifest.get_manifest_path(),
+        retry_node)
+      .get();
+
+    m_res
+      = download_highest_manifest_in_bucket(remote, bucket, retry_node).get();
+    BOOST_REQUIRE(m_res.has_value());
+    BOOST_CHECK_EQUAL(cluster_uuid, m_res.value().cluster_uuid);
+    BOOST_CHECK_EQUAL(10, m_res.value().metadata_id());
+
+    auto new_uuid = model::cluster_uuid(uuid_t::create());
+    manifest.cluster_uuid = new_uuid;
+    manifest.metadata_id = cluster_metadata_id(15);
+
+    // Upload a new manifest with a higher metadata ID for a new cluster.
+    remote
+      .upload_manifest(
+        cloud_storage_clients::bucket_name("test-bucket"),
+        manifest,
+        manifest.get_manifest_path(),
+        retry_node)
+      .get();
+    m_res
+      = download_highest_manifest_in_bucket(remote, bucket, retry_node).get();
+    BOOST_REQUIRE(m_res.has_value());
+    BOOST_REQUIRE_EQUAL(15, m_res.value().metadata_id());
+    BOOST_REQUIRE_EQUAL(new_uuid, m_res.value().cluster_uuid);
+
+    // Sanity check that searching by the cluster UUIDs return the expected
+    // manifests.
+    m_res = download_highest_manifest_for_cluster(
+              remote, cluster_uuid, bucket, retry_node)
+              .get();
+    BOOST_REQUIRE(m_res.has_value());
+    BOOST_REQUIRE_EQUAL(10, m_res.value().metadata_id());
+    BOOST_REQUIRE_EQUAL(cluster_uuid, m_res.value().cluster_uuid);
+
+    m_res = download_highest_manifest_for_cluster(
+              remote, new_uuid, bucket, retry_node)
+              .get();
+    BOOST_REQUIRE(m_res.has_value());
+    BOOST_REQUIRE_EQUAL(15, m_res.value().metadata_id());
+    BOOST_REQUIRE_EQUAL(new_uuid, m_res.value().cluster_uuid);
 }

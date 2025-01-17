@@ -26,11 +26,10 @@ class TieredStorageSinglePartitionTest(RedpandaTest):
     topics = (TopicSpec(replication_factor=3, partition_count=1), )
 
     def __init__(self, test_context, *args, **kwargs):
-        self.si_settings = SISettings(
+        kwargs['si_settings'] = SISettings(
             test_context=test_context,
             log_segment_size=self.log_segment_size,
         )
-        kwargs['si_settings'] = self.si_settings
 
         # Use interval uploads so that at end of test we may do an "everything
         # was uploaded" success condition.
@@ -45,7 +44,9 @@ class TieredStorageSinglePartitionTest(RedpandaTest):
             'cloud_storage_manifest_max_upload_interval_sec':
             self.manifest_upload_interval,
             # Ensure spillover can happen promptly during test
-            'cloud_storage_housekeeping_interval_ms': 5000
+            'cloud_storage_housekeeping_interval_ms': 5000,
+            # But allow the test runtime to configure it.
+            'cloud_storage_spillover_manifest_size': None,
         }
         super().__init__(test_context, *args, **kwargs)
 
@@ -90,6 +91,8 @@ class TieredStorageSinglePartitionTest(RedpandaTest):
             f"Configuring to spill metadata after {spillover_segments} segments"
         )
         self.redpanda.set_cluster_config({
+            'cloud_storage_spillover_manifest_size':
+            None,
             'cloud_storage_spillover_manifest_max_segments':
             spillover_segments
         })
@@ -214,10 +217,11 @@ class TieredStorageSinglePartitionTest(RedpandaTest):
         # many extra raft records we wrote for archival_metadata_stm.
         #
         # At the maximum, this should be:
-        # - 1 per segment (although could be as low as 1 for every four segments
-        #   due to ntp_archiver::_concurrency)
+        # - 1 per segment uploaded
         # - 1 per upload round (i.e. per 1-4 segments) for marking the manifest
         #   clean.
+        # - 1 per upload round (i.e. per 1-4 segments) for updating the highest
+        #   producer ID.
         # - 1 per raft term, for raft config batches written by new leaders
         #
         # This helps to assure us that ntp_archiver and archival_metadata_stm
@@ -237,7 +241,13 @@ class TieredStorageSinglePartitionTest(RedpandaTest):
         self.logger.info(
             f"Delta: {offset_delta}, Segments: {segment_count}, Last term {last_term}"
         )
-        assert offset_delta <= (2 * segment_count + last_term)
+
+        # If we upload in batches of four segments at a time
+        min_offset_delta = (segment_count * 1.5) + last_term
+
+        # If we upload one segment at a time
+        max_offset_delta = (segment_count * 3) + last_term
+        assert min_offset_delta <= offset_delta <= max_offset_delta
 
         # +3 because:
         # - 1 empty upload at start

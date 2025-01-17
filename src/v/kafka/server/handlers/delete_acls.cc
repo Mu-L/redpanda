@@ -10,7 +10,10 @@
  */
 #include "kafka/server/handlers/delete_acls.h"
 
+#include "cluster/security_frontend.h"
+#include "container/fragmented_vector.h"
 #include "kafka/protocol/errors.h"
+#include "kafka/protocol/schemata/delete_acls_response.h"
 #include "kafka/server/errors.h"
 #include "kafka/server/handlers/details/security.h"
 #include "kafka/server/request_context.h"
@@ -62,15 +65,6 @@ ss::future<response_ptr> delete_acls_handler::handle(
     request.decode(ctx.reader(), ctx.header().version);
     log_request(ctx.header(), request);
 
-    if (!ctx.authorized(
-          security::acl_operation::alter, security::default_cluster_name)) {
-        delete_acls_filter_result result;
-        result.error_code = error_code::cluster_authorization_failed;
-        delete_acls_response resp;
-        resp.data.filter_results.assign(request.data.filters.size(), result);
-        co_return co_await ctx.respond(std::move(resp));
-    }
-
     // <filter index> | error
     std::vector<std::variant<size_t, delete_acls_filter_result>> result_index;
     result_index.reserve(request.data.filters.size());
@@ -92,6 +86,38 @@ ss::future<response_ptr> delete_acls_handler::handle(
         }
     }
 
+    auto return_filters = [&filters]() { return filters; };
+
+    auto authz = ctx.authorized(
+      security::acl_operation::alter,
+      security::default_cluster_name,
+      std::move(return_filters));
+
+    if (!ctx.audit()) {
+        delete_acls_filter_result result;
+        result.error_code = error_code::broker_not_available;
+        result.error_message = "Broker not available - audit system failure";
+        delete_acls_response resp;
+        resp.data.filter_results.reserve(request.data.filters.size());
+        std::fill_n(
+          std::back_inserter(resp.data.filter_results),
+          request.data.filters.size(),
+          result);
+        co_return co_await ctx.respond(std::move(resp));
+    }
+
+    if (!authz) {
+        delete_acls_filter_result result;
+        result.error_code = error_code::cluster_authorization_failed;
+        delete_acls_response resp;
+        resp.data.filter_results.reserve(request.data.filters.size());
+        std::fill_n(
+          std::back_inserter(resp.data.filter_results),
+          request.data.filters.size(),
+          result);
+        co_return co_await ctx.respond(std::move(resp));
+    }
+
     const auto num_filters = filters.size();
 
     auto results = co_await ctx.security_frontend().delete_acls(
@@ -109,10 +135,12 @@ ss::future<response_ptr> delete_acls_handler::handle(
           results.size(),
           num_filters);
 
-        response.data.filter_results.assign(
-          result_index.size(),
-          delete_acls_filter_result{
-            .error_code = error_code::unknown_server_error});
+        response.data.filter_results.reserve(result_index.size());
+        for ([[maybe_unused]] auto _ :
+             boost::irange<size_t>(result_index.size())) {
+            response.data.filter_results.push_back(delete_acls_filter_result{
+              .error_code = error_code::unknown_server_error});
+        }
 
         co_return co_await ctx.respond(std::move(response));
     }
@@ -127,7 +155,7 @@ ss::future<response_ptr> delete_acls_handler::handle(
                 .matching_acls = bindings_to_delete_result(results[i].bindings),
               });
           },
-          [&response](delete_acls_filter_result r) {
+          [&response](delete_acls_filter_result& r) {
               response.data.filter_results.push_back(std::move(r));
           });
     }

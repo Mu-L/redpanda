@@ -11,7 +11,6 @@ from math import fabs
 from rptest.services.cluster import cluster
 from ducktape.mark import parametrize
 from ducktape.utils.util import wait_until
-
 from rptest.services.kgo_verifier_services import KgoVerifierProducer
 from rptest.clients.kcl import KCL
 from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST, SISettings, MetricsEndpoint
@@ -40,9 +39,10 @@ class OffsetForLeaderEpochArchivalTest(RedpandaTest):
     def __init__(self, test_context):
         self.extra_rp_conf = {
             'enable_leader_balancer': False,
-            "log_compaction_interval_ms": 1000
+            "log_compaction_interval_ms": 1000,
+            "cloud_storage_spillover_manifest_size": None,
         }
-        self.si_settings = SISettings(
+        si_settings = SISettings(
             test_context,
             log_segment_size=OffsetForLeaderEpochArchivalTest.segment_size,
             cloud_storage_cache_size=5 *
@@ -50,14 +50,14 @@ class OffsetForLeaderEpochArchivalTest(RedpandaTest):
         if test_context.function_name == 'test_querying_archive':
             self.extra_rp_conf[
                 'cloud_storage_spillover_manifest_max_segments'] = 10
-            self.si_settings.log_segment_size = 1024
-            self.si_settings.fast_uploads = True,
-            self.si_settings.cloud_storage_housekeeping_interval_ms = 10000
+            si_settings.log_segment_size = 1024
+            si_settings.fast_uploads = True,
+            si_settings.cloud_storage_housekeeping_interval_ms = 10000
 
         super(OffsetForLeaderEpochArchivalTest,
               self).__init__(test_context=test_context,
                              extra_rp_conf=self.extra_rp_conf,
-                             si_settings=self.si_settings)
+                             si_settings=si_settings)
 
     def _alter_topic_retention_with_retry(self, topic):
         rpk = RpkTool(self.redpanda)
@@ -85,9 +85,14 @@ class OffsetForLeaderEpochArchivalTest(RedpandaTest):
         epoch_offsets = {}
         rpk = RpkTool(self.redpanda)
         self.client().create_topic(topic)
+        remote_reads_str = 'true' if remote_reads else 'false'
         rpk.alter_topic_config(topic.name, "redpanda.remote.read",
-                               str(remote_reads))
+                               remote_reads_str)
         rpk.alter_topic_config(topic.name, "redpanda.remote.write", 'true')
+        desc = rpk.describe_topic_configs(topic.name)
+
+        assert desc['redpanda.remote.read'][0] == remote_reads_str
+        assert desc['redpanda.remote.write'][0] == 'true'
 
         def wait_for_topic():
             wait_until(lambda: len(list(rpk.describe_topic(topic.name))) > 0,

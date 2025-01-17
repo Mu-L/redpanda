@@ -12,18 +12,17 @@
 #pragma once
 
 #include "cluster/commands.h"
+#include "cluster/fwd.h"
+#include "cluster/notification.h"
 #include "cluster/topic_table_probe.h"
-#include "cluster/types.h"
+#include "container/chunked_hash_map.h"
+#include "container/contiguous_range_map.h"
 #include "model/fundamental.h"
-#include "model/limits.h"
 #include "model/metadata.h"
-#include "utils/expiring_promise.h"
 #include "utils/stable_iterator_adaptor.h"
 
-#include <absl/container/flat_hash_map.h>
 #include <absl/container/node_hash_map.h>
 
-#include <span>
 #include <type_traits>
 
 namespace cluster {
@@ -96,31 +95,48 @@ public:
     //   * partition::get_revision_id()
     //   * raft::group_configuration::revision_id()
 
+    class concurrent_modification_error final
+      : public ::concurrent_modification_error {
+    public:
+        concurrent_modification_error(
+          model::revision_id initial_revision,
+          model::revision_id current_revision)
+          : ::concurrent_modification_error(ssx::sformat(
+              "Topic table was modified by concurrent fiber. "
+              "(initial_revision: {}, current_revision: {}) ",
+              initial_revision,
+              current_revision)) {}
+    };
+
     class in_progress_update {
     public:
         explicit in_progress_update(
-          std::vector<model::broker_shard> previous_replicas,
-          std::vector<model::broker_shard> target_replicas,
+          replicas_t previous_replicas,
+          replicas_t target_replicas,
           reconfiguration_state state,
           model::revision_id update_revision,
-          topic_table_probe& probe)
+          reconfiguration_policy policy,
+          topic_table_probe* probe)
           : _previous_replicas(std::move(previous_replicas))
           , _target_replicas(std::move(target_replicas))
           , _state(state)
           , _update_revision(update_revision)
           , _last_cmd_revision(update_revision)
+          , _policy(policy)
           , _probe(probe) {
-            _probe.handle_update(_previous_replicas, _target_replicas);
+            if (_probe) {
+                _probe->handle_update(_previous_replicas, _target_replicas);
+            }
         }
 
         ~in_progress_update() {
-            _probe.handle_update_finish(_previous_replicas, _target_replicas);
-            if (
-              _state == reconfiguration_state::cancelled
-              || _state == reconfiguration_state::force_cancelled) {
-                _probe.handle_update_cancel_finish(
+            if (_probe) {
+                _probe->handle_update_finish(
                   _previous_replicas, _target_replicas);
-                ;
+                if (is_cancelled_state(_state)) {
+                    _probe->handle_update_cancel_finish(
+                      _previous_replicas, _target_replicas);
+                }
             }
         }
 
@@ -133,20 +149,28 @@ public:
 
         void set_state(reconfiguration_state state, model::revision_id rev) {
             if (
-              _state == reconfiguration_state::in_progress
-              && (state == reconfiguration_state::cancelled || state == reconfiguration_state::force_cancelled)) {
-                _probe.handle_update_cancel(
+              _probe && !is_cancelled_state(_state)
+              && is_cancelled_state(state)) {
+                _probe->handle_update_cancel(
                   _previous_replicas, _target_replicas);
             }
             _state = state;
             _last_cmd_revision = rev;
         }
 
-        const std::vector<model::broker_shard>& get_previous_replicas() const {
+        const replicas_t& get_previous_replicas() const {
             return _previous_replicas;
         }
-        const std::vector<model::broker_shard>& get_target_replicas() const {
+        const replicas_t& get_target_replicas() const {
             return _target_replicas;
+        }
+
+        const replicas_t& get_resulting_replicas() const {
+            if (is_cancelled_state(_state)) {
+                return _previous_replicas;
+            } else {
+                return _target_replicas;
+            }
         }
 
         const model::revision_id& get_update_revision() const {
@@ -157,13 +181,27 @@ public:
             return _last_cmd_revision;
         }
 
+        reconfiguration_policy get_reconfiguration_policy() const {
+            return _policy;
+        }
+
+        bool is_force_reconfiguration() const {
+            return _state == reconfiguration_state::force_cancelled
+                   || _state == reconfiguration_state::force_update;
+        }
+
+        friend std::ostream&
+        operator<<(std::ostream&, const in_progress_update&);
+
     private:
-        std::vector<model::broker_shard> _previous_replicas;
-        std::vector<model::broker_shard> _target_replicas;
+        replicas_t _previous_replicas;
+        replicas_t _target_replicas;
         reconfiguration_state _state;
         model::revision_id _update_revision;
         model::revision_id _last_cmd_revision;
-        topic_table_probe& _probe;
+        reconfiguration_policy _policy;
+        // _probe can be nullptr, in this case metrics are not updated.
+        topic_table_probe* _probe;
     };
 
     struct partition_meta {
@@ -178,7 +216,8 @@ public:
 
     struct topic_metadata_item {
         topic_metadata metadata;
-        absl::node_hash_map<model::partition_id, partition_meta> partitions;
+        contiguous_range_map<model::partition_id::type, partition_meta>
+          partitions;
 
         assignments_set& get_assignments() {
             return metadata.get_assignments();
@@ -206,9 +245,7 @@ public:
         }
     };
 
-    using delta = topic_table_delta;
-
-    using underlying_t = absl::node_hash_map<
+    using underlying_t = chunked_hash_map<
       model::topic_namespace,
       topic_metadata_item,
       model::topic_namespace_hash,
@@ -220,40 +257,110 @@ public:
       nt_revision_hash,
       nt_revision_eq>;
 
-    using delta_range_t
-      = boost::iterator_range<fragmented_vector<delta>::const_iterator>;
-    using delta_cb_t = ss::noncopyable_function<void(delta_range_t)>;
-    using lw_cb_t = ss::noncopyable_function<void()>;
+    using disabled_partitions_t = chunked_hash_map<
+      model::topic_namespace,
+      topic_disabled_partitions_set,
+      model::topic_namespace_hash,
+      model::topic_namespace_eq>;
 
-    explicit topic_table()
-      : _probe(*this){};
+    using iceberg_tombstones_t = chunked_hash_map<
+      model::topic_namespace,
+      nt_iceberg_tombstone,
+      model::topic_namespace_hash,
+      model::topic_namespace_eq>;
 
-    cluster::notification_id_type register_delta_notification(delta_cb_t cb) {
-        auto id = _notification_id++;
-        _notifications.emplace_back(id, std::move(cb));
+    using topic_delta = topic_table_topic_delta;
+
+    using topic_delta_cb_t
+      = ss::noncopyable_function<void(const chunked_vector<topic_delta>&)>;
+
+    using ntp_delta = topic_table_ntp_delta;
+
+    using ntp_delta_range_t
+      = boost::iterator_range<fragmented_vector<ntp_delta>::const_iterator>;
+    using ntp_delta_cb_t = ss::noncopyable_function<void(ntp_delta_range_t)>;
+    using lw_ntp_cb_t = ss::noncopyable_function<void()>;
+
+    /// A helper struct that has various replica-related metadata all in one
+    /// place, so that the API user doesn't have to query several maps manually.
+    ///
+    /// Note that it contains references to current topic_table state and
+    /// therefore cannot be used across scheduling points.
+    struct partition_replicas_view {
+        const replicas_t& orig_replicas() const {
+            return update ? update->get_previous_replicas()
+                          : assignment.replicas;
+        }
+
+        const replicas_t& resulting_replicas() const {
+            return assignment.replicas;
+        }
+
+        const replicas_revision_map& revisions() const {
+            return partition_meta.replicas_revisions;
+        }
+
+        model::revision_id last_update_finished_revision() const {
+            return partition_meta.last_update_finished_revision;
+        }
+
+        model::revision_id last_cmd_revision() const {
+            return update ? update->get_last_cmd_revision()
+                          : last_update_finished_revision();
+        }
+
+        friend std::ostream&
+        operator<<(std::ostream&, const partition_replicas_view&);
+
+        const partition_meta& partition_meta;
+        const partition_assignment& assignment;
+        const in_progress_update* update = nullptr;
+    };
+
+    explicit topic_table(data_migrations::migrated_resources&);
+
+    cluster::notification_id_type
+    register_topic_delta_notification(topic_delta_cb_t cb) {
+        auto id = _topic_notification_id++;
+        _topic_notifications.emplace_back(id, std::move(cb));
         return id;
     }
 
-    void unregister_delta_notification(cluster::notification_id_type id) {
+    void unregister_topic_delta_notification(cluster::notification_id_type id) {
         std::erase_if(
-          _notifications,
-          [id](const std::pair<cluster::notification_id_type, delta_cb_t>& n) {
+          _topic_notifications,
+          [id](const std::pair<cluster::notification_id_type, topic_delta_cb_t>&
+                 n) { return n.first == id; });
+    }
+
+    cluster::notification_id_type
+    register_ntp_delta_notification(ntp_delta_cb_t cb) {
+        auto id = _ntp_notification_id++;
+        _ntp_notifications.emplace_back(id, std::move(cb));
+        return id;
+    }
+
+    void unregister_ntp_delta_notification(cluster::notification_id_type id) {
+        std::erase_if(
+          _ntp_notifications,
+          [id](
+            const std::pair<cluster::notification_id_type, ntp_delta_cb_t>& n) {
               return n.first == id;
           });
     }
 
     /// similar to delta notifications but lightweight because a copy of delta
     /// is not included in the notification.
-    cluster::notification_id_type register_lw_notification(lw_cb_t cb) {
-        auto id = _lw_notification_id++;
-        _lw_notifications.emplace_back(id, std::move(cb));
+    cluster::notification_id_type register_lw_ntp_notification(lw_ntp_cb_t cb) {
+        auto id = _lw_ntp_notification_id++;
+        _lw_ntp_notifications.emplace_back(id, std::move(cb));
         return id;
     }
 
-    void unregister_lw_notification(cluster::notification_id_type id) {
+    void unregister_lw_ntp_notification(cluster::notification_id_type id) {
         std::erase_if(
-          _lw_notifications,
-          [id](const std::pair<cluster::notification_id_type, lw_cb_t>& n) {
+          _lw_ntp_notifications,
+          [id](const std::pair<cluster::notification_id_type, lw_ntp_cb_t>& n) {
               return n.first == id;
           });
     }
@@ -264,16 +371,6 @@ public:
         return b.header().type
                == model::record_batch_type::topic_management_cmd;
     }
-
-    // list of commands that this table is able to apply, the list is used to
-    // automatically deserialize batch into command
-    static constexpr auto accepted_commands = make_commands_list<
-      create_topic_cmd,
-      delete_topic_cmd,
-      move_partition_replicas_cmd,
-      finish_moving_partition_replicas_cmd,
-      update_topic_properties_cmd,
-      create_partition_cmd>{};
 
     /// State machine applies
     ss::future<std::error_code> apply(create_topic_cmd, model::offset);
@@ -294,23 +391,18 @@ public:
       apply(revert_cancel_partition_move_cmd, model::offset);
     ss::future<std::error_code>
       apply(force_partition_reconfiguration_cmd, model::offset);
+    ss::future<std::error_code>
+      apply(update_partition_replicas_cmd, model::offset);
+    ss::future<std::error_code>
+      apply(set_topic_partitions_disabled_cmd, model::offset);
+    ss::future<std::error_code>
+      apply(bulk_force_reconfiguration_cmd, model::offset);
 
     ss::future<> fill_snapshot(controller_snapshot&) const;
     ss::future<>
     apply_snapshot(model::offset snapshot_offset, const controller_snapshot&);
 
     ss::future<> stop();
-
-    /// Delta API
-    /// NOTE: This API should only be consumed by a single entity, unless
-    /// careful consideration is taken. This is because once notifications are
-    /// fired, all events are consumed, and if both waiters aren't enqueued in
-    /// the \ref _waiters collection by the time the notify occurs, only one
-    /// waiter will recieve the updates, leaving the second one to observe
-    /// skipped events upon recieving its subsequent notification.
-    ss::future<fragmented_vector<delta>> wait_for_changes(ss::abort_source&);
-
-    bool has_pending_changes() const { return !_pending_deltas.empty(); }
 
     /// Query API
 
@@ -363,6 +455,18 @@ public:
 
     /// Returns metadata of all topics.
     const underlying_t& all_topics_metadata() const;
+
+    /// Get corresponding partition_replicas_view for an ntp (if present).
+    std::optional<partition_replicas_view>
+    get_replicas_view(const model::ntp& ntp) const;
+
+    /// Get corresponding partition_replicas_view for an ntp, assumes that the
+    /// partition exists. Useful for iterating over partitions of a single
+    /// topic (as it avoids repeatedly querying topic-wise maps).
+    partition_replicas_view get_replicas_view(
+      const model::ntp& ntp,
+      const topic_metadata_item& md_item,
+      const partition_assignment& assignment) const;
 
     // use this pair of methods to check if the topics map has changed (so that
     // it is not safe to continue iterating over it).
@@ -423,15 +527,13 @@ public:
      * reconfigured. For reconfiguration from [1,2,3] to [2,3,4] this method
      * will return [1,2,3].
      */
-    std::optional<std::vector<model::broker_shard>>
-    get_previous_replica_set(const model::ntp&) const;
+    std::optional<replicas_t> get_previous_replica_set(const model::ntp&) const;
     /**
      * returns target replica set of partition if partition is currently being
      * reconfigured. For reconfiguration from [1,2,3] to [2,3,4] this method
      * will return [2,3,4].
      */
-    std::optional<std::vector<model::broker_shard>>
-    get_target_replica_set(const model::ntp&) const;
+    std::optional<replicas_t> get_target_replica_set(const model::ntp&) const;
 
     /**
      * Lists all NTPs that replicas are being move to a node
@@ -463,10 +565,57 @@ public:
     size_t get_node_partition_count(model::node_id) const;
 
     /**
-     * See which topics have pending deletion work
+     * See which topics have pending cloud storage deletion work
      */
     const lifecycle_markers_t& get_lifecycle_markers() const {
         return _lifecycle_markers;
+    }
+
+    const disabled_partitions_t& get_disabled_partitions() const {
+        return _disabled_partitions;
+    }
+
+    const topic_disabled_partitions_set*
+    get_topic_disabled_set(model::topic_namespace_view ns_tp) const {
+        auto it = _disabled_partitions.find(ns_tp);
+        if (it == _disabled_partitions.end()) {
+            return nullptr;
+        }
+        return &it->second;
+    }
+
+    bool is_fully_disabled(model::topic_namespace_view ns_tp) const {
+        auto it = _disabled_partitions.find(ns_tp);
+        if (it == _disabled_partitions.end()) {
+            return false;
+        }
+        return it->second.is_fully_disabled();
+    }
+
+    bool is_fully_enabled(model::topic_namespace_view ns_tp) const {
+        auto it = _disabled_partitions.find(ns_tp);
+        if (it == _disabled_partitions.end()) {
+            return true;
+        }
+        return it->second.is_fully_enabled();
+    }
+
+    bool is_disabled(
+      model::topic_namespace_view ns_tp, model::partition_id p_id) const {
+        auto it = _disabled_partitions.find(ns_tp);
+        if (it == _disabled_partitions.end()) {
+            return false;
+        }
+        return it->second.is_disabled(p_id);
+    }
+
+    bool is_disabled(const model::ntp& ntp) const {
+        return is_disabled(model::topic_namespace_view{ntp}, ntp.tp.partition);
+    }
+
+    // Get a set of topics with pending iceberg deletion work.
+    const iceberg_tombstones_t& get_iceberg_tombstones() const {
+        return _iceberg_tombstones;
     }
 
     auto topics_iterator_begin() const {
@@ -483,59 +632,117 @@ public:
           [this] { return _topics_map_revision; }, _topics.end());
     }
 
+    const force_recoverable_partitions_t& partitions_to_force_recover() const {
+        return _partitions_to_force_reconfigure;
+    }
+
+    std::error_code validate_force_reconfigurable_partitions(
+      const fragmented_vector<ntp_with_majority_loss>&) const;
+
+    auto partitions_to_force_recover_it_begin() const {
+        return stable_iterator<
+          force_recoverable_partitions_t::const_iterator,
+          model::revision_id>(
+          [this]() { return _partitions_to_force_reconfigure_revision; },
+          _partitions_to_force_reconfigure.begin());
+    }
+
+    auto partitions_to_force_recover_it_end() const {
+        return stable_iterator<
+          force_recoverable_partitions_t::const_iterator,
+          model::revision_id>(
+          [this]() { return _partitions_to_force_reconfigure_revision; },
+          _partitions_to_force_reconfigure.end());
+    }
+
+    /**
+     * Return the result of applying the update to the topic properties.
+     */
+    static topic_properties update_topic_properties(
+      topic_properties updated_properties, update_topic_properties_cmd cmd);
+
 private:
     friend topic_table_probe;
 
     struct waiter {
         explicit waiter(uint64_t id)
           : id(id) {}
-        ss::promise<fragmented_vector<delta>> promise;
+        ss::promise<fragmented_vector<ntp_delta>> promise;
         ss::abort_source::subscription sub;
         uint64_t id;
     };
 
-    void notify_waiters();
-
-    template<typename Func>
-    std::vector<std::invoke_result_t<Func, const topic_metadata_item&>>
-    transform_topics(Func&&) const;
+    ss::future<> notify_waiters();
 
     void change_partition_replicas(
       model::ntp ntp,
-      const std::vector<model::broker_shard>& new_assignment,
-      topic_metadata_item& metadata,
+      const replicas_t& new_assignment,
       partition_assignment& current_assignment,
       model::offset o,
-      bool is_forced);
+      bool is_forced,
+      reconfiguration_policy policy);
 
     class snapshot_applier;
 
-    std::error_code
-    do_local_delete(model::topic_namespace nt, model::offset offset);
+    ss::future<std::error_code> do_local_delete(
+      model::topic_namespace nt, model::offset offset, bool ignore_migration);
+    ss::future<std::error_code>
+      do_apply(update_partition_replicas_cmd_data, model::offset);
+
+    void add_partition_to_force_reconfigure(ntp_with_majority_loss);
+    void reset_partitions_to_force_reconfigure(
+      const force_recoverable_partitions_t&);
+
+    void on_partition_deletion(const model::ntp&);
+    void on_partition_move_finish(
+      const model::ntp&, const std::vector<model::broker_shard>& replicas);
+    std::error_code validate_force_reconfigurable_partition(
+      const ntp_with_majority_loss&) const;
+
+    // Validation for the final property configuration from a
+    // update_topic_properties_cmd application. Allows user to perform
+    // validations that depend on more than one topic property.
+    //
+    // Returns true if the configured topic_properties is valid, and false
+    // otherwise.
+    bool
+    topic_multi_property_validation(const topic_properties& properties) const;
 
     underlying_t _topics;
     lifecycle_markers_t _lifecycle_markers;
+    disabled_partitions_t _disabled_partitions;
+    iceberg_tombstones_t _iceberg_tombstones;
     size_t _partition_count{0};
 
     updates_t _updates_in_progress;
     model::revision_id _last_applied_revision_id;
-    // Monotonic counter that is bumped for every addition/deletion to topics
-    // map. Unlike other revisions this does not correspond to the command
+
+    // Monotonic counter that is bumped each time _topics, _disabled_partitions,
+    // or _updates_in_progress are modified in a way that makes iteration over
+    // them unsafe (i.e. invalidates iterators or references, including
+    // for nested collections like partition sets and replica sets).
+    //
+    // Unlike other revisions this does not correspond to the command
     // revision that updated the map.
     model::revision_id _topics_map_revision{0};
 
-    fragmented_vector<delta> _pending_deltas;
-    std::vector<std::unique_ptr<waiter>> _waiters;
-    cluster::notification_id_type _notification_id{0};
-    cluster::notification_id_type _lw_notification_id{0};
-    std::vector<std::pair<cluster::notification_id_type, delta_cb_t>>
-      _notifications;
-    std::vector<std::pair<cluster::notification_id_type, lw_cb_t>>
-      _lw_notifications;
-    uint64_t _waiter_id{0};
-    std::vector<delta>::difference_type _last_consumed_by_notifier_offset{0};
-    topic_table_probe _probe;
+    chunked_vector<topic_delta> _pending_topic_deltas;
+    cluster::notification_id_type _topic_notification_id{0};
+    std::vector<std::pair<cluster::notification_id_type, topic_delta_cb_t>>
+      _topic_notifications;
 
+    fragmented_vector<ntp_delta> _pending_ntp_deltas;
+    cluster::notification_id_type _ntp_notification_id{0};
+    cluster::notification_id_type _lw_ntp_notification_id{0};
+    std::vector<std::pair<cluster::notification_id_type, ntp_delta_cb_t>>
+      _ntp_notifications;
+    std::vector<std::pair<cluster::notification_id_type, lw_ntp_cb_t>>
+      _lw_ntp_notifications;
+
+    topic_table_probe _probe;
+    force_recoverable_partitions_t _partitions_to_force_reconfigure;
+    model::revision_id _partitions_to_force_reconfigure_revision{0};
+    data_migrations::migrated_resources& _migrated_resources;
     friend class topic_table_partition_generator;
 };
 

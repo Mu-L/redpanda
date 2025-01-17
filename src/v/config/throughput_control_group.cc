@@ -9,13 +9,13 @@
  * by the Apache License, Version 2.0
  */
 
-#include "throughput_control_group.h"
+#include "config/throughput_control_group.h"
 
 #include "config/convert.h"
 #include "ssx/sformat.h"
+#include "strings/utf8.h"
 #include "utils/functional.h"
 #include "utils/to_string.h"
-#include "utils/utf8.h"
 
 #include <seastar/core/sstring.hh>
 

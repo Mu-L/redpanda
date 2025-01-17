@@ -10,9 +10,9 @@
  */
 #pragma once
 #include "bytes/bytes.h"
+#include "bytes/random.h"
 #include "hashing/secure.h"
 #include "net/types.h"
-#include "random/generators.h"
 #include "security/scram_credential.h"
 #include "ssx/sformat.h"
 #include "utils/base64.h"
@@ -196,6 +196,8 @@ public:
     static constexpr int min_iterations = MinIterations;
     static_assert(min_iterations > 0, "Minimum iterations must be positive");
 
+    static constexpr auto key_size = HashType::digest_size;
+
     static bytes client_signature(
       bytes_view stored_key,
       const client_first_message& client_first,
@@ -232,7 +234,7 @@ public:
      */
     static scram_credential
     make_credentials(const ss::sstring& password, int iterations) {
-        bytes salt = random_generators::get_bytes(SaltSize);
+        bytes salt = random_generators::get_crypto_bytes(SaltSize);
         bytes salted_password = salt_password(password, salt, iterations);
         auto clientkey = client_key(salted_password);
         auto storedkey = stored_key(clientkey);
@@ -245,7 +247,7 @@ public:
     }
     static scram_credential make_credentials(
       acl_principal principal, const ss::sstring& password, int iterations) {
-        bytes salt = random_generators::get_bytes(SaltSize);
+        bytes salt = random_generators::get_crypto_bytes(SaltSize);
         bytes salted_password = salt_password(password, salt, iterations);
         auto clientkey = client_key(salted_password);
         auto storedkey = stored_key(clientkey);
@@ -345,6 +347,8 @@ private:
           client_final.msg_no_proof());
     }
 };
+
+bool validate_scram_username(std::string_view username);
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-magic-numbers)
 using scram_sha512 = scram_algorithm<hmac_sha512, hash_sha512, 130, 4096>;

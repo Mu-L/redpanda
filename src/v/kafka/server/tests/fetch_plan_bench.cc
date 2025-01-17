@@ -8,6 +8,7 @@
  * the Business Source License, use of this software will be governed
  * by the Apache License, Version 2.0
  */
+#include "base/seastarx.h"
 #include "kafka/client/types.h"
 #include "kafka/protocol/fetch.h"
 #include "kafka/protocol/schemata/fetch_request.h"
@@ -15,39 +16,20 @@
 #include "kafka/server/fetch_session.h"
 #include "kafka/server/fetch_session_cache.h"
 #include "kafka/server/handlers/fetch.h"
-#include "kafka/server/handlers/fetch/fetch_planner.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
-#include "model/namespace.h"
+#include "model/metadata.h"
 #include "random/generators.h"
 #include "redpanda/tests/fixture.h"
-#include "test_utils/fixture.h"
 
-#include <seastar/core/sstring.hh>
 #include <seastar/testing/perf_tests.hh>
-#include <seastar/testing/thread_test_case.hh>
 
-#include <boost/range/iterator_range_core.hpp>
-#include <boost/test/tools/interface.hpp>
 #include <boost/test/tools/old/interface.hpp>
 #include <boost/test/unit_test_log.hpp>
-#include <fmt/ostream.h>
-
-#include <tuple>
 
 static ss::logger fpt_logger("fpt_test");
 
 using namespace std::chrono_literals; // NOLINT
 struct fixture {
-    static kafka::fetch_session_partition make_fetch_partition(
-      model::topic topic, model::partition_id p_id, model::offset offset) {
-        return kafka::fetch_session_partition{
-          .topic_partition = {std::move(topic), p_id},
-          .max_bytes = 1_MiB,
-          .fetch_offset = offset,
-          .high_watermark = offset};
-    }
-
     static kafka::fetch_request::topic
     make_fetch_request_topic(model::topic tp, int partitions_count) {
         kafka::fetch_request::topic fetch_topic{
@@ -77,7 +59,7 @@ struct fetch_plan_fixture : redpanda_thread_fixture {
     fetch_plan_fixture() {
         BOOST_TEST_CHECKPOINT("before leadership");
 
-        wait_for_controller_leadership().get0();
+        wait_for_controller_leadership().get();
 
         BOOST_TEST_CHECKPOINT("HERE");
 
@@ -94,35 +76,39 @@ struct fetch_plan_fixture : redpanda_thread_fixture {
 };
 
 PERF_TEST_F(fetch_plan_fixture, test_fetch_plan) {
-    // make the fetch topic
-    kafka::fetch_topic ft;
-    ft.name = t;
+    auto make_fetch_req = [this]() {
+        // make the fetch topic
+        kafka::fetch_topic ft;
+        ft.name = t;
 
-    // add the partitions to the fetch request
-    for (int pid = 0; pid < session_partition_count; pid++) {
-        kafka::fetch_partition fp;
-        fp.partition_index = model::partition_id(pid);
-        fp.fetch_offset = model::offset(0);
-        fp.current_leader_epoch = kafka::leader_epoch(-1);
-        fp.log_start_offset = model::offset(-1);
-        fp.max_bytes = 1048576;
-        ft.fetch_partitions.push_back(std::move(fp));
-    }
+        // add the partitions to the fetch request
+        for (size_t pid = 0; pid < session_partition_count; pid++) {
+            kafka::fetch_partition fp;
+            fp.partition_index = model::partition_id(static_cast<int32_t>(pid));
+            fp.fetch_offset = model::offset(0);
+            fp.current_leader_epoch = kafka::leader_epoch(-1);
+            fp.log_start_offset = model::offset(-1);
+            fp.max_bytes = 1048576;
+            ft.fetch_partitions.push_back(std::move(fp));
+        }
 
-    BOOST_TEST_CHECKPOINT("HERE");
+        BOOST_TEST_CHECKPOINT("HERE");
 
-    // create a request
-    kafka::fetch_request_data frq_data;
-    frq_data.replica_id = kafka::client::consumer_replica_id;
-    frq_data.max_wait_ms = 500ms;
-    frq_data.min_bytes = 1;
-    frq_data.max_bytes = 52428800;
-    frq_data.isolation_level = model::isolation_level::read_uncommitted;
-    frq_data.session_id = kafka::invalid_fetch_session_id;
-    frq_data.session_epoch = kafka::initial_fetch_session_epoch;
-    frq_data.topics.push_back(std::move(ft));
+        // create a request
+        kafka::fetch_request_data frq_data;
+        frq_data.replica_id = kafka::client::consumer_replica_id;
+        frq_data.max_wait_ms = 500ms;
+        frq_data.min_bytes = 1;
+        frq_data.max_bytes = 52428800;
+        frq_data.isolation_level = model::isolation_level::read_uncommitted;
+        frq_data.session_id = kafka::invalid_fetch_session_id;
+        frq_data.session_epoch = kafka::initial_fetch_session_epoch;
+        frq_data.topics.push_back(std::move(ft));
 
-    kafka::fetch_request fetch_req{frq_data};
+        return kafka::fetch_request{std::move(frq_data)};
+    };
+
+    auto fetch_req = make_fetch_req();
 
     BOOST_TEST_CHECKPOINT("HERE");
 
@@ -132,11 +118,15 @@ PERF_TEST_F(fetch_plan_fixture, test_fetch_plan) {
 
     BOOST_TEST_CHECKPOINT("HERE");
 
+    kafka::request_header header{
+      .key = kafka::fetch_handler::api::key,
+      .version = kafka::fetch_handler::max_supported};
+
     // use this initial request to populate the fetch session
     // in the session cache
     kafka::fetch_session_id sess_id;
     {
-        auto rctx = make_request_context(fetch_req, conn);
+        auto rctx = make_request_context(make_fetch_req(), header, conn);
         // set up a fetch session
         auto ctx = rctx.fetch_sessions().maybe_get_session(fetch_req);
         BOOST_REQUIRE_EQUAL(ctx.has_error(), false);
@@ -157,14 +147,17 @@ PERF_TEST_F(fetch_plan_fixture, test_fetch_plan) {
     fetch_req.data.session_epoch = 1;
     fetch_req.data.topics.clear();
 
-    auto rctx = make_request_context(fetch_req);
+    auto rctx = make_request_context(std::move(fetch_req), header);
     BOOST_REQUIRE_EQUAL(rctx.fetch_sessions().size(), 1);
 
     // add all partitions to fetch metadata
     auto& mdc = rctx.get_fetch_metadata_cache();
-    for (int i = 0; i < total_partition_count; i++) {
+    for (size_t i = 0; i < total_partition_count; i++) {
         mdc.insert_or_assign(
-          {t, i}, model::offset(0), model::offset(100), model::offset(100));
+          {t, static_cast<int32_t>(i)},
+          model::offset(0),
+          model::offset(100),
+          model::offset(100));
     }
 
     vassert(mdc.size() == total_partition_count, "mdc.size(): {}", mdc.size());

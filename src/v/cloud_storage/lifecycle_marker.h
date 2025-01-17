@@ -10,8 +10,9 @@
 
 #pragma once
 
+#include "cloud_storage/remote_path_provider.h"
 #include "cloud_storage_clients/types.h"
-#include "cluster/types.h"
+#include "cluster/nt_revision.h"
 #include "hashing/xx.h"
 
 namespace cloud_storage {
@@ -34,7 +35,7 @@ namespace cloud_storage {
 // └────┬─────┘
 //      │
 //      │
-//      │ Topic purge complete (by scrubber)
+//      │ Topic purge complete (by purger)
 //      ▼
 // ┌──────────┐
 // │  Purged  │
@@ -64,7 +65,7 @@ enum class lifecycle_status : uint8_t {
  * as a tombstone that enables
  *  - readers to unambiguously understand that the
  *    topic is deleted and not just missing
- *  - scrubbers to know that it is safe to erase stray objects within the
+ *  - purgers to know that it is safe to erase stray objects within the
  *    NT that the lifecycle describes.
  *
  * For normal not-deleted topics, this marker doesn't tell you anything more
@@ -93,20 +94,13 @@ struct remote_nt_lifecycle_marker
 
     lifecycle_status status;
 
-    cloud_storage_clients::object_key get_key() {
-        return generate_key(
-          topic.nt.ns, topic.nt.tp, topic.initial_revision_id);
-    }
+    auto serde_fields() { return std::tie(cluster_id, topic, status); }
 
-    static cloud_storage_clients::object_key generate_key(
-      const model::ns& ns,
-      const model::topic& tp,
-      model::initial_revision_id rev) {
-        constexpr uint32_t bitmask = 0xF0000000;
-        auto path = fmt::format("{}/{}", ns(), tp());
-        uint32_t hash = bitmask & xxhash_32(path.data(), path.size());
-        return cloud_storage_clients::object_key(
-          fmt::format("{:08x}/meta/{}/{}_lifecycle.bin", hash, path, rev()));
+    cloud_storage_clients::object_key
+    get_key(const remote_path_provider& path_provider) {
+        return cloud_storage_clients::object_key{
+          path_provider.topic_lifecycle_marker_path(
+            topic.nt, topic.initial_revision_id)};
     }
 };
 

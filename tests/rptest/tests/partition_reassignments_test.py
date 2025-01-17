@@ -19,7 +19,7 @@ from rptest.services.redpanda import LoggingConfig, RedpandaService, SecurityCon
 from rptest.services.verifiable_producer import VerifiableProducer
 from rptest.services.admin import Admin
 from rptest.tests.redpanda_test import RedpandaTest
-from rptest.clients.rpk import RpkTool
+from rptest.clients.rpk import RpkTool, RpkException
 
 from rptest.clients.types import TopicSpec
 from rptest.clients.kafka_cli_tools import KafkaCliTools
@@ -168,9 +168,7 @@ def alter_partition_reassignments_with_kcl(
         timeout_s: int = 10):
     ok_re = re.compile(r"^(?P<topic>[a-z\-]+?) +(?P<partition>[0-9]+?) +OK$")
 
-    output = kcl.alter_partition_reassignments(topics,
-                                               user_cred=user_cred,
-                                               timeout_s=timeout_s)
+    output = kcl.alter_partition_reassignments(topics, timeout_s=timeout_s)
 
     for line in output:
         assert ok_re.match(line.strip()) is not None
@@ -243,15 +241,18 @@ class PartitionReassignmentsTest(RedpandaTest):
         prod.start()
         return prod
 
-    def wait_producers(self, producers: list[VerifiableProducer],
-                       num_messages: int):
-        assert num_messages > 0
+    def wait_producers(self,
+                       producers: list[VerifiableProducer],
+                       num_messages: int,
+                       timeout_s: int = 180):
+        assert num_messages > 0, f'Number of messages must be > 0: num messages {num_messages}'
 
         for prod in producers:
-            wait_until(lambda: prod.num_acked > num_messages,
-                           timeout_sec=180,
-                           err_msg="Producer failed to produce messages for %ds." %\
-                           60)
+            wait_until(
+                lambda: prod.num_acked > num_messages,
+                timeout_sec=timeout_s,
+                err_msg=f"Producer failed to produce messages for {timeout_s}s."
+            )
             self.logger.info("Stopping producer after writing up to offsets %s" %\
                             str(prod.last_acked_offsets))
             prod.stop()
@@ -312,6 +313,7 @@ class PartitionReassignmentsTest(RedpandaTest):
         return kafka_tools.reassign_partitions(
             reassignments=reassignments, operation="cancel").splitlines()
 
+    @ignore  # https://redpandadata.atlassian.net/browse/CORE-8735
     @cluster(num_nodes=6)
     def test_reassignments_kafka_cli(self):
         initial_assignments, all_node_idx, producers = self.initial_setup_steps(
@@ -495,6 +497,116 @@ class PartitionReassignmentsTest(RedpandaTest):
         except subprocess.CalledProcessError as e:
             assert "AlterPartitionReassignment API is disabled. See" in e.output
 
+    @cluster(num_nodes=6)
+    def test_add_partitions_with_inprogress_reassignments(self):
+        """
+        Checks for REASSIGNMENT_IN_PROGRESS error on the CreatePartitions API (i.e., `rpk topic add-partitions`)
+        when there is an in-progress reassignment on the topic
+        """
+        all_topic_names = [t.name for t in self.topics]
+        initial_assignments, all_node_idx, producers = self.initial_setup_steps(
+            producer_config={
+                "topics": all_topic_names,
+                "throughput": 1024
+            },
+            # Slow down partition move enough that the reassignment is in-progress
+            # when we execute add-partitions
+            recovery_rate=10)
+
+        self.wait_producers(producers, num_messages=100000)
+
+        reassignments = {}
+        for assignment in initial_assignments:
+            if assignment.name not in reassignments:
+                reassignments[assignment.name] = {}
+
+            for partition in assignment.partitions:
+                assert partition.id not in reassignments[
+                    assignment.
+                    name], f'Duplicate partition in reassignment: partition {partition.id}, reassignment {reassignments[assignment.name]}'
+                assert len(
+                    partition.replicas
+                ) == self.REPLICAS_COUNT, f'Unexpected replicas count: replicas {partition.replicas}, expected count {self.REPLICAS_COUNT}'
+                missing_node_idx = self.get_missing_node_idx(
+                    all_node_idx, partition.replicas)
+                # Trigger replica add and removal by replacing one of the replicas
+                partition.replicas[2] = missing_node_idx
+                reassignments[assignment.name][
+                    partition.id] = partition.replicas
+
+        self.logger.debug(
+            f"Replacing replicas. New assignments: {reassignments}")
+        kcl = KCL(self.redpanda)
+        alter_partition_reassignments_with_kcl(kcl, reassignments)
+
+        rpk = RpkTool(self.redpanda)
+
+        def try_add_partitions(topic: str, count: int):
+            try:
+                return rpk.add_partitions(topic, count)
+            except RpkException as ex:
+                if 'REASSIGNMENT_IN_PROGRESS: A partition reassignment is in progress.' in str(
+                        ex):
+                    return None
+                else:
+                    raise
+
+        # Try to add partitions to a single topic while there is an in-progress reassignment.
+        # Expect fail.
+        def add_partition_during_inprogress_reassignment(
+                topic: str, count: int):
+            assert try_add_partitions(
+                topic, count
+            ) is None, f'Expected failed add-partitions: topic {topic}, partition count {count}, output {out}'
+
+        add_partition_during_inprogress_reassignment(all_topic_names[0],
+                                                     self.PARTITION_COUNT)
+        add_partition_during_inprogress_reassignment(all_topic_names[1],
+                                                     self.PARTITION_COUNT)
+
+        # Increase the recovery rate so the partition move is faster
+        # to complete
+        self.redpanda.set_cluster_config(
+            {"raft_learner_recovery_rate": 1024 * 1024 * 100})
+
+        all_node_idx_set = set(all_node_idx)
+        partition_idxs = [p for p in range(self.PARTITION_COUNT)]
+
+        # Block until there is no in-progress reassignment
+        def zero_in_progress():
+            def _zero_in_progress(adding: list[int], removing: list[int]):
+                return len(adding) == 0 and len(removing) == 0
+
+            responses = kcl.list_partition_reassignments()
+            self.logger.debug(responses)
+
+            no_tps_in_progress = []
+            for res in responses:
+                assert res.topic in all_topic_names, 'Unexpected topic'
+                assert res.partition in partition_idxs, 'Unexpected partition id'
+                assert set(res.replicas).issubset(
+                    all_node_idx_set), 'Unexpected replica'
+                no_tps_in_progress.append(
+                    _zero_in_progress(res.adding_replicas,
+                                      res.removing_replicas))
+
+            return all(no_tps_in_progress)
+
+        wait_until(zero_in_progress, timeout_sec=30, backoff_sec=1)
+
+        # Try to add partitions to a single topic when there is no in-progress reassignment.
+        # Expect success.
+        def add_partition_when_no_inprogress_reassignment(
+                topic: str, count: int):
+            assert re.search(
+                r'.*topic-[a-z]+\s+OK\s*$', try_add_partitions(topic, count)
+            ) is not None, f'Expected successful add-partitions: topic {topic}, partition count {count}, output {out}'
+
+        add_partition_when_no_inprogress_reassignment(all_topic_names[0],
+                                                      self.PARTITION_COUNT + 2)
+        add_partition_when_no_inprogress_reassignment(all_topic_names[1],
+                                                      self.PARTITION_COUNT + 2)
+
 
 class PartitionReassignmentsACLsTest(RedpandaTest):
     topics = [TopicSpec()]
@@ -533,18 +645,12 @@ class PartitionReassignmentsACLsTest(RedpandaTest):
         reassignments = {self.topic: {0: [1, 2, 3]}}
         self.logger.debug(f"New replica assignments: {reassignments}")
 
-        user_cred = {
-            "user": username,
-            "passwd": self.password,
-            "method": self.algorithm.lower().replace('-', '_')
-        }
-        kcl = KCL(self.redpanda)
+        method = self.algorithm.lower().replace('-', '_')
+        kcl = KCL(self.redpanda, username, self.password, method)
         try:
-            alter_partition_reassignments_with_kcl(kcl,
-                                                   reassignments,
-                                                   user_cred=user_cred)
+            alter_partition_reassignments_with_kcl(kcl, reassignments)
             raise Exception(
-                f'AlterPartition with user {user_cred} passed. Expected fail.')
+                f'AlterPartition with user {username} passed. Expected fail.')
         except subprocess.CalledProcessError as e:
             if e.output.startswith("CLUSTER_AUTHORIZATION_FAILED"):
                 pass
@@ -553,9 +659,9 @@ class PartitionReassignmentsACLsTest(RedpandaTest):
 
         tps_to_list = {self.topic: [0]}
         try:
-            kcl.list_partition_reassignments(tps_to_list, user_cred=user_cred)
+            kcl.list_partition_reassignments(tps_to_list)
             raise Exception(
-                f'ListPartition with user {user_cred} passed. Expected fail.')
+                f'ListPartition with user {username} passed. Expected fail.')
         except subprocess.CalledProcessError as e:
             if e.output.startswith("CLUSTER_AUTHORIZATION_FAILED"):
                 pass
@@ -563,18 +669,12 @@ class PartitionReassignmentsACLsTest(RedpandaTest):
                 raise
 
         super_username, super_password, super_algorithm = self.redpanda.SUPERUSER_CREDENTIALS
-        user_cred = {
-            "user": super_username,
-            "passwd": super_password,
-            "method": super_algorithm.lower().replace('-', '_')
-        }
-        alter_partition_reassignments_with_kcl(kcl,
-                                               reassignments,
-                                               user_cred=user_cred)
+        method = super_algorithm.lower().replace('-', '_')
+        kcl = KCL(self.redpanda, super_username, super_password, method)
+        alter_partition_reassignments_with_kcl(kcl, reassignments)
 
         def reassignments_done():
-            responses = kcl.list_partition_reassignments(tps_to_list,
-                                                         user_cred=user_cred)
+            responses = kcl.list_partition_reassignments(tps_to_list)
             self.logger.debug(responses)
 
             # Any response means the reassignment is on-going, so before

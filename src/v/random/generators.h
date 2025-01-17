@@ -11,8 +11,8 @@
 
 #pragma once
 
-#include "bytes/bytes.h"
-#include "seastarx.h"
+#include "base/seastarx.h"
+#include "crypto/crypto.h"
 
 #include <seastar/core/sstring.hh>
 
@@ -31,19 +31,20 @@ inline std::random_device::result_type get_seed() {
 
 static const auto seed = get_seed();
 
-// NOLINTNEXTLINE
+// NOLINTBEGIN
 static thread_local std::default_random_engine gen(internal::seed);
+inline thread_local crypto::secure_private_rng secure_private_rng{};
+inline thread_local crypto::secure_public_rng secure_public_rng{};
+// NOLINTEND
 } // namespace internal
-
-bytes get_bytes(size_t n = 128 * 1024);
 
 /**
  * Random string generator. Total number of distinct values that may be
  * generated is unlimited (within all possible values of given size).
  */
-ss::sstring gen_alphanum_string(size_t n);
+ss::sstring gen_alphanum_string(size_t n, bool use_secure_rng = false);
 
-static constexpr size_t alphanum_max_distinct_strlen = 32;
+inline constexpr size_t alphanum_max_distinct_strlen = 32;
 /**
  * Random string generator that limits the maximum number of distinct values
  * that will be returned. That is, this function is a generator, which creates
@@ -54,10 +55,25 @@ static constexpr size_t alphanum_max_distinct_strlen = 32;
  */
 ss::sstring gen_alphanum_max_distinct(size_t max_cardinality);
 
-// Makes an random alphanumeric string, encoded in an iobuf.
-iobuf make_iobuf(size_t n = 128);
-
 void fill_buffer_randomchars(char* start, size_t amount);
+
+template<typename T>
+std::vector<T> randomized_range(T min, T max) {
+    std::vector<T> r(max - min);
+    std::iota(r.begin(), r.end(), min);
+    std::shuffle(r.begin(), r.end(), internal::gen);
+    return r;
+}
+
+template<typename T>
+T get_int_secure(bool use_private) {
+    std::uniform_int_distribution<T> dist;
+    if (use_private) {
+        return dist(internal::secure_private_rng);
+    } else {
+        return dist(internal::secure_public_rng);
+    }
+}
 
 template<typename T>
 T get_int() {
@@ -78,6 +94,12 @@ T get_int(T max) {
 
 template<typename T>
 const T& random_choice(const std::vector<T>& elements) {
+    auto idx = get_int<size_t>(0, elements.size() - 1);
+    return elements[idx];
+}
+
+template<typename T>
+T& random_choice(std::vector<T>& elements) {
     auto idx = get_int<size_t>(0, elements.size() - 1);
     return elements[idx];
 }

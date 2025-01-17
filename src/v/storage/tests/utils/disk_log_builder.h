@@ -10,18 +10,18 @@
  */
 
 #pragma once
+#include "base/seastarx.h"
+#include "base/units.h"
+#include "base/vassert.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/tests/random_batch.h"
 #include "random/generators.h"
-#include "seastarx.h"
 #include "ssx/sformat.h"
 #include "storage/api.h"
 #include "storage/disk_log_impl.h"
-#include "units.h"
-#include "vassert.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/sstring.hh>
@@ -32,12 +32,12 @@
 #include <vector>
 namespace storage {
 
-inline static ss::sstring random_dir() {
+static inline ss::sstring random_dir() {
     return ssx::sformat(
       "test.dir_{}", random_generators::gen_alphanum_string(7));
 }
 
-inline static log_config log_builder_config() {
+inline log_config log_builder_config() {
     return log_config(
       random_dir(),
       100_MiB,
@@ -45,21 +45,21 @@ inline static log_config log_builder_config() {
       storage::make_sanitized_file_config());
 }
 
-inline static log_reader_config reader_config() {
+inline log_reader_config reader_config() {
     return log_reader_config{
       model::offset(0),
       model::model_limits<model::offset>::max(),
       ss::default_priority_class()};
 }
 
-inline static log_append_config append_config() {
+inline log_append_config append_config() {
     return log_append_config{
       .should_fsync = storage::log_append_config::fsync::yes,
       .io_priority = ss::default_priority_class(),
       .timeout = model::no_timeout};
 }
 
-inline static model::ntp log_builder_ntp() {
+inline model::ntp log_builder_ntp() {
     return model::ntp(
       model::ns("test.log_builder"),
       model::topic(random_generators::gen_alphanum_string(8)),
@@ -132,7 +132,9 @@ public:
     using should_flush_after = ss::bool_class<struct flush_after_tag>;
     // Constructors
     explicit disk_log_builder(
-      storage::log_config config = log_builder_config());
+      storage::log_config config = log_builder_config(),
+      std::vector<model::record_batch_type> offset_translator_types = {},
+      raft::group_id group_id = raft::group_id{});
     ~disk_log_builder() noexcept = default;
     disk_log_builder(const disk_log_builder&) = delete;
     disk_log_builder& operator=(const disk_log_builder&) = delete;
@@ -302,12 +304,17 @@ public:
     ss::future<> truncate(model::offset);
     ss::future<> gc(
       model::timestamp collection_upper_bound,
-      std::optional<size_t> max_partition_retention_size);
+      std::optional<size_t> max_partition_retention_size,
+      std::optional<std::chrono::milliseconds> tombstone_retention_ms
+      = std::nullopt);
     ss::future<usage_report> disk_usage(
       model::timestamp collection_upper_bound,
       std::optional<size_t> max_partition_retention_size);
     ss::future<std::optional<model::offset>> apply_retention(gc_config cfg);
-    ss::future<> apply_compaction(
+    ss::future<> apply_adjacent_merge_compaction(
+      compaction_config cfg,
+      std::optional<model::offset> new_start_offset = std::nullopt);
+    ss::future<bool> apply_sliding_window_compaction(
       compaction_config cfg,
       std::optional<model::offset> new_start_offset = std::nullopt);
     ss::future<bool> update_start_offset(model::offset start_offset);
@@ -361,7 +368,7 @@ public:
 
     ss::future<> update_configuration(ntp_config::default_overrides o) {
         if (_log) {
-            return _log->update_configuration(o);
+            _log->set_overrides(o);
         }
 
         return ss::make_ready_future<>();
@@ -375,6 +382,10 @@ public:
     storage::api& storage() { return _storage; }
 
     void set_time(model::timestamp t) { _ts_cursor = t; }
+
+    ss::sharded<features::feature_table>& feature_table() {
+        return _feature_table;
+    }
 
 private:
     template<typename Consumer>
@@ -407,6 +418,8 @@ private:
     ss::logger _test_logger{"disk-log-test-logger"};
     ss::sharded<features::feature_table> _feature_table;
     storage::log_config _log_config;
+    std::vector<model::record_batch_type> _translator_batch_types;
+    raft::group_id _group_id;
     storage::api _storage;
     ss::shared_ptr<log> _log;
     size_t _bytes_written{0};

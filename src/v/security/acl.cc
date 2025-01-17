@@ -17,17 +17,51 @@
 #include <seastar/coroutine/maybe_yield.hh>
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/node_hash_map.h>
+#include <container/fragmented_vector.h>
 #include <fmt/format.h>
 
 namespace security {
 
-seastar::logger seclog("security");
+void acl_entry_set::insert(acl_entry entry) {
+    auto [it, ins] = _entries.insert(std::move(entry));
+    if (const auto& principal = it->principal();
+        ins && principal.type() == principal_type::role) {
+        _role_cache[principal.name_view()] += 1;
+    }
+}
+
+void acl_entry_set::remove_if_role(const acl_principal_base& p) {
+    if (p.type() != principal_type::role) {
+        return;
+    }
+    if (auto it = _role_cache.find(p.name_view()); it != _role_cache.end()) {
+        it->second -= 1;
+        vassert(
+          it->second >= 0,
+          "Role binding count unexpectedly < 0: {}",
+          it->second);
+        if (it->second == 0) {
+            _role_cache.erase(it);
+        }
+    }
+}
 
 std::optional<std::reference_wrapper<const acl_entry>> acl_entry_set::find(
   acl_operation operation,
-  const acl_principal& principal,
+  const acl_principal_base& principal,
   const acl_host& host,
   acl_permission perm) const {
+    // NOTE(oren): We don't allow wildcard roles, so we can short circuit on a
+    // straight name lookup here. This is advantageous because the common case
+    // for role-based authZ requires several ACL lookups (one for each role to
+    // which an authenticated principal belongs), each requiring linear work in
+    // the length of the target resource ACL set.
+    if (
+      principal.type() == principal_type::role
+      && !_role_cache.contains(principal.name_view())) {
+        return std::nullopt;
+    }
     for (const auto& entry : _entries) {
         if (entry.permission() != perm) {
             continue;
@@ -49,42 +83,48 @@ std::optional<std::reference_wrapper<const acl_entry>> acl_entry_set::find(
 }
 
 bool acl_matches::empty() const {
-    if (wildcards && !wildcards->get().empty()) {
+    if (wildcards && !wildcards->acl_entry_set.get().empty()) {
         return false;
     }
-    if (literals && !literals->get().empty()) {
+    if (literals && !literals->acl_entry_set.get().empty()) {
         return false;
     }
     return std::all_of(
-      prefixes.cbegin(), prefixes.cend(), [](const entry_set_ref& e) {
-          return e.get().empty();
+      prefixes.begin(), prefixes.end(), [](const entry_set_ref& e) {
+          return e.acl_entry_set.get().empty();
       });
 }
 
-bool acl_matches::contains(
+std::optional<security::acl_match> acl_matches::find(
   acl_operation operation,
-  const acl_principal& principal,
+  const acl_principal_base& principal,
   const acl_host& host,
   acl_permission perm) const {
     for (const auto& entries : prefixes) {
-        if (entries.get().contains(operation, principal, host, perm)) {
-            return true;
+        if (auto entry = entries.acl_entry_set.get().find(
+              operation, principal, host, perm);
+            entry.has_value()) {
+            return {{entries.resource, *entry}};
         }
     }
 
     if (wildcards) {
-        if (wildcards->get().contains(operation, principal, host, perm)) {
-            return true;
+        if (auto entry = wildcards->acl_entry_set.get().find(
+              operation, principal, host, perm);
+            entry.has_value()) {
+            return {{wildcards->resource, *entry}};
         }
     }
 
     if (literals) {
-        if (literals->get().contains(operation, principal, host, perm)) {
-            return true;
+        if (auto entry = literals->acl_entry_set.get().find(
+              operation, principal, host, perm);
+            entry.has_value()) {
+            return {{literals->resource, *entry}};
         }
     }
 
-    return false;
+    return std::nullopt;
 }
 
 acl_matches
@@ -96,7 +136,7 @@ acl_store::find(resource_type resource, const ss::sstring& name) const {
 
     opt_entry_set wildcards;
     if (const auto it = _acls.find(wildcard_pattern); it != _acls.end()) {
-        wildcards = it->second;
+        wildcards = {it->first, it->second};
     }
 
     const resource_pattern literal_pattern(
@@ -104,27 +144,11 @@ acl_store::find(resource_type resource, const ss::sstring& name) const {
 
     opt_entry_set literals;
     if (const auto it = _acls.find(literal_pattern); it != _acls.end()) {
-        literals = it->second;
+        literals = {it->first, it->second};
     }
 
-    /*
-     * the acls are sorted within (resource-type, pattern-type) bounds by name
-     * in reverse order so longer names (prefixes) appear first.
-     */
-    std::vector<acl_matches::entry_set_ref> prefixes;
-    {
-        auto it = _acls.lower_bound(
-          resource_pattern(resource, name, pattern_type::prefixed));
-
-        auto end = _acls.upper_bound(resource_pattern(
-          resource, name.substr(0, 1), pattern_type::prefixed));
-
-        for (; it != end; ++it) {
-            if (std::string_view(name).starts_with(it->first.name())) {
-                prefixes.emplace_back(it->second);
-            }
-        }
-    }
+    auto prefixes = get_prefix_view<acl_matches::entry_set_ref>(
+      _acls, resource, name);
 
     return acl_matches(wildcards, literals, std::move(prefixes));
 }
@@ -165,7 +189,12 @@ std::vector<std::vector<acl_binding>> acl_store::remove_bindings(
     }
 
     // deleted binding index of deleted filter that matched
-    absl::flat_hash_map<acl_binding, size_t> deleted;
+    // NOTE: the algorithm below requires pointer stability of the key
+    absl::node_hash_map<acl_binding, size_t> deleted;
+    // NOTE(oren): deleted bindings are held in this scope, so
+    // non-owning references are safe to use as long as they are
+    // accessed exclusively inside the loop body.
+    chunked_vector<acl_principal_view> maybe_roles;
 
     for (const auto& resources_it : resources) {
         // structured binding in for-range prevents capturing reference to
@@ -182,16 +211,27 @@ std::vector<std::vector<acl_binding>> acl_store::remove_bindings(
         // remove matching entries and track the deleted binding along with the
         // index of the filter that matched the entry.
         it->second.erase_if(
-          [&filters, &resource, &deleted, dry_run](const acl_entry& entry) {
+          [&filters, &resource, &deleted, &maybe_roles, dry_run](
+            const acl_entry& entry) {
               for (const auto& filter : filters) {
                   if (filter.first.entry().matches(entry)) {
                       auto binding = acl_binding(resource, entry);
-                      deleted.emplace(binding, filter.second);
+                      auto [it, _] = deleted.emplace(binding, filter.second);
+                      if (const auto& p = it->first.entry().principal();
+                          !dry_run && p.type() == principal_type::role) {
+                          maybe_roles.emplace_back(p);
+                      }
                       return !dry_run;
                   }
               }
               return false;
           });
+        for (const auto& principal : maybe_roles) {
+            it->second.remove_if_role(principal);
+        }
+        // ensure that elements won't outlive the corresponding bindings
+        // in enclosing scope.
+        maybe_roles.clear();
     }
 
     std::vector<std::vector<acl_binding>> res;
@@ -311,12 +351,16 @@ std::ostream& operator<<(std::ostream& os, principal_type type) {
         return os << "user";
     case principal_type::ephemeral_user:
         return os << "ephemeral user";
+    case principal_type::role:
+        return os << "role";
     }
     __builtin_unreachable();
 }
 
-std::ostream& operator<<(std::ostream& os, const acl_principal& principal) {
-    fmt::print(os, "{{type {} name {}}}", principal._type, principal._name);
+std::ostream&
+operator<<(std::ostream& os, const acl_principal_base& principal) {
+    fmt::print(
+      os, "type {{{}}} name {{{}}}", principal.type(), principal.name_view());
     return os;
 }
 
@@ -485,7 +529,7 @@ bool resource_pattern_filter::matches(const resource_pattern& pattern) const {
 void read_nested(
   iobuf_parser& in,
   resource_pattern_filter& filter,
-  size_t const bytes_left_limit) {
+  const size_t bytes_left_limit) {
     using serde::read_nested;
 
     read_nested(in, filter._resource, bytes_left_limit);

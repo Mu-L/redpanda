@@ -9,10 +9,12 @@
  * by the Apache License, Version 2.0
  */
 
+#include "cluster/feature_update_action.h"
 #include "features/feature_table.h"
 #include "features/feature_table_snapshot.h"
+#include "model/timestamp.h"
+#include "security/license.h"
 #include "test_utils/fixture.h"
-#include "vlog.h"
 
 #include <seastar/core/sleep.hh>
 #include <seastar/testing/thread_test_case.hh>
@@ -79,10 +81,7 @@ SEASTAR_THREAD_TEST_CASE(feature_table_test_hook_off) {
 SEASTAR_THREAD_TEST_CASE(feature_table_strings) {
     BOOST_REQUIRE_EQUAL(to_string_view(feature::test_alpha), mock_feature);
     BOOST_REQUIRE_EQUAL(
-      to_string_view(feature::rpc_v2_by_default), "rpc_v2_by_default");
-    BOOST_REQUIRE_EQUAL(to_string_view(feature::kafka_gssapi), "kafka_gssapi");
-    BOOST_REQUIRE_EQUAL(
-      to_string_view(feature::node_isolation), "node_isolation");
+      to_string_view(feature::audit_logging), "audit_logging");
 }
 
 /**
@@ -122,10 +121,10 @@ FIXTURE_TEST(feature_table_basic, feature_table_fixture) {
       ft.get_state(feature::test_alpha).get_state()
       == feature_state::state::unavailable);
 
-    // The dummy test features requires version 2001.  The feature
+    // The dummy test features requires version TEST_VERSION. The feature
     // should go available, but not any further: the feature table
     // relies on external stimulus to actually activate features.
-    set_active_version(cluster_version{2001});
+    set_active_version(TEST_VERSION);
 
     BOOST_REQUIRE(
       ft.get_state(feature::test_alpha).get_state()
@@ -275,7 +274,7 @@ FIXTURE_TEST(feature_uniqueness, feature_table_fixture) {
  * but also activates elegible features.
  */
 FIXTURE_TEST(feature_table_bootstrap, feature_table_fixture) {
-    bootstrap_active_version(cluster_version{2001});
+    bootstrap_active_version(TEST_VERSION);
 
     // A non-auto-activating feature should remain in available state:
     // explicit_only features always require explicit activation, even
@@ -313,7 +312,7 @@ FIXTURE_TEST(feature_table_old_snapshot, feature_table_fixture) {
     snapshot.version = features::feature_table::get_earliest_logical_version();
     snapshot.states = {
       features::feature_state_snapshot{
-        .name = "serde_raft_0",
+        .name = "audit_logging",
         .state = feature_state::state::available,
       },
       features::feature_state_snapshot{
@@ -326,11 +325,136 @@ FIXTURE_TEST(feature_table_old_snapshot, feature_table_fixture) {
 
     // Fast-forwarded feature should still be active.
     BOOST_CHECK(
-      ft.get_state(feature::serde_raft_0).get_state()
+      ft.get_state(feature::audit_logging).get_state()
       == feature_state::state::active);
     // A feature with explicit available_policy should be activated by the
     // snapshot.
     BOOST_CHECK(
       ft.get_state(feature::test_alpha).get_state()
       == feature_state::state::active);
+}
+
+// Test that applying an old snapshot disables features that we only enabled in
+// this version.
+FIXTURE_TEST(feature_table_old_snapshot_missing, feature_table_fixture) {
+    bootstrap_active_version(TEST_VERSION);
+
+    features::feature_table_snapshot snapshot;
+    snapshot.version = cluster::cluster_version{ft.get_active_version() - 1};
+    snapshot.states = {};
+    snapshot.apply(ft);
+
+    // A feature with explicit available_policy should be activated by the
+    // snapshot.
+    BOOST_CHECK(
+      ft.get_state(feature::test_alpha).get_state()
+      == feature_state::state::unavailable);
+}
+
+// Test that applying a snapshot of the same version with a missing feature
+// enables it, as we assume it was retired in the next version.
+FIXTURE_TEST(feature_table_new_snapshot_missing, feature_table_fixture) {
+    bootstrap_active_version(TEST_VERSION);
+
+    features::feature_table_snapshot snapshot;
+    snapshot.version = cluster::cluster_version{ft.get_active_version()};
+    snapshot.states = {};
+    snapshot.apply(ft);
+
+    // A feature with explicit available_policy should be activated by the
+    // snapshot.
+    BOOST_CHECK(
+      ft.get_state(feature::test_alpha).get_state()
+      == feature_state::state::active);
+}
+
+FIXTURE_TEST(feature_table_trial_license_test, feature_table_fixture) {
+    const char* sample_valid_license = std::getenv("REDPANDA_SAMPLE_LICENSE");
+    if (sample_valid_license == nullptr) {
+        const char* is_on_ci = std::getenv("CI");
+        BOOST_TEST_REQUIRE(
+          !is_on_ci,
+          "Expecting the REDPANDA_SAMPLE_LICENSE env var in the CI "
+          "enviornment");
+        return;
+    }
+    const ss::sstring license_str{sample_valid_license};
+    const auto license = security::make_license(license_str);
+
+    auto expired_license = license;
+    expired_license.expiry = 0s;
+
+    BOOST_CHECK_EQUAL(ft.get_license().has_value(), false);
+    BOOST_CHECK_EQUAL(ft.should_sanction(), false);
+
+    ft.set_builtin_trial_license(model::timestamp::now());
+    BOOST_CHECK_EQUAL(ft.get_license().has_value(), true);
+    BOOST_CHECK_EQUAL(ft.get_license()->is_expired(), false);
+    BOOST_CHECK_EQUAL(ft.should_sanction(), false);
+
+    ft.set_license(expired_license);
+    BOOST_CHECK_EQUAL(ft.get_license().has_value(), true);
+    BOOST_CHECK_EQUAL(ft.get_license()->is_expired(), true);
+    BOOST_CHECK_EQUAL(ft.should_sanction(), true);
+
+    ft.set_license(license);
+    BOOST_CHECK_EQUAL(ft.get_license().has_value(), true);
+    BOOST_CHECK_EQUAL(ft.get_license()->is_expired(), false);
+    BOOST_CHECK_EQUAL(ft.should_sanction(), false);
+
+    ft.revoke_license();
+    BOOST_CHECK_EQUAL(ft.get_license().has_value(), false);
+    BOOST_CHECK_EQUAL(ft.should_sanction(), true);
+}
+
+SEASTAR_THREAD_TEST_CASE(feature_table_probe_expiry_metric_test) {
+    using ft = features::feature_table;
+    const char* sample_valid_license = std::getenv("REDPANDA_SAMPLE_LICENSE");
+    if (sample_valid_license == nullptr) {
+        const char* is_on_ci = std::getenv("CI");
+        BOOST_TEST_REQUIRE(
+          !is_on_ci,
+          "Expecting the REDPANDA_SAMPLE_LICENSE env var in the CI "
+          "enviornment");
+        return;
+    }
+    const ss::sstring license_str{sample_valid_license};
+    const auto license = security::make_license(license_str);
+
+    auto expiry = security::license::clock::time_point{4813252273s};
+
+    BOOST_CHECK_EQUAL(ft::calculate_expiry_metric(license, expiry - 1s), 1);
+    BOOST_CHECK_EQUAL(ft::calculate_expiry_metric(license, expiry), 0);
+    BOOST_CHECK_EQUAL(ft::calculate_expiry_metric(license, expiry + 1s), 0);
+    BOOST_CHECK_EQUAL(ft::calculate_expiry_metric(std::nullopt), -1);
+}
+
+SEASTAR_THREAD_TEST_CASE(is_major_version_upgrade_test) {
+    BOOST_CHECK(!is_major_version_upgrade(
+      to_cluster_version(release_version::v22_1_1),
+      to_cluster_version(release_version::v22_1_1)));
+    BOOST_CHECK(!is_major_version_upgrade(
+      to_cluster_version(release_version::v22_1_1),
+      to_cluster_version(release_version::v22_1_5)));
+    BOOST_CHECK(is_major_version_upgrade(
+      to_cluster_version(release_version::v22_1_1),
+      to_cluster_version(release_version::v22_2_1)));
+    BOOST_CHECK(is_major_version_upgrade(
+      to_cluster_version(release_version::v22_1_5),
+      to_cluster_version(release_version::v22_2_1)));
+    BOOST_CHECK(!is_major_version_upgrade(
+      to_cluster_version(release_version::v22_3_1),
+      to_cluster_version(release_version::v22_1_1)));
+    BOOST_CHECK(is_major_version_upgrade(
+      cluster::cluster_version{2},
+      to_cluster_version(release_version::v22_3_1)));
+    BOOST_CHECK(is_major_version_upgrade(
+      cluster::cluster_version{-1},
+      to_cluster_version(release_version::v22_3_1)));
+    BOOST_CHECK(is_major_version_upgrade(
+      to_cluster_version(release_version::MAX),
+      cluster::cluster_version{
+        static_cast<std::underlying_type_t<release_version>>(
+          release_version::MAX)
+        + 1}));
 }

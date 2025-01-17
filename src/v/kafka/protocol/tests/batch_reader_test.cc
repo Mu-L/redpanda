@@ -15,12 +15,12 @@
 #include "kafka/protocol/kafka_batch_adapter.h"
 #include "model/fundamental.h"
 #include "model/tests/random_batch.h"
-#include "redpanda/tests/fixture.h"
 
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/sstring.hh>
+#include <seastar/testing/thread_test_case.hh>
 
-#include <boost/test/tools/old/interface.hpp>
+#include <boost/test/unit_test.hpp>
 
 #include <iterator>
 #include <type_traits>
@@ -32,7 +32,8 @@ struct context {
 };
 
 context make_context(model::offset base_offset, size_t batch_count) {
-    auto input = model::test::make_random_batches(base_offset, batch_count);
+    auto input
+      = model::test::make_random_batches(base_offset, batch_count).get();
     BOOST_REQUIRE(!input.empty());
     const auto last_offset = input.back().last_offset();
 

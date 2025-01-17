@@ -30,8 +30,9 @@ KDC_CONF_PATH = "/etc/krb5kdc/kdc.conf"
 
 KRB5_CONF_TMPL = """
 [libdefaults]
-	default_realm = {realm}
-	dns_canonicalize_hostname = false
+    default_realm = {realm}
+    dns_canonicalize_hostname = false
+    permitted_enctypes = {permitted_enctypes}
 
 [realms]
 	{realm} = {{
@@ -66,6 +67,36 @@ sasl.jaas.config=com.sun.security.auth.module.Krb5LoginModule required \
     useTicketCache=false;
 """
 
+PRODUCER_SCRIPT = """
+from confluent_kafka import Producer
+import time
+from ducktape.utils.util import wait_until
+
+if __name__ == '__main__':
+    producer_conf = dict([
+        ('bootstrap.servers','{bootstrap_servers}'),
+        ('sasl.mechanism','GSSAPI'),
+        ('security.protocol','SASL_PLAINTEXT'),
+        ('sasl.kerberos.service.name','{broker_principal}'),
+        ('sasl.kerberos.principal','{user_principal}'),
+        ('sasl.kerberos.keytab','{user_secret}'),
+    ])
+    producer = Producer(producer_conf)
+    producer.poll(1.0)
+
+    expected_topics = set(['{topic}'])
+    wait_until(lambda: set(producer.list_topics(timeout=5).topics.keys())
+               == expected_topics,
+               timeout_sec=5)
+
+    for i in range(0, {n}):
+        producer.poll(0.0)
+        producer.produce(topic='{topic}', value='foo')
+        time.sleep({interval})
+    producer.flush(timeout=2)
+    print('DONE')
+"""
+
 
 class AuthenticationError(Exception):
     def __init__(self, message):
@@ -75,8 +106,10 @@ class AuthenticationError(Exception):
         return repr(self.message)
 
 
-def render_krb5_config(kdc_node, realm: str):
-    return KRB5_CONF_TMPL.format(node=kdc_node, realm=realm)
+def render_krb5_config(kdc_node, realm: str, permitted_enctypes: str):
+    return KRB5_CONF_TMPL.format(node=kdc_node,
+                                 realm=realm,
+                                 permitted_enctypes=permitted_enctypes)
 
 
 def render_remote_kadmin_command(command,
@@ -131,7 +164,8 @@ class KrbKdc(Service):
     def __init__(self, context, realm="example.com", log_level="DEBUG"):
         super(KrbKdc, self).__init__(context, num_nodes=1)
         self.realm = realm
-        self.supported_encryption_types = "aes256-cts-hmac-sha1-96:normal"
+        self.supported_encryption_types = "aes256-cts-hmac-sha384-192:normal"
+        self.permitted_enctypes = "aes256-cts-hmac-sha384-192"
         self.kadmin_principal = "kadmin/admin"
         self.kadmin_password = "adminpassword"
         self.kadm5_acl_path = KADM5_ACL_PATH
@@ -140,7 +174,10 @@ class KrbKdc(Service):
         self.log_level = log_level
 
     def _render_cfg(self, node):
-        tmpl = KRB5_CONF_TMPL.format(node=node, realm=self.realm)
+        tmpl = KRB5_CONF_TMPL.format(
+            node=node,
+            realm=self.realm,
+            permitted_enctypes=self.permitted_enctypes)
         self.logger.info(f"{self.krb5_conf_path}: {tmpl}")
         node.account.create_file(self.krb5_conf_path, tmpl)
 
@@ -317,6 +354,7 @@ class KrbClient(Service):
         self.redpanda = redpanda
         self.krb5_conf_path = KRB5_CONF_PATH
         self.keytab_file = DEFAULT_KEYTAB_FILE
+        self.permitted_enctypes = self.kdc.permitted_enctypes
 
     def _form_kadmin_command(self,
                              command,
@@ -367,8 +405,10 @@ class KrbClient(Service):
 
     def start_node(self, node, **kwargs):
         self.logger.debug(f"Generating KRB5 config file for {node.name}")
-        krb5_config = render_krb5_config(kdc_node=self.kdc.nodes[0],
-                                         realm=self.kdc.realm)
+        krb5_config = render_krb5_config(
+            kdc_node=self.kdc.nodes[0],
+            realm=self.kdc.realm,
+            permitted_enctypes=self.permitted_enctypes)
         self.logger.debug(f"KRB5 config to {KRB5_CONF_PATH}: {krb5_config}")
         node.account.create_file(KRB5_CONF_PATH, krb5_config)
 
@@ -404,6 +444,36 @@ class KrbClient(Service):
                 combine_stderr=False)
             self.logger.debug(f"Metadata request: {res}")
             return json.loads(res)
+        except RemoteCommandError as err:
+            if b'No Kerberos credentials available' in err.msg:
+                raise AuthenticationError(err.msg) from err
+            raise
+
+    # produce num junk records to the given topic at a given interval
+    def produce(self,
+                principal: str,
+                topic: str,
+                num: int = 100,
+                interval_s: float = 0.1):
+        self.logger.debug(f"Produce for {num * interval_s}s")
+        producer = PRODUCER_SCRIPT.format(
+            bootstrap_servers=self.redpanda.brokers(
+                listener='kerberoslistener'),
+            broker_principal='redpanda',
+            user_principal=principal,
+            user_secret=self.keytab_file,
+            n=num,
+            interval=interval_s,
+            topic=topic)
+        self.nodes[0].account.ssh(cmd=f'echo "{producer}" > /tmp/produce.py ',
+                                  allow_fail=False)
+        try:
+            res = self.nodes[0].account.ssh_output(
+                cmd=f'python3 /tmp/produce.py',
+                allow_fail=False,
+                combine_stderr=False)
+            self.logger.debug(f"Produce request: {res}")
+            return res
         except RemoteCommandError as err:
             if b'No Kerberos credentials available' in err.msg:
                 raise AuthenticationError(err.msg) from err
@@ -466,6 +536,7 @@ class RedpandaKerberosNode(RedpandaService):
         self.realm = realm
         self.keytab_file = keytab_file
         self.krb5_conf_path = krb5_conf_path
+        self.permitted_enctypes = self.kdc.permitted_enctypes
 
     def clean_node(self, node, **kwargs):
         super().clean_node(node, **kwargs)
@@ -477,8 +548,10 @@ class RedpandaKerberosNode(RedpandaService):
         self.logger.debug(
             f"Rendering KRB5 config for {node.name} using KDC node {self.kdc.nodes[0].name}"
         )
-        krb5_config = render_krb5_config(kdc_node=self.kdc.nodes[0],
-                                         realm=self.kdc.realm)
+        krb5_config = render_krb5_config(
+            kdc_node=self.kdc.nodes[0],
+            realm=self.kdc.realm,
+            permitted_enctypes=self.permitted_enctypes)
         self.logger.debug(
             f"KRB5 config to {self.krb5_conf_path}: {krb5_config}")
         node.account.ssh(f"mkdir -p {os.path.dirname(self.krb5_conf_path)}")

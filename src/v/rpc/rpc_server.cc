@@ -9,6 +9,7 @@
 
 #include "rpc/rpc_server.h"
 
+#include "config/configuration.h"
 #include "rpc/logger.h"
 #include "rpc/types.h"
 #include "ssx/semaphore.h"
@@ -75,8 +76,10 @@ ss::future<> rpc_server::apply(ss::lw_shared_ptr<net::connection> conn) {
 
 ss::future<>
 rpc_server::send_reply(ss::lw_shared_ptr<server_context_impl> ctx, netbuf buf) {
-    buf.set_min_compression_bytes(reply_min_compression_bytes);
-    buf.set_compression(rpc::compression_type::zstd);
+    if (config::shard_local_cfg().rpc_server_compress_replies()) {
+        buf.set_min_compression_bytes(reply_min_compression_bytes);
+        buf.set_compression(rpc::compression_type::zstd);
+    }
     buf.set_correlation_id(ctx->get_header().correlation_id);
 
     auto view = co_await std::move(buf).as_scattered();
@@ -164,7 +167,7 @@ ss::future<> rpc_server::dispatch_method_once(
               if (unlikely(it == _services.end())) {
                   ss::sstring msg_suffix;
                   rpc::status s = rpc::status::method_not_found;
-                  if (!_all_services_added && _service_unavailable_allowed) {
+                  if (!_all_services_added) {
                       msg_suffix = " during startup. Ignoring...";
                       s = rpc::status::service_unavailable;
                   }
@@ -193,12 +196,16 @@ ss::future<> rpc_server::dispatch_method_once(
               method* m = it->get()->method_from_id(method_id);
 
               return m->handle(ctx->conn->input(), *ctx)
-                .then_wrapped([this, ctx, m, l = hist().auto_measure()](
+                .then_wrapped([this,
+                               ctx,
+                               m,
+                               method_id,
+                               l = hist().auto_measure()](
                                 ss::future<netbuf> fut) mutable {
                     bool error = true;
                     netbuf reply_buf;
                     try {
-                        reply_buf = fut.get0();
+                        reply_buf = fut.get();
                         reply_buf.set_status(rpc::status::success);
                         error = false;
                     } catch (const rpc_internal_body_parsing_exception& e) {
@@ -210,38 +217,49 @@ ss::future<> rpc_server::dispatch_method_once(
                         ctx->pr.set_exception(e);
                         return ss::now();
                     } catch (const ss::timed_out_error& e) {
-                        rpclog.debug("Timing out request on timed_out_error "
-                                     "(shutting down)");
+                        vlog(
+                          rpclog.debug,
+                          "Timing out request on timed_out_error "
+                          "(shutting down)");
                         reply_buf.set_status(rpc::status::request_timeout);
                     } catch (const ss::condition_variable_timed_out& e) {
-                        rpclog.debug(
+                        vlog(
+                          rpclog.debug,
                           "Timing out request on condition_variable_timed_out");
                         reply_buf.set_status(rpc::status::request_timeout);
                     } catch (const ss::gate_closed_exception& e) {
                         // gate_closed is typical during shutdown.  Treat
                         // it like a timeout: request was not erroneous
                         // but we will not give a rseponse.
-                        rpclog.debug(
+                        vlog(
+                          rpclog.debug,
                           "Timing out request on gate_closed_exception "
                           "(shutting down)");
                         reply_buf.set_status(rpc::status::request_timeout);
                     } catch (const ss::broken_condition_variable& e) {
-                        rpclog.debug(
+                        vlog(
+                          rpclog.debug,
                           "Timing out request on broken_condition_variable "
                           "(shutting down)");
                         reply_buf.set_status(rpc::status::request_timeout);
                     } catch (const ss::abort_requested_exception& e) {
-                        rpclog.debug(
+                        vlog(
+                          rpclog.debug,
                           "Timing out request on abort_requested_exception "
                           "(shutting down)");
                         reply_buf.set_status(rpc::status::request_timeout);
                     } catch (const ss::broken_semaphore& e) {
-                        rpclog.debug("Timing out request on broken_semaphore "
-                                     "(shutting down)");
+                        vlog(
+                          rpclog.debug,
+                          "Timing out request on broken_semaphore "
+                          "(shutting down)");
                         reply_buf.set_status(rpc::status::request_timeout);
                     } catch (...) {
-                        rpclog.error(
-                          "Service handler threw an exception: {}",
+                        vlog(
+                          rpclog.error,
+                          "Service handler for method {} threw an exception: "
+                          "{}",
+                          method_id,
                           std::current_exception());
                         probe().service_error();
                         reply_buf.set_status(rpc::status::server_error);
@@ -268,7 +286,7 @@ ss::future<> rpc_server::dispatch_method_once(
                 });
           })
           .handle_exception([](const std::exception_ptr& e) {
-              rpclog.error("Error dispatching: {}", e);
+              vlog(rpclog.error, "Error dispatching: {}", e);
           });
 
     return fut;

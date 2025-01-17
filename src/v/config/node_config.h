@@ -9,13 +9,16 @@
 
 #pragma once
 
+#include "config/bounded_property.h"
 #include "config/broker_authn_endpoint.h"
 #include "config/broker_endpoint.h"
 #include "config/convert.h"
 #include "config/data_directory_path.h"
+#include "config/node_overrides.h"
 #include "config/property.h"
 #include "config/seed_server.h"
 #include "config_store.h"
+#include "model/fundamental.h"
 
 #include <algorithm>
 #include <iterator>
@@ -51,6 +54,9 @@ public:
     // Coproc/wasm
     deprecated_property coproc_supervisor_server;
 
+    // Data transforms
+    property<bool> emergency_disable_data_transforms;
+
     // HTTP server content dirs
     property<ss::sstring> admin_api_doc_dir;
     deprecated_property dashboard_dir;
@@ -58,9 +64,13 @@ public:
     // Shadow indexing/S3 cache location
     property<std::optional<ss::sstring>> cloud_storage_cache_directory;
 
+    // Path to store inventory file hashes for cloud storage scrubber
+    property<std::optional<ss::sstring>> cloud_storage_inventory_hash_store;
+
     deprecated_property enable_central_config;
 
     property<std::optional<uint32_t>> crash_loop_limit;
+    property<std::optional<std::chrono::seconds>> crash_loop_sleep_sec;
 
     // If true, permit any version of redpanda to start, even
     // if potentially incompatible with existing system state.
@@ -71,9 +81,28 @@ public:
     // to the configuration at `storage_failure_injection_config_path`.
     property<bool> storage_failure_injection_enabled;
 
+    // If true, start redpanda in "metadata only" mode, skipping loading
+    // user partitions and allowing only metadata operations.
+    property<bool> recovery_mode_enabled;
+
     // Path to the configuration file for low level storage failure injection.
     property<std::optional<std::filesystem::path>>
       storage_failure_injection_config_path;
+
+    // Timeout upper-bound for setting verbose (>=DEBUG) logging.
+    bounded_property<std::optional<std::chrono::seconds>>
+      verbose_logging_timeout_sec_max;
+
+    // Flag indicating whether or not Redpanda will start in FIPS mode
+    enum_property<fips_mode_flag> fips_mode;
+
+    // Path to the OpenSSL config file
+    property<std::optional<std::filesystem::path>> openssl_config_file;
+
+    // Path to the directory that holds the OpenSSL FIPS module
+    property<std::optional<std::filesystem::path>> openssl_module_directory;
+
+    property<std::vector<config::node_id_override>> node_id_overrides;
 
     // build pidfile path: `<data_directory>/pid.lock`
     std::filesystem::path pidfile_path() const {
@@ -88,6 +117,11 @@ public:
         return data_directory().path / "syschecks";
     }
 
+    // This file tracks the metadata needed to detect crash loops
+    std::filesystem::path crash_loop_tracker_path() const {
+        return data_directory().path / "startup_log";
+    }
+
     /**
      * Return the configured cache path if set, otherwise a default
      * path within the data directory.
@@ -98,6 +132,14 @@ public:
         } else {
             return data_directory().path / "cloud_storage_cache";
         }
+    }
+
+    std::filesystem::path cloud_storage_inventory_hash_path() const {
+        if (cloud_storage_inventory_hash_store().has_value()) {
+            return std::filesystem::path{
+              cloud_storage_inventory_hash_store().value()};
+        }
+        return data_directory().path / "cloud_storage_inventory";
     }
 
     std::vector<model::broker_endpoint> advertised_kafka_api() const {
@@ -129,12 +171,12 @@ public:
     node_config() noexcept;
     error_map_t load(const YAML::Node& root_node);
     error_map_t load(
-      std::filesystem::path const& loaded_from, const YAML::Node& root_node) {
+      const std::filesystem::path& loaded_from, const YAML::Node& root_node) {
         _cfg_file_path = loaded_from;
         return load(root_node);
     }
 
-    std::filesystem::path const& get_cfg_file_path() const {
+    const std::filesystem::path& get_cfg_file_path() const {
         return _cfg_file_path;
     }
 

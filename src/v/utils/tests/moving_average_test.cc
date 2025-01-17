@@ -1,7 +1,9 @@
-#include "seastarx.h"
+#define BOOST_TEST_MODULE utils
+
+#include "base/seastarx.h"
+#include "base/vassert.h"
+#include "base/vlog.h"
 #include "utils/moving_average.h"
-#include "vassert.h"
-#include "vlog.h"
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/util/log.hh>

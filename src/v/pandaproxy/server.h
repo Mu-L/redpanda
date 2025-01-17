@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "config/config_store.h"
+#include "base/seastarx.h"
 #include "config/rest_authn_endpoint.h"
 #include "hashing/jump_consistent_hash.h"
 #include "hashing/xx.h"
@@ -19,13 +19,14 @@
 #include "pandaproxy/json/types.h"
 #include "pandaproxy/kafka_client_cache.h"
 #include "pandaproxy/types.h"
-#include "seastarx.h"
-#include "utils/request_auth.h"
+#include "security/request_auth.h"
+#include "utils/adjustable_semaphore.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sstring.hh>
 #include <seastar/http/api_docs.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/httpd.hh>
@@ -40,6 +41,8 @@
 
 namespace pandaproxy {
 
+class server_probe;
+
 inline ss::shard_id user_shard(const ss::sstring& name) {
     auto hash = xxhash_64(name.data(), name.length());
     return jump_consistent_hash(hash, ss::smp::count);
@@ -53,7 +56,7 @@ concept KafkaRequestType = std::same_as<T, typename T::api_type::request_type>;
 template<typename F>
 concept KafkaRequestFactory = KafkaRequestType<std::invoke_result_t<F>>;
 
-ss::shard_id inline consumer_shard(const kafka::group_id& g_id) {
+inline ss::shard_id consumer_shard(const kafka::group_id& g_id) {
     auto hash = xxhash_64(g_id().data(), g_id().length());
     return jump_consistent_hash(hash, ss::smp::count);
 }
@@ -69,7 +72,10 @@ class server {
 public:
     struct context_t {
         std::vector<net::unresolved_address> advertised_listeners;
+        size_t max_memory;
         ssx::semaphore& mem_sem;
+        size_t max_inflight;
+        adjustable_semaphore& inflight_sem;
         ss::abort_source as;
         ss::smp_service_group smp_sg;
     };
@@ -102,9 +108,9 @@ public:
     };
 
     server() = delete;
-    ~server() = default;
+    ~server() noexcept;
     server(const server&) = delete;
-    server(server&&) noexcept = default;
+    server(server&&) noexcept = delete;
     server& operator=(const server&) = delete;
     server& operator=(server&&) = delete;
 
@@ -134,6 +140,7 @@ private:
     bool _has_routes;
     context_t& _ctx;
     json::serialization_format _exceptional_mime_type;
+    std::unique_ptr<server_probe> _probe;
 };
 
 template<typename service_t>
@@ -222,7 +229,7 @@ public:
         }
 
         template<std::invocable<kafka::client::client&> Func>
-        auto dispatch(kafka::group_id const& group_id, Func&& func) {
+        auto dispatch(const kafka::group_id& group_id, Func&& func) {
             switch (authn_method) {
             case config::rest_authn_method::none: {
                 return service().client().invoke_on(

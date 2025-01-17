@@ -31,11 +31,13 @@ rp_test(
     timequery_test.cc
     kvstore_test.cc
     backlog_controller_test.cc
-    readers_cache_test.cc
     concat_segment_reader_test.cc
     offset_to_filepos_test.cc
     offset_translator_state_test.cc
     file_sanitizer_test.cc
+    compaction_reducer_test.cc
+    batch_consumer_utils_test.cc
+    compaction_fuzz_test.cc
   LIBRARIES v::seastar_testing_main v::storage_test_utils v::model_test_utils
   LABELS storage
   ARGS "-- -c 1"
@@ -50,6 +52,15 @@ rp_test(
         LIBRARIES v::seastar_testing_main v::storage_test_utils v::model_test_utils
         LABELS storage
         ARGS "-- -c 1"
+)
+
+rp_test(
+  UNIT_TEST
+  BINARY_NAME test_offset_translator
+  SOURCES offset_translator_tests.cc
+  LIBRARIES v::seastar_testing_main v::storage_test_utils
+  LABELS kafka
+  ARGS "-- -c 8"
 )
 
 # Putting this first, last, or in the middle of the other single thread tests
@@ -104,19 +115,69 @@ rp_test(
   BENCHMARK_TEST
   BINARY_NAME storage
   SOURCES compaction_idx_bench.cc
-  LIBRARIES Seastar::seastar_perf_testing v::storage
+  LIBRARIES Seastar::seastar_perf_testing v::storage v::bytes_random
   LABELS storage
 )
 
 set (fixture_srcs
-  storage_e2e_fixture_test.cc)
+  storage_e2e_fixture_test.cc
+  compaction_e2e_multinode_test.cc)
 
 rp_test(
   FIXTURE_TEST
   BINARY_NAME storage_e2e
   SOURCES ${fixture_srcs}
-  LIBRARIES v::seastar_testing_main v::application v::raft v::config v::kafka_test_utils
+  LIBRARIES v::seastar_testing_main v::application v::raft v::config v::kafka_test_utils v::model_test_utils
   ARGS "-- -c 1"
   LABELS storage
 )
 
+rp_test(
+  UNIT_TEST
+  GTEST
+  BINARY_NAME key_offset_map
+  SOURCES
+    key_offset_map_test.cc
+  LIBRARIES
+    v::gtest_main
+    v::storage
+  ARGS "-- -c 1"
+  LABELS storage
+)
+
+rp_test(
+  UNIT_TEST
+  GTEST
+  BINARY_NAME gtest_storage
+  SOURCES
+    scoped_file_tracker_test.cc
+    segment_deduplication_test.cc
+    readers_cache_test.cc
+  LIBRARIES  v::storage v::storage_test_utils v::gtest_main
+  LABELS storage
+  ARGS "-- -c 1"
+)
+
+rp_test(
+  FIXTURE_TEST
+  GTEST
+  BINARY_NAME gtest_storage_e2e
+  SOURCES compaction_e2e_test.cc
+  LIBRARIES  v::application v::features v::gtest_main v::kafka_test_utils
+  LABELS storage
+  ARGS "-- -c 1"
+)
+
+
+rp_test(
+  UNIT_TEST
+  GTEST
+  BINARY_NAME segment_offset_tracker
+  SOURCES
+  segment_offset_tracker_test.cc
+  LIBRARIES
+    v::gtest_main
+    v::storage
+  ARGS "-- -c 1"
+  LABELS storage
+)

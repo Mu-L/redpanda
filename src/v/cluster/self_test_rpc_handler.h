@@ -11,9 +11,8 @@
 
 #pragma once
 
-#include "cluster/self_test_backend.h"
+#include "cluster/fwd.h"
 #include "cluster/self_test_rpc_service.h"
-#include "cluster/self_test_rpc_types.h"
 
 namespace cluster {
 
@@ -25,16 +24,16 @@ public:
       ss::sharded<self_test_backend>&);
 
     ss::future<get_status_response>
-    start_test(start_test_request&&, rpc::streaming_context&) final;
+    start_test(start_test_request, rpc::streaming_context&) final;
 
     ss::future<get_status_response>
-    stop_test(empty_request&&, rpc::streaming_context&) final;
+    stop_test(empty_request, rpc::streaming_context&) final;
 
     ss::future<get_status_response>
-    get_status(empty_request&&, rpc::streaming_context&) final;
+    get_status(empty_request, rpc::streaming_context&) final;
 
     ss::future<netcheck_response>
-    netcheck(netcheck_request&&, rpc::streaming_context&) final;
+    netcheck(netcheck_request, rpc::streaming_context&) final;
 
 private:
     ss::sharded<self_test_backend>& _self_test_backend;

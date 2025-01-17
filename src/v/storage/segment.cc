@@ -9,9 +9,12 @@
 
 #include "storage/segment.h"
 
+#include "base/vassert.h"
+#include "base/vlog.h"
 #include "compression/compression.h"
 #include "config/configuration.h"
 #include "ssx/future-util.h"
+#include "storage/batch_cache.h"
 #include "storage/compacted_index_writer.h"
 #include "storage/file_sanitizer.h"
 #include "storage/fs_utils.h"
@@ -19,14 +22,12 @@
 #include "storage/logger.h"
 #include "storage/parser_utils.h"
 #include "storage/readers_cache.h"
-#include "storage/segment_appender_utils.h"
+#include "storage/record_batch_utils.h"
 #include "storage/segment_set.h"
 #include "storage/segment_utils.h"
 #include "storage/storage_resources.h"
 #include "storage/types.h"
 #include "storage/version.h"
-#include "vassert.h"
-#include "vlog.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/do_with.hh>
@@ -37,6 +38,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/smp.hh>
 
+#include <exception>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -95,6 +97,8 @@ ss::future<> segment::close() {
 
     co_await do_flush();
     co_await do_close();
+
+    vassert(_inflight.empty(), "Closing segment with inflight writes.");
 
     if (is_tombstone()) {
         auto size = co_await remove_persistent_state();
@@ -221,6 +225,9 @@ ss::future<> segment::do_close() {
     // after appender flushes to make sure we make things visible
     // only after appender flush
     f = f.then([this] { return _idx.flush(); });
+    if (_cache) {
+        f = f.then([this] { return _cache->clear_async(); });
+    }
     return f;
 }
 
@@ -290,6 +297,8 @@ ss::future<> segment::release_appender(readers_cache* readers_cache) {
 }
 
 void segment::release_appender_in_background(readers_cache* readers_cache) {
+    _gate.check();
+
     auto a = std::exchange(_appender, nullptr);
     auto c = config::shard_local_cfg().release_cache_on_segment_roll()
                ? std::exchange(_cache, std::nullopt)
@@ -303,7 +312,8 @@ void segment::release_appender_in_background(readers_cache* readers_cache) {
        c = std::move(c),
        i = std::move(i)]() mutable {
           return readers_cache
-            ->evict_range(_tracker.base_offset, _tracker.dirty_offset)
+            ->evict_range(
+              _tracker.get_base_offset(), _tracker.get_dirty_offset())
             .then(
               [this, a = std::move(a), c = std::move(c), i = std::move(i)](
                 readers_cache::range_lock_holder readers_cache_lock) mutable {
@@ -333,14 +343,17 @@ ss::future<> segment::do_flush() {
     if (!_appender) {
         return ss::make_ready_future<>();
     }
-    auto o = _tracker.dirty_offset;
+    auto o = _tracker.get_dirty_offset();
     auto fsize = _appender->file_byte_offset();
     return _appender->flush().then([this, o, fsize] {
         // never move committed offset backward, there may be multiple
         // outstanding flushes once the one executed later in terms of offset
         // finishes we guarantee that all previous flushes finished.
-        _tracker.committed_offset = std::max(o, _tracker.committed_offset);
-        _tracker.stable_offset = _tracker.committed_offset;
+        _tracker.set_offsets(
+          offset_tracker::committed_offset_t{
+            std::max(o, _tracker.get_committed_offset())},
+          offset_tracker::stable_offset_t{
+            std::max(o, _tracker.get_stable_offset())});
         _reader->set_file_size(std::max(fsize, _reader->file_size()));
         clear_cached_disk_usage();
     });
@@ -351,7 +364,7 @@ ss::future<> remove_compacted_index(const segment_full_path& reader_path) {
     return ss::remove_file(path.string())
       .handle_exception([path](const std::exception_ptr& e) {
           try {
-              rethrow_exception(e);
+              std::rethrow_exception(e);
           } catch (const std::filesystem::filesystem_error& e) {
               if (e.code() == std::errc::no_such_file_or_directory) {
                   // Do not log: ENOENT on removal is success
@@ -363,33 +376,34 @@ ss::future<> remove_compacted_index(const segment_full_path& reader_path) {
 }
 
 ss::future<> segment::truncate(
-  model::offset prev_last_offset,
+  model::offset new_max_offset,
   size_t physical,
   model::timestamp new_max_timestamp) {
     check_segment_not_closed("truncate()");
     return write_lock().then(
-      [this, prev_last_offset, physical, new_max_timestamp](
+      [this, new_max_offset, physical, new_max_timestamp](
         ss::rwlock::holder h) {
-          return do_truncate(prev_last_offset, physical, new_max_timestamp)
+          return do_truncate(new_max_offset, physical, new_max_timestamp)
             .finally([this, h = std::move(h)] { clear_cached_disk_usage(); });
       });
 }
 
 ss::future<> segment::do_truncate(
-  model::offset prev_last_offset,
+  model::offset new_max_offset,
   size_t physical,
   model::timestamp new_max_timestamp) {
-    _tracker.committed_offset = prev_last_offset;
-    _tracker.stable_offset = prev_last_offset;
-    _tracker.dirty_offset = prev_last_offset;
+    _tracker.set_offsets(
+      offset_tracker::committed_offset_t{new_max_offset},
+      offset_tracker::stable_offset_t{new_max_offset},
+      offset_tracker::dirty_offset_t{new_max_offset});
     _reader->set_file_size(physical);
     vlog(
       stlog.trace,
       "truncating segment {} at {}",
       _reader->filename(),
-      prev_last_offset);
+      new_max_offset);
     _generation_id++;
-    cache_truncate(prev_last_offset + model::offset(1));
+    cache_truncate(new_max_offset + model::offset(1));
     auto f = ss::now();
     if (is_compacted_segment()) {
         // if compaction index is opened close it
@@ -404,8 +418,8 @@ ss::future<> segment::do_truncate(
         f = f.then([this] { return remove_compacted_index(_reader->path()); });
     }
 
-    f = f.then([this, prev_last_offset, new_max_timestamp] {
-        return _idx.truncate(prev_last_offset, new_max_timestamp);
+    f = f.then([this, new_max_offset, new_max_timestamp] {
+        return _idx.truncate(new_max_offset, new_max_timestamp);
     });
 
     // physical file only needs *one* truncation call
@@ -430,14 +444,16 @@ ss::future<> segment::do_truncate(
 
 ss::future<bool> segment::materialize_index() {
     vassert(
-      _tracker.base_offset == model::next_offset(_tracker.dirty_offset),
+      _tracker.get_base_offset()
+        == model::next_offset(_tracker.get_dirty_offset()),
       "Materializing the index must happen before tracking any data. {}",
       *this);
     return _idx.materialize_index().then([this](bool yn) {
         if (yn) {
-            _tracker.committed_offset = _idx.max_offset();
-            _tracker.stable_offset = _idx.max_offset();
-            _tracker.dirty_offset = _idx.max_offset();
+            _tracker.set_offsets(
+              offset_tracker::committed_offset_t{_idx.max_offset()},
+              offset_tracker::stable_offset_t{_idx.max_offset()},
+              offset_tracker::dirty_offset_t{_idx.max_offset()});
         }
         return yn;
     });
@@ -454,9 +470,12 @@ ss::future<> segment::do_compaction_index_batch(const model::record_batch& b) {
     auto& w = compaction_index();
     return model::for_each_record(
       b,
-      [o = b.base_offset(), batch_type = b.header().type, &w](
-        const model::record& r) {
-          return w.index(batch_type, r.key(), o, r.offset_delta());
+      [o = b.base_offset(),
+       batch_type = b.header().type,
+       is_control_batch = b.header().attrs.is_control(),
+       &w](const model::record& r) {
+          return w.index(
+            batch_type, is_control_batch, r.key(), o, r.offset_delta());
       });
 }
 ss::future<> segment::compaction_index_batch(const model::record_batch& b) {
@@ -491,19 +510,28 @@ ss::future<> segment::compaction_index_batch(const model::record_batch& b) {
 ss::future<append_result> segment::do_append(const model::record_batch& b) {
     check_segment_not_closed("append()");
     vassert(
-      b.base_offset() >= _tracker.base_offset,
-      "Invalid state. Attempted to append a batch with base_offset:{}, but "
-      "would invalidate our initial state base offset of:{}. Actual batch "
-      "header:{}, self:{}",
-      b.base_offset(),
-      _tracker.base_offset,
-      b.header(),
-      *this);
-    vassert(
       b.header().ctx.owner_shard,
       "Shard not set when writing to: {} - header: {}",
       *this,
       b.header());
+    if (unlikely(b.base_offset() > b.last_offset())) {
+        return ss::make_exception_future<append_result>(
+          std::runtime_error(fmt::format(
+            "Empty batch written to {}. Batch header: {}",
+            path(),
+            b.header())));
+    }
+    if (unlikely(b.base_offset() < _tracker.get_base_offset())) {
+        return ss::make_exception_future<
+          append_result>(std::runtime_error(fmt::format(
+          "Invalid state. Attempted to append a batch with base_offset:{}, but "
+          "would invalidate our initial state base offset of:{}. Actual batch "
+          "header:{}, self:{}",
+          b.base_offset(),
+          _tracker.get_base_offset(),
+          b.header(),
+          *this)));
+    }
     if (unlikely(b.compressed() && !b.header().attrs.is_valid_compression())) {
         return ss::make_exception_future<
           append_result>(std::runtime_error(fmt::format(
@@ -511,14 +539,20 @@ ss::future<append_result> segment::do_append(const model::record_batch& b) {
           b.header())));
     }
     const auto start_physical_offset = _appender->file_byte_offset();
+    const auto expected_end_physical = start_physical_offset
+                                       + b.header().size_bytes;
+
     _generation_id++;
+
+    // inflight index. trimmed on every dma_write in appender
+    _inflight.emplace(expected_end_physical, b.last_offset());
+
     // proxy serialization to segment_appender
     auto write_fut = _appender->append(b).then(
-      [this, &b, start_physical_offset] {
-          _tracker.dirty_offset = b.last_offset();
+      [this, &b, start_physical_offset, expected_end_physical] {
+          _tracker.set_offset(offset_tracker::dirty_offset_t{b.last_offset()});
           const auto end_physical_offset = _appender->file_byte_offset();
-          const auto expected_end_physical = start_physical_offset
-                                             + b.header().size_bytes;
+
           vassert(
             end_physical_offset == expected_end_physical,
             "size must be deterministic: end_offset:{}, expected:{}, "
@@ -527,16 +561,25 @@ ss::future<append_result> segment::do_append(const model::record_batch& b) {
             expected_end_physical,
             b.header(),
             *this);
-          // inflight index. trimmed on every dma_write in appender
-          _inflight.emplace(end_physical_offset, b.last_offset());
+
           // index the write
-          _idx.maybe_track(b.header(), start_physical_offset);
+          _idx.maybe_track(
+            b.header(), ss::lowres_system_clock::now(), start_physical_offset);
           auto ret = append_result{
             .base_offset = b.base_offset(),
             .last_offset = b.last_offset(),
             .byte_size = (size_t)b.size_bytes()};
+
           // cache always copies the batch
-          cache_put(b);
+          cache_put(
+            b,
+            // It may happen that this continuation may run after the stable
+            // offset has been advances and the cache was already marked as
+            // clean up to or beyond the offset of the batch we are writing. In
+            // that case, the batch entry should be considered clean.
+            _tracker.get_stable_offset() < b.last_offset()
+              ? batch_cache::is_dirty_entry::yes
+              : batch_cache::is_dirty_entry::no);
           return ret;
       });
     auto index_fut = compaction_index_batch(b);
@@ -567,7 +610,7 @@ ss::future<append_result> segment::do_append(const model::record_batch& b) {
               }
               return ss::make_exception_future<append_result>(append_err);
           }
-          auto ret = append_fut.get0();
+          auto ret = append_fut.get();
           auto index_err = std::move(index_fut).get_exception();
           vlog(
             stlog.error,
@@ -579,7 +622,7 @@ ss::future<append_result> segment::do_append(const model::record_batch& b) {
 }
 
 ss::future<append_result> segment::append(const model::record_batch& b) {
-    if (has_compaction_index() && b.header().attrs.is_transactional()) {
+    if (has_compaction_index() && b.contains_transactional_data()) {
         // With transactional batches, we do not know ahead of time whether the
         // batch will be committed or aborted. We may not have this information
         // during the lifetime of this segment as the batch may be aborted in
@@ -622,22 +665,34 @@ segment::offset_data_stream(model::offset o, ss::io_priority_class iopc) {
     return _reader->data_stream(position, iopc);
 }
 
-void segment::advance_stable_offset(size_t offset) {
+void segment::advance_stable_offset(size_t filepos) {
     if (_inflight.empty()) {
         return;
     }
 
-    auto it = _inflight.upper_bound(offset);
+    auto it = _inflight.upper_bound(filepos);
     if (it != _inflight.begin()) {
         --it;
     }
 
-    if (it->first > offset) {
+    if (it->first > filepos) {
         return;
     }
 
     _reader->set_file_size(it->first);
-    _tracker.stable_offset = it->second;
+
+    // Maintain `stable_offset <= dirty_offset` invariant.
+    // `advance_stable_offset` may be called before the continuation attached to
+    // the `segment_appender::append` where we are advancing the dirty offset.
+    _tracker.set_offsets(
+      offset_tracker::stable_offset_t{it->second},
+      offset_tracker::dirty_offset_t{
+        std::max(it->second, _tracker.get_dirty_offset())});
+
+    if (_cache) {
+        _cache->mark_clean(_tracker.get_stable_offset());
+    }
+
     _inflight.erase(_inflight.begin(), std::next(it));
 
     // after data gets flushed out of the appender recheck on disk size
@@ -648,10 +703,10 @@ std::ostream& operator<<(std::ostream& o, const segment::offset_tracker& t) {
     fmt::print(
       o,
       "{{term:{}, base_offset:{}, committed_offset:{}, dirty_offset:{}}}",
-      t.term,
-      t.base_offset,
-      t.committed_offset,
-      t.dirty_offset);
+      t.get_term(),
+      t.get_base_offset(),
+      t.get_committed_offset(),
+      t.get_dirty_offset());
     return o;
 }
 
@@ -659,6 +714,7 @@ std::ostream& operator<<(std::ostream& o, const segment& h) {
     o << "{offset_tracker:" << h._tracker
       << ", compacted_segment=" << h.is_compacted_segment()
       << ", finished_self_compaction=" << h.finished_self_compaction()
+      << ", finished_windowed_compaction=" << h.finished_windowed_compaction()
       << ", generation=" << h.get_generation_id() << ", reader=";
     if (h._reader) {
         o << *h._reader;
@@ -694,7 +750,7 @@ auto with_segment(ss::lw_shared_ptr<segment> s, Func&& f) {
     return f(s).then_wrapped([s](
                                ss::future<ss::lw_shared_ptr<segment>> new_seg) {
         try {
-            auto ptr = new_seg.get0();
+            auto ptr = new_seg.get();
             return ss::make_ready_future<ss::lw_shared_ptr<segment>>(ptr);
         } catch (...) {
             return s->close()
@@ -755,7 +811,8 @@ ss::future<ss::lw_shared_ptr<segment>> make_segment(
   std::optional<batch_cache_index> batch_cache,
   storage_resources& resources,
   ss::sharded<features::feature_table>& feature_table,
-  std::optional<ntp_sanitizer_config> ntp_sanitizer_config) {
+  std::optional<ntp_sanitizer_config> ntp_sanitizer_config,
+  size_t segment_size_hint) {
     auto path = segment_full_path(ntpc, base_offset, term, version);
     vlog(stlog.info, "Creating new segment {}", path);
     return open_segment(
@@ -766,16 +823,25 @@ ss::future<ss::lw_shared_ptr<segment>> make_segment(
              resources,
              feature_table,
              ntp_sanitizer_config)
-      .then([path, &ntpc, pc, &resources, ntp_sanitizer_config](
-              ss::lw_shared_ptr<segment> seg) mutable {
+      .then([path,
+             &ntpc,
+             pc,
+             segment_size_hint,
+             &resources,
+             ntp_sanitizer_config](ss::lw_shared_ptr<segment> seg) mutable {
           return with_segment(
             std::move(seg),
-            [path, &ntpc, pc, &resources, ntp_sanitizer_config](
+            [path,
+             &ntpc,
+             pc,
+             segment_size_hint,
+             &resources,
+             ntp_sanitizer_config](
               const ss::lw_shared_ptr<segment>& seg) mutable {
                 return internal::make_segment_appender(
                          path,
                          internal::number_of_chunks_from_config(ntpc),
-                         internal::segment_size_from_config(ntpc),
+                         segment_size_hint,
                          pc,
                          resources,
                          std::move(ntp_sanitizer_config))
@@ -834,6 +900,17 @@ ss::future<model::timestamp> segment::get_file_timestamp() const {
       std::chrono::duration_cast<std::chrono::milliseconds>(
         stat.time_modified.time_since_epoch())
         .count());
+}
+
+bool segment::may_have_compactible_records() const {
+    auto num_compactible_records = index().num_compactible_records_appended();
+    if (!num_compactible_records.has_value()) {
+        // Segment was written in a version that didn't have the
+        // `num_compactible_records_appended` field. We can't definitively say
+        // that there were no data records, so err on the side of caution.
+        return true;
+    }
+    return num_compactible_records.value() > 0;
 }
 
 } // namespace storage

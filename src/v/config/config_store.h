@@ -11,8 +11,8 @@
 
 #pragma once
 
+#include "base/seastarx.h"
 #include "config/property.h"
-#include "seastarx.h"
 #include "utils/to_string.h"
 
 #include <fmt/format.h>
@@ -57,7 +57,7 @@ public:
       const std::set<std::string_view> ignore_missing = {}) {
         error_map_t errors;
 
-        for (auto const& [name, property] : _properties) {
+        for (const auto& [name, property] : _properties) {
             if (property->is_required() == required::no) {
                 continue;
             }
@@ -68,44 +68,52 @@ public:
             }
         }
 
-        for (auto const& node : root_node) {
+        for (const auto& node : root_node) {
             auto name = node.first.as<ss::sstring>();
-            auto found = _properties.find(name);
-            if (found == _properties.end()) {
+            auto* prop = [&]() -> base_property* {
+                auto found = _properties.find(name);
+                if (found != _properties.end()) {
+                    return found->second;
+                }
                 found = _aliases.find(name);
-                if (found == _aliases.end()) {
-                    if (!ignore_missing.contains(name)) {
-                        throw std::invalid_argument(
-                          fmt::format("Unknown property {}", name));
-                    }
-                }
-            } else {
-                bool ok = false;
-                try {
-                    auto validation_err = found->second->validate(node.second);
-                    if (validation_err.has_value()) {
-                        errors[name] = fmt::format(
-                          "Validation error: {}",
-                          validation_err.value().error_message());
-                    }
-
-                    found->second->set_value(node.second);
-                    ok = true;
-                } catch (YAML::InvalidNode const& e) {
-                    errors[name] = fmt::format("Invalid syntax: {}", e);
-                } catch (YAML::ParserException const& e) {
-                    errors[name] = fmt::format("Invalid syntax: {}", e);
-                } catch (YAML::BadConversion const& e) {
-                    errors[name] = fmt::format("Invalid value: {}", e);
+                if (found != _aliases.end()) {
+                    return found->second;
                 }
 
-                // A validation error is fatal if the property was required,
-                // e.g. if someone entered a non-integer node_id, or an invalid
-                // internal RPC address.
-                if (!ok && found->second->is_required()) {
-                    throw std::invalid_argument(fmt::format(
-                      "Property {} is required and has invalid value", name));
+                return nullptr;
+            }();
+
+            if (prop == nullptr) {
+                if (!ignore_missing.contains(name)) {
+                    throw std::invalid_argument(
+                      fmt::format("Unknown property {}", name));
                 }
+                continue;
+            }
+            bool ok = false;
+            try {
+                auto validation_err = prop->validate(node.second);
+                if (validation_err.has_value()) {
+                    errors[name] = fmt::format(
+                      "Validation error: {}",
+                      validation_err.value().error_message());
+                }
+                prop->set_value(node.second);
+                ok = true;
+            } catch (const YAML::InvalidNode& e) {
+                errors[name] = fmt::format("Invalid syntax: {}", e);
+            } catch (const YAML::ParserException& e) {
+                errors[name] = fmt::format("Invalid syntax: {}", e);
+            } catch (const YAML::BadConversion& e) {
+                errors[name] = fmt::format("Invalid value: {}", e);
+            }
+
+            // A validation error is fatal if the property was required,
+            // e.g. if someone entered a non-integer node_id, or an invalid
+            // internal RPC address.
+            if (!ok && prop->is_required()) {
+                throw std::invalid_argument(fmt::format(
+                  "Property {} is required and has invalid value", name));
             }
         }
 
@@ -114,7 +122,7 @@ public:
 
     template<typename Func>
     void for_each(Func&& f) const {
-        for (auto const& [_, property] : _properties) {
+        for (const auto& [_, property] : _properties) {
             f(*property);
         }
     }
@@ -132,7 +140,7 @@ public:
         w.StartObject();
 
         for (const auto& [name, property] : _properties) {
-            if (property->get_visibility() == visibility::deprecated) {
+            if (property->is_hidden()) {
                 continue;
             }
 
@@ -147,11 +155,25 @@ public:
         w.EndObject();
     }
 
+    // Write a single key out to json::Writer.
+    void to_json_single_key(
+      json::Writer<json::StringBuffer>& w,
+      redact_secrets redact,
+      std::string_view key) {
+        // Whether key was either an original property name or an
+        // alias, we will obtain the original property here.
+        const auto& property = get(key);
+        w.StartObject();
+        w.Key(key.data(), key.size());
+        property.to_json(w, redact);
+        w.EndObject();
+    }
+
     void to_json_for_metrics(json::Writer<json::StringBuffer>& w) {
         w.StartObject();
 
         for (const auto& [name, property] : _properties) {
-            if (property->get_visibility() == visibility::deprecated) {
+            if (property->is_hidden()) {
                 continue;
             }
 
@@ -184,6 +206,21 @@ public:
         }
 
         return result;
+    }
+
+    std::set<std::string_view> property_aliases() const {
+        std::set<std::string_view> result;
+        for (const auto& i : _aliases) {
+            result.insert(i.first);
+        }
+
+        return result;
+    }
+
+    std::set<std::string_view> property_names_and_aliases() const {
+        auto all = property_names();
+        all.merge(property_aliases());
+        return all;
     }
 
     friend std::ostream&

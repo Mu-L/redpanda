@@ -10,21 +10,18 @@
  */
 #pragma once
 
+#include "base/vassert.h"
 #include "cluster/scheduling/leader_balancer_constraints.h"
 #include "cluster/scheduling/leader_balancer_strategy.h"
 #include "cluster/scheduling/leader_balancer_types.h"
+#include "container/chunked_hash_map.h"
+#include "container/fragmented_vector.h"
 #include "model/metadata.h"
-#include "raft/types.h"
+#include "raft/fundamental.h"
 #include "random/generators.h"
-#include "utils/fragmented_vector.h"
-#include "vassert.h"
 
-#include <absl/container/flat_hash_map.h>
-
-#include <cmath>
 #include <cstddef>
-#include <deque>
-#include <functional>
+#include <cstdint>
 #include <memory>
 #include <optional>
 
@@ -95,7 +92,7 @@ private:
         raft::group_id group_id;
         model::broker_shard broker_shard;
     };
-    absl::flat_hash_map<raft::group_id, model::broker_shard> _current_leaders;
+    chunked_hash_map<raft::group_id, model::broker_shard> _current_leaders;
 
     using replicas_t = fragmented_vector<replica>;
     replicas_t _replicas;
@@ -105,11 +102,23 @@ private:
 class random_hill_climbing_strategy final : public leader_balancer_strategy {
 public:
     random_hill_climbing_strategy(
-      index_type index, group_id_to_topic_revision_t g_to_ntp, muted_index mi)
+      index_type index,
+      group_id_to_topic_id g_to_topic,
+      muted_index mi,
+      std::optional<preference_index> preference_idx)
       : _mi(std::make_unique<muted_index>(std::move(mi)))
-      , _reassignments(index)
-      , _etdc(std::move(g_to_ntp), shard_index(index), *_mi)
-      , _eslc(shard_index(std::move(index)), *_mi) {}
+      , _group2topic(
+          std::make_unique<group_id_to_topic_id>(std::move(g_to_topic)))
+      , _si(std::make_unique<shard_index>(std::move(index)))
+      , _reassignments(_si->shards())
+      , _etdc(*_group2topic, *_si, *_mi)
+      , _eslc(*_si, *_mi)
+      , _enlc(*_si) {
+        if (preference_idx) {
+            _pinning_constr.emplace(
+              *_group2topic, std::move(preference_idx.value()));
+        }
+    }
 
     double error() const override { return _eslc.error() + _etdc.error(); }
 
@@ -117,7 +126,7 @@ public:
      * Find a group reassignment that reduces total error.
      */
     std::optional<reassignment>
-    find_movement(const absl::flat_hash_set<raft::group_id>& skip) override {
+    find_movement(const leader_balancer_types::muted_groups_t& skip) override {
         for (;;) {
             auto reassignment_opt = _reassignments.generate_reassignment();
 
@@ -127,20 +136,41 @@ public:
 
             auto reassignment = *reassignment_opt;
             if (
-              skip.contains(reassignment.group)
+              skip.contains(static_cast<uint64_t>(reassignment.group))
               || _mi->muted_nodes().contains(reassignment.from.node_id)
               || _mi->muted_nodes().contains(reassignment.to.node_id)) {
                 continue;
             }
 
-            auto eval = _etdc.evaluate(reassignment)
-                        + _eslc.evaluate(reassignment);
+            // Hierarchical optimization: first check if the proposed
+            // reassignment improves the pinning objective (makes the leaders
+            // distribution better conform to the provided pinning
+            // configuration). If the pinning objective remains at the same
+            // level, check balancing objectives.
 
-            if (eval <= error_jitter) {
-                continue;
+            if (_pinning_constr) {
+                auto pinning_diff = _pinning_constr->evaluate(reassignment);
+                if (pinning_diff < -error_jitter) {
+                    continue;
+                } else if (pinning_diff > error_jitter) {
+                    return reassignment_opt;
+                }
             }
 
-            return reassignment_opt;
+            auto shard_load_diff = _etdc.evaluate(reassignment)
+                                   + _eslc.evaluate(reassignment);
+            if (shard_load_diff < -error_jitter) {
+                continue;
+            } else if (shard_load_diff > error_jitter) {
+                return reassignment_opt;
+            }
+
+            auto node_load_diff = _enlc.evaluate(reassignment);
+            if (node_load_diff < -error_jitter) {
+                continue;
+            } else if (node_load_diff > error_jitter) {
+                return reassignment_opt;
+            }
         }
 
         return std::nullopt;
@@ -149,7 +179,9 @@ public:
     void apply_movement(const reassignment& reassignment) override {
         _etdc.update_index(reassignment);
         _eslc.update_index(reassignment);
+        _enlc.update_index(reassignment);
         _mi->update_index(reassignment);
+        _si->update_index(reassignment);
         _reassignments.update_index(reassignment);
     }
 
@@ -162,10 +194,14 @@ private:
     static constexpr double error_jitter = 0.000001;
 
     std::unique_ptr<muted_index> _mi;
+    std::unique_ptr<group_id_to_topic_id> _group2topic;
+    std::unique_ptr<shard_index> _si;
     random_reassignments _reassignments;
 
-    even_topic_distributon_constraint _etdc;
+    std::optional<pinning_constraint> _pinning_constr;
+    even_topic_distribution_constraint _etdc;
     even_shard_load_constraint _eslc;
+    even_node_load_constraint _enlc;
 };
 
 } // namespace cluster::leader_balancer_types

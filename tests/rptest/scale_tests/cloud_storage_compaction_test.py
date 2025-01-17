@@ -44,6 +44,10 @@ CDT_CONFIGURATION = {
     "cloud_storage_segment_max_upload_interval_sec": 5
 }
 
+ALLOWED_LOG_LINES = [
+    'Ensure that your bucket exists and that the cloud_storage_bucket and cloud_storage_region cluster configs are correct.'
+]
+
 
 class CloudStorageCompactionTest(EndToEndTest):
     topic = "panda-topic"
@@ -127,6 +131,7 @@ class CloudStorageCompactionTest(EndToEndTest):
         wait_until(lambda: len(self.producer.last_acked_offsets) != 0, 30)
 
     def _init_redpanda_read_replica(self):
+        extra_rp_conf = dict(enable_cluster_metadata_upload_loop=False)
         self.rr_si_settings = SISettings(
             self.test_context,
             bypass_bucket_creation=True,
@@ -137,7 +142,10 @@ class CloudStorageCompactionTest(EndToEndTest):
             configuration["cloud_storage_segment_max_upload_interval_sec"])
         self.rr_si_settings.load_context(self.logger, self.test_context)
         self.rr_cluster = make_redpanda_service(
-            self.test_context, num_brokers=3, si_settings=self.rr_si_settings)
+            self.test_context,
+            num_brokers=3,
+            si_settings=self.rr_si_settings,
+            extra_rp_conf=extra_rp_conf)
 
     def _create_read_repica_topic_success(self):
         try:
@@ -158,13 +166,21 @@ class CloudStorageCompactionTest(EndToEndTest):
     def _setup_read_replica(self):
         self._init_redpanda_read_replica()
         self.rr_cluster.start(start_si=False)
+
+        # Explicitly create the consumer offsets topic to avoid it uploading.
+        rpk_rr_cluster = RpkTool(self.rr_cluster)
+        conf = {
+            'redpanda.remote.write': "false",
+        }
+        rpk_rr_cluster.create_topic("__consumer_offsets", config=conf)
+
         wait_until(self._create_read_repica_topic_success,
                    timeout_sec=30,
                    backoff_sec=5)
 
-    @cluster(num_nodes=9)
-    @matrix(
-        cloud_storage_type=get_cloud_storage_type(docker_use_arbitrary=True))
+    @cluster(num_nodes=9, log_allow_list=ALLOWED_LOG_LINES)
+    @matrix(cloud_storage_type=get_cloud_storage_type(
+        docker_use_arbitrary=True))
     def test_read_from_replica(self, cloud_storage_type):
         self.start_workload()
         self.start_consumer(num_nodes=2,
@@ -182,24 +198,17 @@ class CloudStorageCompactionTest(EndToEndTest):
         self.run_consumer_validation(enable_compaction=True,
                                      consumer_timeout_sec=600)
 
+        # source cluster uploads
         upload_sucess = sum([
             sample.value for sample in self.redpanda.metrics_sample(
-                "successful_uploads",
+                "cloud_storage_successful_uploads",
                 metrics_endpoint=MetricsEndpoint.METRICS).samples
         ])
-        upload_fails = sum([
-            sample.value for sample in self.redpanda.metrics_sample(
-                "failed_uploads",
-                metrics_endpoint=MetricsEndpoint.METRICS).samples
-        ])
+
+        # read replica cluster downloads
         download_sucess = sum([
             sample.value for sample in self.rr_cluster.metrics_sample(
-                "successful_downloads",
-                metrics_endpoint=MetricsEndpoint.METRICS).samples
-        ])
-        download_fails = sum([
-            sample.value for sample in self.rr_cluster.metrics_sample(
-                "failed_downloads",
+                "cloud_storage_successful_downloads",
                 metrics_endpoint=MetricsEndpoint.METRICS).samples
         ])
 
@@ -207,5 +216,20 @@ class CloudStorageCompactionTest(EndToEndTest):
         assert download_sucess > 0
         assert download_sucess <= upload_sucess, \
             f"Downloaded {download_sucess}, uploaded {upload_sucess}"
-        assert upload_fails == 0
-        assert download_fails == 0
+
+        # read replica success and failures
+        rr_upload_successes = sum([
+            sample.value for sample in self.rr_cluster.metrics_sample(
+                "cloud_storage_successful_uploads",
+                metrics_endpoint=MetricsEndpoint.METRICS).samples
+        ])
+        rr_upload_failures = sum([
+            sample.value for sample in self.rr_cluster.metrics_sample(
+                "cloud_storage_failed_uploads",
+                metrics_endpoint=MetricsEndpoint.METRICS).samples
+        ])
+
+        # the read replica cluster should not be doing any uploads
+        assert (
+            rr_upload_successes + rr_upload_failures
+        ) == 0, f"Read replica cluster upload successes {rr_upload_successes} failures {rr_upload_failures}"

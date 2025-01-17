@@ -36,6 +36,7 @@
 #include <seastar/core/loop.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/util/variant_utils.hh>
 
 #include <absl/container/node_hash_map.h>
 
@@ -138,22 +139,33 @@ controller_api::get_reconciliation_state(model::topic_namespace_view tp_ns) {
     ntps.reserve(metadata->get().get_assignments().size());
 
     std::transform(
-      metadata->get().get_assignments().cbegin(),
-      metadata->get().get_assignments().cend(),
+      metadata->get().get_assignments().begin(),
+      metadata->get().get_assignments().end(),
       std::back_inserter(ntps),
-      [tp_ns](const partition_assignment& p_as) {
-          return model::ntp(tp_ns.ns, tp_ns.tp, p_as.id);
+      [tp_ns](const assignments_set::value_type& p_as) {
+          return model::ntp(tp_ns.ns, tp_ns.tp, p_as.second.id);
       });
 
     co_return co_await get_reconciliation_state(std::move(ntps));
 }
 
-ss::future<ss::chunked_fifo<controller_backend::delta_metadata>>
-controller_api::get_remote_core_deltas(model::ntp ntp, ss::shard_id shard) {
-    return _backend.invoke_on(
+ss::future<std::optional<backend_operation>>
+controller_api::get_current_op(model::ntp ntp, ss::shard_id shard) {
+    auto cur_op = co_await _backend.invoke_on(
       shard, [ntp = std::move(ntp)](controller_backend& backend) {
-          return backend.list_ntp_deltas(ntp);
+          return backend.get_current_op(ntp);
       });
+    if (cur_op) {
+        co_return backend_operation{
+          .source_shard = shard,
+          .p_as = std::move(cur_op->assignment),
+          .type = cur_op->type,
+          .current_retry = cur_op->retries,
+          .last_operation_result = cur_op->last_error,
+          .revision_of_operation = cur_op->revision,
+        };
+    }
+    co_return std::nullopt;
 }
 
 ss::future<ntp_reconciliation_state>
@@ -173,22 +185,10 @@ controller_api::get_reconciliation_state(model::ntp ntp) {
     ss::chunked_fifo<backend_operation> ops;
     const auto shards = boost::irange<ss::shard_id>(0, ss::smp::count);
     for (auto shard : shards) {
-        auto local_deltas = co_await get_remote_core_deltas(ntp, shard);
-
-        std::transform(
-          local_deltas.begin(),
-          local_deltas.end(),
-          std::back_inserter(ops),
-          [shard](controller_backend::delta_metadata& m) {
-              return backend_operation{
-                .source_shard = shard,
-                .p_as = std::move(m.delta.new_assignment),
-                .type = m.delta.type,
-                .current_retry = m.retries,
-                .last_operation_result = m.last_error,
-                .revision_of_operation = model::revision_id(m.delta.offset),
-              };
-          });
+        auto shard_op = co_await get_current_op(ntp, shard);
+        if (shard_op) {
+            ops.push_back(std::move(*shard_op));
+        }
     }
 
     // having any deltas is sufficient to state that reconciliation is still
@@ -280,22 +280,26 @@ controller_api::get_reconciliation_state(
 
 // high level APIs
 ss::future<std::error_code> controller_api::wait_for_topic(
-  model::topic_namespace_view tp_ns, model::timeout_clock::time_point timeout) {
-    auto metadata = _topics.local().get_topic_metadata_ref(tp_ns);
-    if (!metadata) {
-        vlog(clusterlog.trace, "topic {} does not exists", tp_ns);
-        co_return make_error_code(errc::topic_not_exists);
-    }
-
-    std::deque<model::ntp> all_ntps;
-    for (const auto& p_as : metadata->get().get_assignments()) {
-        all_ntps.emplace_back(tp_ns.ns, tp_ns.tp, p_as.id);
-    }
+  model::topic_namespace_view tp_ns_view,
+  model::timeout_clock::time_point timeout) {
+    model::topic_namespace tp_ns(tp_ns_view);
     bool ready = false;
     while (!ready) {
         if (model::timeout_clock::now() > timeout) {
             co_return make_error_code(errc::timeout);
         }
+        auto metadata = _topics.local().get_topic_metadata_ref(tp_ns);
+        if (!metadata) {
+            vlog(clusterlog.trace, "topic {} does not exists", tp_ns);
+            co_await ss::sleep_abortable(
+              std::chrono::milliseconds(100), _as.local());
+            continue;
+        }
+        std::deque<model::ntp> all_ntps;
+        for (const auto& [_, p_as] : metadata->get().get_assignments()) {
+            all_ntps.emplace_back(tp_ns.ns, tp_ns.tp, p_as.id);
+        }
+
         auto res = co_await all_reconciliations_done(all_ntps);
         ready = !res.has_error() && res.value();
         if (!ready) {
@@ -330,6 +334,7 @@ controller_api::get_partitions_reconfiguration_state(
         state.current_assignment = std::move(p_as->replicas);
         state.previous_assignment = progress_it->second.get_previous_replicas();
         state.state = progress_it->second.get_state();
+        state.policy = progress_it->second.get_reconfiguration_policy();
         states.emplace(ntp, std::move(state));
 
         auto [tp_it, _] = partitions_filter.namespaces.try_emplace(
@@ -355,19 +360,19 @@ controller_api::get_partitions_reconfiguration_state(
     auto& report = result.value();
 
     for (auto& node_report : report.node_reports) {
-        for (auto& tp : node_report.topics) {
-            for (auto& p : tp.partitions) {
-                model::ntp ntp(tp.tp_ns.ns, tp.tp_ns.tp, p.id);
+        for (auto& [tp_ns, partitions] : node_report->topics) {
+            for (auto& p : partitions) {
+                model::ntp ntp(tp_ns.ns, tp_ns.tp, p.id);
                 auto it = states.find(ntp);
                 if (it == states.end()) {
                     continue;
                 }
 
-                if (p.leader_id == node_report.id) {
+                if (p.leader_id == node_report->id) {
                     it->second.current_partition_size = p.size_bytes;
                 }
                 const auto moving_to = moving_to_node(
-                  node_report.id,
+                  node_report->id,
                   it->second.previous_assignment,
                   it->second.current_assignment);
 
@@ -375,7 +380,7 @@ controller_api::get_partitions_reconfiguration_state(
                 if (moving_to) {
                     it->second.already_transferred_bytes.emplace_back(
                       replica_bytes{
-                        .node = node_report.id, .bytes = p.size_bytes});
+                        .node = node_report->id, .bytes = p.size_bytes});
                 }
 
                 co_await ss::maybe_yield();
@@ -497,11 +502,7 @@ controller_api::get_node_decommission_progress(
 
 std::optional<ss::shard_id>
 controller_api::shard_for(const raft::group_id& group) const {
-    if (_shard_table.local().contains(group)) {
-        return _shard_table.local().shard_for(group);
-    } else {
-        return std::nullopt;
-    }
+    return _shard_table.local().shard_for(group);
 }
 
 std::optional<ss::shard_id>
@@ -522,7 +523,7 @@ controller_api::get_global_reconciliation_state(
             // not longer updating
             continue;
         }
-        auto all_replicas = union_replica_sets(
+        auto all_replicas = union_vectors(
           it->second.get_previous_replicas(), it->second.get_target_replicas());
         for (const auto& r : all_replicas) {
             grouped_ntps[r.node_id].push_back(ntp);

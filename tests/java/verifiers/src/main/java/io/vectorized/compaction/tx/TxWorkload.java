@@ -27,6 +27,9 @@ public class TxWorkload extends GatedWorkload {
     public String topic;
     public int partitions;
     public int key_set_cardinality;
+    // [0, 1] 0 being no aborts and
+    // 1 being every request is an abort
+    public float abort_probability;
   }
 
   static class WriteInfo {
@@ -208,7 +211,8 @@ public class TxWorkload extends GatedWorkload {
 
       producer.beginTransaction();
 
-      boolean shouldAbort = random.nextInt(3) == 0;
+      boolean shouldAbort
+          = random.nextInt(100) < Math.round(args.abort_probability * 100);
 
       HashMap<String, WriteInfo> batch = new HashMap<>();
 
@@ -268,6 +272,7 @@ public class TxWorkload extends GatedWorkload {
       try {
         if (shouldAbort) {
           log(pid, "abort");
+          producer.flush();
           producer.abortTransaction();
         } else {
           log(pid, "commit");
@@ -364,17 +369,13 @@ public class TxWorkload extends GatedWorkload {
     consumer.assign(tps);
     consumer.seekToEnd(tps);
     long end = consumer.position(tp);
-    long written = -1;
-    synchronized (this) {
-      partition.endOffset = end;
-      written = partition.writtenOffset;
-    }
+    synchronized (this) { partition.endOffset = end; }
     consumer.seekToBeginning(tps);
 
     long lastOffset = -1;
     long lastOpId = -1;
 
-    while (consumer.position(tp) < end && consumer.position(tp) <= written) {
+    while (consumer.position(tp) < end) {
       synchronized (this) { partition.readPosition = consumer.position(tp); }
       ConsumerRecords<String, String> records
           = consumer.poll(Duration.ofMillis(10000));

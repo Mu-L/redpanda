@@ -10,10 +10,12 @@
 
 #pragma once
 
+#include "base/seastarx.h"
+#include "bytes/iobuf.h"
+#include "bytes/iostream.h"
 #include "cloud_storage/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "seastarx.h"
 
 #include <seastar/core/iostream.hh>
 
@@ -29,6 +31,7 @@ enum class manifest_type {
     tx_range,
     cluster_metadata,
     spillover,
+    topic_mount
 };
 
 std::ostream& operator<<(std::ostream& s, manifest_type t);
@@ -37,6 +40,8 @@ enum class manifest_format {
     json,
     serde,
 };
+
+std::ostream& operator<<(std::ostream& s, manifest_format t);
 class base_manifest {
 public:
     virtual ~base_manifest();
@@ -53,17 +58,8 @@ public:
     /// Serialize manifest object
     ///
     /// \return asynchronous input_stream with the serialized json
-    virtual ss::future<serialized_data_stream> serialize() const = 0;
-
-    /// Manifest object format and name in S3
-    virtual remote_manifest_path get_manifest_path() const = 0;
-
-    /// default implementation for derived classed that don't support multiple
-    /// formats
-    virtual std::pair<manifest_format, remote_manifest_path>
-    get_manifest_format_and_path() const {
-        return {manifest_format::json, get_manifest_path()};
-    }
+    virtual ss::future<serialized_data_stream> serialize() const;
+    virtual ss::future<iobuf> serialize_buf() const = 0;
 
     /// Get manifest type
     virtual manifest_type get_manifest_type() const = 0;

@@ -10,12 +10,12 @@
  */
 
 #pragma once
+#include "base/oncore.h"
 #include "cluster/fwd.h"
 #include "config/property.h"
 #include "kafka/server/usage_aggregator.h"
-#include "oncore.h"
+#include "model/namespace.h"
 #include "storage/fwd.h"
-#include "utils/fragmented_vector.h"
 
 #include <seastar/core/gate.hh>
 #include <seastar/core/sharded.hh>
@@ -118,7 +118,7 @@ private:
 
     /// Per-core metric, shard-0 aggregates these values across shards
     usage _current_bucket;
-    mutex _background_mutex;
+    mutex _background_mutex{"usage_monitor::_background_mutex"};
     ss::gate _background_gate;
 
     /// Valid on core-0 when usage_enabled() == true
@@ -129,7 +129,7 @@ private:
 /// consideration data batches via produce/fetch requests to these topics
 static const auto usage_excluded_topics = std::to_array(
   {model::topic("_schemas"),
-   model::topic("__audit"),
+   model::kafka_audit_logging_topic,
    model::topic("__redpanda_e2e_probe")});
 
 } // namespace kafka

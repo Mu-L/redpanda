@@ -43,7 +43,7 @@ func newListCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 		Aliases: []string{"ls"},
 		Short:   "List the partitions in a broker in the cluster",
 		Args:    cobra.ExactArgs(1),
-		Run: func(cmd *cobra.Command, args []string) {
+		Run: func(_ *cobra.Command, args []string) {
 			brokerID, err := strconv.Atoi(args[0])
 			out.MaybeDie(err, "invalid broker %s: %v", args[0], err)
 			if brokerID < 0 {
@@ -51,7 +51,7 @@ func newListCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 			}
 
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
 
 			adm, err := kafka.NewAdmin(fs, p)
 			out.MaybeDie(err, "unable to initialize kafka client: %v", err)

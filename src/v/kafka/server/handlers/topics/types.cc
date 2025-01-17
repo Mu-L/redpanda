@@ -9,21 +9,25 @@
 
 #include "kafka/server/handlers/topics/types.h"
 
+#include "base/units.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
+#include "container/fragmented_vector.h"
+#include "kafka/server/handlers/configs/config_response_utils.h"
 #include "kafka/server/handlers/configs/config_utils.h"
 #include "model/compression.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "model/timestamp.h"
 #include "pandaproxy/schema_registry/subject_name_strategy.h"
-#include "units.h"
-#include "utils/string_switch.h"
+#include "strings/string_switch.h"
+#include "utils/tristate.h"
 
 #include <seastar/core/sstring.hh>
 
 #include <bits/stdint-intn.h>
 #include <bits/stdint-uintn.h>
+#include <boost/lexical_cast/bad_lexical_cast.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -39,8 +43,13 @@ template<typename T>
 concept CreatableTopicCfg = std::is_same_v<T, creatable_topic_configs>
                             || std::is_same_v<T, createable_topic_config>;
 
-template<CreatableTopicCfg T>
-config_map_t make_config_map(const std::vector<T>& config) {
+template<typename Container>
+concept CreatableTopicCfgContainer = requires(Container c) {
+    requires CreatableTopicCfg<typename Container::value_type>;
+};
+
+template<CreatableTopicCfgContainer T>
+config_map_t make_config_map(const T& config) {
     config_map_t ret;
     ret.reserve(config.size());
     for (const auto& c : config) {
@@ -59,12 +68,23 @@ config_map_t config_map(const std::vector<creatable_topic_configs>& config) {
     return make_config_map(config);
 }
 
-// Either parse configuration or return nullopt
-template<typename T>
-static std::optional<T>
-get_config_value(const config_map_t& config, std::string_view key) {
+template<class T>
+requires std::
+  is_same_v<T, std::chrono::duration<typename T::rep, typename T::period>>
+  static std::optional<T> get_duration_value(
+    const config_map_t& config,
+    std::string_view key,
+    bool clamp_to_duration_max = false) {
     if (auto it = config.find(key); it != config.end()) {
-        return boost::lexical_cast<T>(it->second);
+        auto parsed = boost::lexical_cast<typename T::rep>(it->second);
+        // Certain Kafka clients have LONG_MAX duration to represent
+        // maximum duration but that overflows during serde serialization
+        // to nanos. Clamping to max allowed duration gives the same
+        // desired behavior of no timeout without having to fail the request.
+        constexpr auto max = std::chrono::duration_cast<T>(
+          std::chrono::nanoseconds::max());
+        auto v = clamp_to_duration_max ? std::min(parsed, max.count()) : parsed;
+        return T{v};
     }
     return std::nullopt;
 }
@@ -78,18 +98,28 @@ get_string_value(const config_map_t& config, std::string_view key) {
 }
 
 // Either parse configuration or return nullopt
-static std::optional<bool>
+std::optional<bool>
 get_bool_value(const config_map_t& config, std::string_view key) {
     if (auto it = config.find(key); it != config.end()) {
-        return string_switch<std::optional<bool>>(it->second)
-          .match("true", true)
-          .match("false", false)
-          .default_match(std::nullopt);
+        try {
+            // Ignore case.
+            auto str_value = it->second;
+            std::transform(
+              str_value.begin(),
+              str_value.end(),
+              str_value.begin(),
+              [](const auto& c) { return std::tolower(c); });
+            return string_switch<std::optional<bool>>(str_value)
+              .match("true", true)
+              .match("false", false);
+        } catch (const std::runtime_error&) {
+            throw boost::bad_lexical_cast();
+        };
     }
     return std::nullopt;
 }
 
-static model::shadow_indexing_mode
+model::shadow_indexing_mode
 get_shadow_indexing_mode(const config_map_t& config) {
     auto arch_enabled = get_bool_value(config, topic_property_remote_write);
     auto si_enabled = get_bool_value(config, topic_property_remote_read);
@@ -117,26 +147,48 @@ get_shadow_indexing_mode(const config_map_t& config) {
     return mode;
 }
 
-// Special case for options where Kafka allows -1
-// In redpanda the mapping is following
-//
-// -1 (feature disabled)   =>  tristate.is_disabled() == true;
-// no value                =>  tristate.has_value() == false;
-// value present           =>  tristate.has_value() == true;
-
 template<typename T>
-static tristate<T>
-get_tristate_value(const config_map_t& config, std::string_view key) {
-    auto v = get_config_value<int64_t>(config, key);
-    // no value set
-    if (!v) {
-        return tristate<T>(std::nullopt);
+static std::optional<T>
+get_enum_value(const config_map_t& config, std::string_view key) {
+    T ret;
+    auto s_opt = get_string_value(config, key);
+    if (!s_opt) {
+        return std::nullopt;
     }
-    // disabled case
-    if (v <= 0) {
-        return tristate<T>{};
+    auto is = std::istringstream(*s_opt);
+    is >> ret;
+    if (is.fail()) {
+        return std::nullopt;
     }
-    return tristate<T>(std::make_optional<T>(*v));
+    return ret;
+}
+
+static std::optional<config::leaders_preference>
+get_leaders_preference(const config_map_t& config) {
+    if (auto it = config.find(topic_property_leaders_preference);
+        it != config.end()) {
+        return config::leaders_preference::parse(it->second);
+    }
+    return std::nullopt;
+}
+
+static tristate<std::chrono::milliseconds>
+get_delete_retention_ms(const config_map_t& config) {
+    auto delete_retention_ms = get_tristate_value<std::chrono::milliseconds>(
+      config, topic_property_delete_retention_ms);
+
+    // If the config entry for delete.retention.ms is in the "empty" state, and
+    // the cluster default is also std::nullopt, ensure the option is disabled
+    // by default. DescribeConfigs calls should still return DEFAULT_CONFIG when
+    // describing this state, thanks to override_if_not_default in
+    // config_response_utils.cc.
+    if (
+      delete_retention_ms.is_empty()
+      && !config::shard_local_cfg().tombstone_retention_ms().has_value()) {
+        return tristate<std::chrono::milliseconds>{disable_tristate};
+    }
+
+    return delete_retention_ms;
 }
 
 cluster::custom_assignable_topic_configuration
@@ -187,12 +239,51 @@ to_cluster_type(const creatable_topic& t) {
     cfg.properties.segment_ms = get_tristate_value<std::chrono::milliseconds>(
       config_entries, topic_property_segment_ms);
 
+    cfg.properties.initial_retention_local_target_bytes
+      = get_tristate_value<size_t>(
+        config_entries, topic_property_initial_retention_local_target_bytes);
+    cfg.properties.initial_retention_local_target_ms
+      = get_tristate_value<std::chrono::milliseconds>(
+        config_entries, topic_property_initial_retention_local_target_ms);
+
+    cfg.properties.mpx_virtual_cluster_id
+      = get_config_value<model::vcluster_id>(
+        config_entries, topic_property_mpx_virtual_cluster_id);
+
+    cfg.properties.write_caching = get_enum_value<model::write_caching_mode>(
+      config_entries, topic_property_write_caching);
+
+    cfg.properties.flush_ms = get_duration_value<std::chrono::milliseconds>(
+      config_entries, topic_property_flush_ms, true);
+
+    cfg.properties.flush_bytes = get_config_value<size_t>(
+      config_entries, topic_property_flush_bytes);
+
+    cfg.properties.iceberg_mode
+      = get_config_value<model::iceberg_mode>(
+          config_entries, topic_property_iceberg_mode)
+          .value_or(storage::ntp_config::default_iceberg_mode);
+
+    cfg.properties.leaders_preference = get_leaders_preference(config_entries);
+
+    cfg.properties.delete_retention_ms = get_delete_retention_ms(
+      config_entries);
+
+    cfg.properties.iceberg_delete = get_bool_value(
+      config_entries, topic_property_iceberg_delete);
+
     schema_id_validation_config_parser schema_id_validation_config_parser{
       cfg.properties};
 
     for (auto& p : t.configs) {
         schema_id_validation_config_parser(
           p, kafka::config_resource_operation::set);
+    }
+
+    if (config::shard_local_cfg().development_enable_cloud_topics()) {
+        cfg.properties.cloud_topic_enabled
+          = get_bool_value(config_entries, topic_property_cloud_topic_enabled)
+              .value_or(storage::ntp_config::default_cloud_topic_enabled);
     }
 
     /// Final topic_property not decoded here is \ref remote_topic_properties,
@@ -212,145 +303,32 @@ to_cluster_type(const creatable_topic& t) {
             ret.custom_assignments.push_back(
               cluster::custom_partition_assignment{
                 .id = assignment.partition_index,
-                .replicas = assignment.broker_ids});
+                .replicas = std::vector<model::node_id>{
+                  assignment.broker_ids.begin(), assignment.broker_ids.end()}});
         }
     }
     return ret;
 }
 
-template<typename T>
-static ss::sstring from_config_type(const T& v) {
-    if constexpr (std::is_enum_v<T>) {
-        return ss::to_sstring(static_cast<std::underlying_type_t<T>>(v));
-    } else if constexpr (std::is_same_v<bool, T>) {
-        return v ? "true" : "false";
-    } else if constexpr (std::is_same_v<T, std::chrono::milliseconds>) {
-        return ss::to_sstring(
-          std::chrono::duration_cast<std::chrono::milliseconds>(v).count());
-    } else {
-        return ss::to_sstring(v);
+static std::vector<kafka::creatable_topic_configs>
+convert_topic_configs(config_response_container_t&& topic_cfgs) {
+    auto configs = std::vector<kafka::creatable_topic_configs>();
+    configs.reserve(topic_cfgs.size());
+
+    for (auto& conf : topic_cfgs) {
+        configs.push_back(conf.to_create_config());
     }
+
+    return configs;
 }
 
-config_map_t from_cluster_type(const cluster::topic_properties& properties) {
-    config_map_t config_entries;
-    if (properties.compression) {
-        config_entries[topic_property_compression] = from_config_type(
-          *properties.compression);
-    }
-    if (properties.cleanup_policy_bitflags) {
-        config_entries[topic_property_cleanup_policy] = from_config_type(
-          *properties.cleanup_policy_bitflags);
-    }
-    if (properties.compaction_strategy) {
-        config_entries[topic_property_compaction_strategy] = from_config_type(
-          *properties.compaction_strategy);
-    }
-    if (properties.timestamp_type) {
-        config_entries[topic_property_timestamp_type] = from_config_type(
-          *properties.timestamp_type);
-    }
-    if (properties.segment_size) {
-        config_entries[topic_property_segment_size] = from_config_type(
-          *properties.segment_size);
-    }
-    if (properties.retention_bytes.has_optional_value()) {
-        config_entries[topic_property_retention_bytes] = from_config_type(
-          properties.retention_bytes.value());
-    }
-    if (properties.retention_duration.has_optional_value()) {
-        config_entries[topic_property_retention_duration] = from_config_type(
-          *properties.retention_duration);
-    }
-    if (properties.recovery) {
-        config_entries[topic_property_recovery] = from_config_type(
-          *properties.recovery);
-    }
-    if (properties.batch_max_bytes) {
-        config_entries[topic_property_max_message_bytes] = from_config_type(
-          *properties.batch_max_bytes);
-    }
-    if (properties.shadow_indexing) {
-        config_entries[topic_property_remote_write] = "false";
-        config_entries[topic_property_remote_read] = "false";
+std::vector<kafka::creatable_topic_configs> report_topic_configs(
+  const cluster::metadata_cache& metadata_cache,
+  const cluster::topic_properties& topic_properties) {
+    auto topic_cfgs = make_topic_configs(
+      metadata_cache, topic_properties, std::nullopt, false, false);
 
-        switch (*properties.shadow_indexing) {
-        case model::shadow_indexing_mode::archival:
-            config_entries[topic_property_remote_write] = "true";
-            break;
-        case model::shadow_indexing_mode::fetch:
-            config_entries[topic_property_remote_read] = "true";
-            break;
-        case model::shadow_indexing_mode::full:
-            config_entries[topic_property_remote_write] = "true";
-            config_entries[topic_property_remote_read] = "true";
-            break;
-        default:
-            break;
-        }
-    }
-    if (properties.read_replica_bucket) {
-        config_entries[topic_property_read_replica] = from_config_type(
-          *properties.read_replica_bucket);
-    }
-
-    if (properties.retention_local_target_bytes.has_optional_value()) {
-        config_entries[topic_property_retention_local_target_bytes]
-          = from_config_type(*properties.retention_local_target_bytes);
-    }
-
-    if (properties.retention_local_target_ms.has_optional_value()) {
-        config_entries[topic_property_retention_local_target_ms]
-          = from_config_type(*properties.retention_local_target_ms);
-    }
-
-    config_entries[topic_property_remote_delete] = from_config_type(
-      properties.remote_delete);
-
-    if (properties.segment_ms.has_optional_value()) {
-        config_entries[topic_property_segment_ms] = from_config_type(
-          properties.segment_ms.value());
-    }
-
-    if (properties.record_key_schema_id_validation) {
-        config_entries[topic_property_record_key_schema_id_validation]
-          = from_config_type(properties.record_key_schema_id_validation);
-    }
-    if (properties.record_key_schema_id_validation_compat) {
-        config_entries[topic_property_record_key_schema_id_validation_compat]
-          = from_config_type(properties.record_key_schema_id_validation_compat);
-    }
-    if (properties.record_key_subject_name_strategy) {
-        config_entries[topic_property_record_key_subject_name_strategy]
-          = from_config_type(properties.record_key_subject_name_strategy);
-    }
-    if (properties.record_key_subject_name_strategy_compat) {
-        config_entries[topic_property_record_key_subject_name_strategy_compat]
-          = from_config_type(
-            properties.record_key_subject_name_strategy_compat);
-    }
-    if (properties.record_value_schema_id_validation) {
-        config_entries[topic_property_record_value_schema_id_validation]
-          = from_config_type(properties.record_value_schema_id_validation);
-    }
-    if (properties.record_value_schema_id_validation_compat) {
-        config_entries[topic_property_record_value_schema_id_validation_compat]
-          = from_config_type(
-            properties.record_value_schema_id_validation_compat);
-    }
-    if (properties.record_value_subject_name_strategy) {
-        config_entries[topic_property_record_value_subject_name_strategy]
-          = from_config_type(properties.record_value_subject_name_strategy);
-    }
-    if (properties.record_value_subject_name_strategy_compat) {
-        config_entries[topic_property_record_value_subject_name_strategy_compat]
-          = from_config_type(
-            properties.record_value_subject_name_strategy_compat);
-    }
-
-    /// Final topic_property not encoded here is \ref remote_topic_properties,
-    /// is more of an implementation detail no need to ever show user
-    return config_entries;
+    return convert_topic_configs(std::move(topic_cfgs));
 }
 
 } // namespace kafka

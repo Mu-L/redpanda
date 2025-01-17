@@ -10,12 +10,15 @@
  */
 
 #pragma once
+#include "base/seastarx.h"
 #include "cluster/fwd.h"
 #include "cluster/types.h"
+#include "container/fragmented_vector.h"
+#include "kafka/protocol/errors.h"
+#include "kafka/protocol/logger.h"
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/handlers/topics/validators.h"
 #include "model/timeout_clock.h"
-#include "seastarx.h"
 
 #include <boost/container/flat_map.hpp>
 
@@ -43,7 +46,7 @@ concept TopicResultIterator
 template<typename T>
 requires TopicRequestItem<T>
 creatable_topic_result
-generate_error(T item, error_code code, const ss::sstring& msg) {
+generate_error(const T& item, error_code code, const ss::sstring& msg) {
     return creatable_topic_result{
       .name = item.name,
       .error_code = code,
@@ -54,7 +57,7 @@ generate_error(T item, error_code code, const ss::sstring& msg) {
 /// Generates successfull creatable_topic_result for single topic request item
 template<typename T>
 requires TopicRequestItem<T>
-creatable_topic_result generate_successfull_result(T item) {
+creatable_topic_result generate_successfull_result(const T& item) {
     return creatable_topic_result{
       .name = item.name, .error_code = error_code::none};
 }
@@ -110,28 +113,37 @@ Iter validate_requests_range(
 // Kafka protocol error message
 void append_cluster_results(
   const std::vector<cluster::topic_result>&,
-  std::vector<creatable_topic_result>&);
+  chunked_vector<creatable_topic_result>&);
 
 // Converts objects representing KafkaAPI message to objects consumed
 // by cluster::controller API
 // clang-format off
-template<typename KafkaApiTypeIter>
+template<typename KafkaApiTypeIter, typename ErrIter>
 requires TopicRequestItem<typename KafkaApiTypeIter::value_type> &&
+         TopicResultIterator<ErrIter> &&
 requires(KafkaApiTypeIter it) {
     to_cluster_type(*it);
 }
 // clang-format on
-auto to_cluster_type(KafkaApiTypeIter begin, KafkaApiTypeIter end)
-  -> std::vector<decltype(to_cluster_type(*begin))> {
-    std::vector<decltype(to_cluster_type(*begin))> cluster_types;
+auto to_cluster_type(
+  KafkaApiTypeIter begin, KafkaApiTypeIter end, ErrIter out_it)
+  -> chunked_vector<cluster::custom_assignable_topic_configuration> {
+    chunked_vector<cluster::custom_assignable_topic_configuration>
+      cluster_types;
     cluster_types.reserve(std::distance(begin, end));
-    std::transform(
-      begin,
-      end,
-      std::back_inserter(cluster_types),
-      [](const typename KafkaApiTypeIter::value_type& kafka_type) {
-          return to_cluster_type(kafka_type);
-      });
+    for (auto it = begin; it != end; ++it) {
+        try {
+            cluster_types.emplace_back(to_cluster_type(*it));
+        } catch (...) {
+            auto e = std::current_exception();
+            vlog(
+              klog.warn,
+              "Invalid config for topic creation generated error: {}",
+              e);
+            out_it = generate_error(
+              *it, error_code::invalid_config, "Configuration is invalid");
+        }
+    }
     return cluster_types;
 }
 
@@ -147,7 +159,7 @@ Iter validate_range_duplicates(Iter begin, Iter end, ErrIter out_it) {
     using type = typename Iter::value_type;
     boost::container::flat_map<model::topic_view, uint32_t> freq;
     freq.reserve(std::distance(begin, end));
-    for (auto const& r : boost::make_iterator_range(begin, end)) {
+    for (const auto& r : boost::make_iterator_range(begin, end)) {
         freq[r.name]++;
     }
     auto valid_range_end = std::partition(
@@ -178,7 +190,7 @@ void generate_not_controller_errors(Iter begin, Iter end, ErrIter out_it) {
 }
 
 // Wait for leaders of all topic partitons for given set of results
-ss::future<std::vector<model::node_id>> wait_for_leaders(
+ss::future<> wait_for_leaders(
   cluster::metadata_cache&,
   std::vector<cluster::topic_result>,
   model::timeout_clock::time_point);

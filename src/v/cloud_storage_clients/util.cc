@@ -10,10 +10,17 @@
 
 #include "cloud_storage_clients/util.h"
 
+#include "base/vlog.h"
 #include "bytes/streambuf.h"
 #include "net/connection.h"
+#include "utils/retry_chain_node.h"
+
+#include <seastar/core/future.hh>
 
 #include <boost/property_tree/xml_parser.hpp>
+
+#include <exception>
+#include <system_error>
 
 namespace {
 
@@ -38,8 +45,31 @@ bool has_abort_or_gate_close_exception(const ss::nested_exception& ex) {
            || is_abort_or_gate_close_exception(ex.outer);
 }
 
+bool is_nested_reconnect_error(const ss::nested_exception& ex) {
+    try {
+        std::rethrow_exception(ex.inner);
+    } catch (const std::system_error& e) {
+        if (!net::is_reconnect_error(e)) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    try {
+        std::rethrow_exception(ex.outer);
+    } catch (const std::system_error& e) {
+        if (!net::is_reconnect_error(e)) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+template<typename Logger>
 error_outcome handle_client_transport_error(
-  std::exception_ptr current_exception, ss::logger& logger) {
+  std::exception_ptr current_exception, Logger& logger) {
     auto outcome = error_outcome::retry;
 
     try {
@@ -77,7 +107,7 @@ error_outcome handle_client_transport_error(
         vlog(logger.warn, "Connection timeout {}", terr.what());
     } catch (const boost::system::system_error& err) {
         if (
-          err.code() != boost::beast::http::error::short_read
+          err.code() != boost::beast::http::error::end_of_stream
           && err.code() != boost::beast::http::error::partial_message) {
             vlog(logger.warn, "Connection failed {}", err.what());
             outcome = error_outcome::fail;
@@ -100,10 +130,12 @@ error_outcome handle_client_transport_error(
         if (has_abort_or_gate_close_exception(ex)) {
             vlog(logger.debug, "Nested abort or gate closed: {}", ex);
             throw;
+        } else if (is_nested_reconnect_error(ex)) {
+            vlog(logger.warn, "Connection error {}", std::current_exception());
+        } else {
+            vlog(logger.error, "Unexpected error {}", std::current_exception());
+            outcome = error_outcome::fail;
         }
-
-        vlog(logger.error, "Unexpected error {}", std::current_exception());
-        outcome = error_outcome::fail;
     } catch (...) {
         vlog(logger.error, "Unexpected error {}", std::current_exception());
         outcome = error_outcome::fail;
@@ -111,6 +143,11 @@ error_outcome handle_client_transport_error(
 
     return outcome;
 }
+
+template error_outcome
+handle_client_transport_error<ss::logger>(std::exception_ptr, ss::logger&);
+template error_outcome handle_client_transport_error<retry_chain_logger>(
+  std::exception_ptr, retry_chain_logger&);
 
 ss::future<iobuf>
 drain_response_stream(http::client::response_stream_ref resp) {
@@ -195,6 +232,27 @@ void log_buffer_with_rate_limiting(
     auto sz = stream.readsome(str.data(), buffer_size);
     auto sview = std::string_view(str.data(), sz);
     vlog(log_with_rate_limit, "{}: {}", msg, sview);
+}
+
+std::vector<object_key> all_paths_to_file(const object_key& path) {
+    if (!path().has_filename()) {
+        return {};
+    }
+
+    std::vector<object_key> paths;
+    std::filesystem::path current_path;
+    for (auto path_iter = path().begin(); path_iter != path().end();
+         ++path_iter) {
+        if (current_path == "") {
+            current_path += *path_iter;
+        } else {
+            current_path /= *path_iter;
+        }
+
+        paths.emplace_back(current_path);
+    }
+
+    return paths;
 }
 
 } // namespace cloud_storage_clients::util

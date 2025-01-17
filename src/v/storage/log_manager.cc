@@ -9,14 +9,14 @@
 
 #include "storage/log_manager.h"
 
-#include "cluster/cluster_utils.h"
-#include "cluster/topic_table.h"
+#include "base/likely.h"
+#include "base/vlog.h"
 #include "config/configuration.h"
-#include "likely.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timestamp.h"
 #include "resource_mgmt/io_priority.h"
+#include "resource_mgmt/memory_groups.h"
 #include "ssx/async-clear.h"
 #include "ssx/future-util.h"
 #include "storage/batch_cache.h"
@@ -24,8 +24,10 @@
 #include "storage/disk_log_impl.h"
 #include "storage/file_sanitizer.h"
 #include "storage/fs_utils.h"
+#include "storage/key_offset_map.h"
 #include "storage/kvstore.h"
 #include "storage/log.h"
+#include "storage/log_manager_probe.h"
 #include "storage/logger.h"
 #include "storage/segment.h"
 #include "storage/segment_appender.h"
@@ -34,9 +36,8 @@
 #include "storage/segment_set.h"
 #include "storage/segment_utils.h"
 #include "storage/storage_resources.h"
+#include "storage/types.h"
 #include "utils/directory_walker.h"
-#include "utils/gate_guard.h"
-#include "vlog.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/file.hh>
@@ -53,6 +54,7 @@
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/switch_to.hh>
+#include <seastar/util/defer.hh>
 #include <seastar/util/file.hh>
 
 #include <boost/algorithm/string/predicate.hpp>
@@ -62,6 +64,8 @@
 #include <exception>
 #include <filesystem>
 #include <optional>
+
+using namespace std::chrono_literals;
 
 namespace storage {
 using logs_type = absl::flat_hash_map<model::ntp, log_housekeeping_meta>;
@@ -80,7 +84,7 @@ log_config::log_config(
   , retention_bytes(config::mock_binding<std::optional<size_t>>(std::nullopt))
   , compaction_interval(
       config::mock_binding<std::chrono::milliseconds>(std::chrono::minutes(10)))
-  , delete_retention(
+  , log_retention(
       config::mock_binding<std::optional<std::chrono::milliseconds>>(
         std::chrono::minutes(10080)))
   , file_config(std::move(file_cfg)) {}
@@ -92,10 +96,10 @@ log_config::log_config(
   with_cache with,
   std::optional<file_sanitize_config> file_cfg) noexcept
   : log_config(
-    std::move(directory),
-    segment_size,
-    compaction_priority,
-    std::move(file_cfg)) {
+      std::move(directory),
+      segment_size,
+      compaction_priority,
+      std::move(file_cfg)) {
     cache = with;
 }
 
@@ -108,7 +112,7 @@ log_config::log_config(
   ss::io_priority_class compaction_priority,
   config::binding<std::optional<size_t>> ret_bytes,
   config::binding<std::chrono::milliseconds> compaction_ival,
-  config::binding<std::optional<std::chrono::milliseconds>> del_ret,
+  config::binding<std::optional<std::chrono::milliseconds>> log_ret,
   with_cache c,
   batch_cache::reclaim_options recopts,
   std::chrono::milliseconds rdrs_cache_eviction_timeout,
@@ -122,7 +126,7 @@ log_config::log_config(
   , compaction_priority(compaction_priority)
   , retention_bytes(std::move(ret_bytes))
   , compaction_interval(std::move(compaction_ival))
-  , delete_retention(std::move(del_ret))
+  , log_retention(std::move(log_ret))
   , cache(c)
   , reclaim_opts(recopts)
   , readers_cache_eviction_timeout(rdrs_cache_eviction_timeout)
@@ -139,13 +143,17 @@ log_manager::log_manager(
   , _resources(resources)
   , _feature_table(feature_table)
   , _jitter(_config.compaction_interval())
-  , _batch_cache(config.reclaim_opts) {
+  , _trigger_gc_jitter(0s, 5s)
+  , _batch_cache(_config.reclaim_opts)
+  , _probe(std::make_unique<log_manager_probe>()) {
     _config.compaction_interval.watch([this]() {
         _jitter = simple_time_jitter<ss::lowres_clock>{
           _config.compaction_interval()};
         _housekeeping_sem.signal();
     });
 }
+
+log_manager::~log_manager() = default;
 
 ss::future<> log_manager::clean_close(ss::shared_ptr<storage::log> log) {
     auto clean_segment = co_await log->close();
@@ -167,7 +175,12 @@ ss::future<> log_manager::clean_close(ss::shared_ptr<storage::log> log) {
 }
 
 ss::future<> log_manager::start() {
-    ssx::spawn_with_gate(_open_gate, [this] { return housekeeping(); });
+    _probe->setup_metrics();
+    if (unlikely(config::shard_local_cfg()
+                   .log_disable_housekeeping_for_tests.value())) {
+        co_return;
+    }
+    ssx::spawn_with_gate(_gate, [this] { return housekeeping(); });
     co_return;
 }
 
@@ -175,13 +188,20 @@ ss::future<> log_manager::stop() {
     _abort_source.request_abort();
     _housekeeping_sem.broken();
 
-    co_await _open_gate.close();
+    co_await _gate.close();
     co_await ss::coroutine::parallel_for_each(
       _logs, [this](logs_type::value_type& entry) {
           return clean_close(entry.second->handle);
       });
     co_await _batch_cache.stop();
-    co_await ssx::async_clear(_logs)();
+    co_await ssx::async_clear(_logs);
+    if (_compaction_hash_key_map) {
+        // Clear memory used for the compaction hash map, if any.
+        co_await _compaction_hash_key_map->initialize(0);
+        _compaction_hash_key_map.reset();
+    }
+
+    _probe->clear_metrics();
 }
 
 /**
@@ -191,8 +211,16 @@ ss::future<>
 log_manager::housekeeping_scan(model::timestamp collection_threshold) {
     using bflags = log_housekeeping_meta::bitflags;
 
-    if (_logs_list.empty()) {
-        co_return;
+    static constexpr auto is_not_set = [](bflags var, auto flag) {
+        return (var & flag) != flag;
+    };
+
+    // reset flags for the next two loops, segment_ms and compaction.
+    // since there are suspension points during the traversal of _logs_list, the
+    // algorithm is: mark the logs visited, rotate _logs_list, op, and loop
+    // until empty or reaching a marked log
+    for (auto& log_meta : _logs_list) {
+        log_meta.flags &= ~(bflags::compacted | bflags::lifetime_checked);
     }
 
     /*
@@ -206,40 +234,60 @@ log_manager::housekeeping_scan(model::timestamp collection_threshold) {
      *   compaction is already sequential when this will be unified with
      *   compaction, the whole task could be made concurrent
      */
-    for (auto& log_meta : _logs_list) {
-        co_await log_meta.handle->apply_segment_ms();
+    while (!_logs_list.empty()
+           && is_not_set(_logs_list.front().flags, bflags::lifetime_checked)) {
+        if (_abort_source.abort_requested()) {
+            co_return;
+        }
+
+        auto& current_log = _logs_list.front();
+        _logs_list.shift_forward();
+
+        current_log.flags |= bflags::lifetime_checked;
+        // NOTE: apply_segment_ms holds _compaction_housekeeping_gate, that
+        // prevents the removal of the parent object. this makes awaiting
+        // apply_segment_ms safe against removal of segments from _logs_list
+        co_await current_log.handle->apply_segment_ms();
     }
 
-    for (auto& log_meta : _logs_list) {
-        log_meta.flags &= ~bflags::compacted;
+    if (
+      config::shard_local_cfg().log_compaction_use_sliding_window.value()
+      && !_compaction_hash_key_map && !_logs_list.empty()
+      && is_not_set(_logs_list.front().flags, bflags::compacted)) {
+        auto compaction_mem_bytes
+          = memory_groups().compaction_reserved_memory();
+        auto compaction_map = std::make_unique<hash_key_offset_map>();
+        co_await compaction_map->initialize(compaction_mem_bytes);
+        _compaction_hash_key_map = std::move(compaction_map);
     }
-
-    while ((_logs_list.front().flags & bflags::compacted) == bflags::none) {
+    while (!_logs_list.empty()
+           && is_not_set(_logs_list.front().flags, bflags::compacted)) {
         if (_abort_source.abort_requested()) {
             co_return;
         }
 
         auto& current_log = _logs_list.front();
 
-        _logs_list.pop_front();
-        _logs_list.push_back(current_log);
+        _logs_list.shift_forward();
 
         current_log.flags |= bflags::compacted;
         current_log.last_compaction = ss::lowres_clock::now();
 
         auto ntp_sanitizer_cfg = _config.maybe_get_ntp_sanitizer_config(
           current_log.handle->config().ntp());
+        // NOTE: housekeeping holds _compaction_housekeeping_gate, that prevents
+        // the removal of the parent object. this makes awaiting housekeeping
+        // safe against removal of segments from _logs_list
         co_await current_log.handle->housekeeping(housekeeping_config(
           collection_threshold,
           _config.retention_bytes(),
           current_log.handle->stm_manager()->max_collectible_offset(),
+          current_log.handle->config().tombstone_retention_ms(),
           _config.compaction_priority,
           _abort_source,
-          std::move(ntp_sanitizer_cfg)));
-
-        if (_logs_list.empty()) {
-            co_return;
-        }
+          std::move(ntp_sanitizer_cfg),
+          _compaction_hash_key_map.get()));
+        _probe->housekeeping_log_processed();
 
         // bail out of compaction early in order to get back to gc
         if (_gc_triggered) {
@@ -249,7 +297,7 @@ log_manager::housekeeping_scan(model::timestamp collection_threshold) {
 }
 
 ss::future<> log_manager::housekeeping() {
-    while (!_open_gate.is_closed()) {
+    while (!_gate.is_closed()) {
         try {
             co_await housekeeping_loop();
         } catch (...) {
@@ -258,30 +306,32 @@ ss::future<> log_manager::housekeeping() {
              * a partition shutting down. we only stop running housekeeping when
              * the log manager stops.
              */
-            if (ssx::is_shutdown_exception(std::current_exception())) {
+            auto e = std::current_exception();
+            if (ssx::is_shutdown_exception(e)) {
+                vlog(
+                  stlog.debug,
+                  "Shutdown error caught in housekeeping(): {}",
+                  e);
                 continue;
             }
-            vlog(
-              stlog.info,
-              "Error processing housekeeping(): {}",
-              std::current_exception());
+            vlog(stlog.info, "Error processing housekeeping(): {}", e);
         }
     }
+}
+
+model::timestamp log_manager::lowest_ts_to_retain() const {
+    if (!_config.log_retention().has_value()) {
+        return model::timestamp(0);
+    }
+    const auto now = model::timestamp::now().value();
+    const auto retention = _config.log_retention().value().count();
+    return model::timestamp(now - retention);
 }
 
 ss::future<> log_manager::housekeeping_loop() {
     /*
      * data older than this threshold may be garbage collected
      */
-    const auto collection_threshold = [this] {
-        if (!_config.delete_retention().has_value()) {
-            return model::timestamp(0);
-        }
-        const auto now = model::timestamp::now().value();
-        const auto retention = _config.delete_retention().value().count();
-        return model::timestamp(now - retention);
-    };
-
     while (true) {
         try {
             const auto prev_jitter_base = _jitter.base_duration();
@@ -317,6 +367,7 @@ ss::future<> log_manager::housekeeping_loop() {
             // it is expected that callers set the flag whenever they want the
             // next round of housekeeping to priortize gc.
             _gc_triggered = false;
+            _probe->urgent_gc_run();
 
             /*
              * build a schedule of partitions to gc ordered by amount of
@@ -342,7 +393,7 @@ ss::future<> log_manager::housekeeping_loop() {
 
                 auto ntp = log_meta.handle->config().ntp();
                 auto usage = co_await log_meta.handle->disk_usage(
-                  gc_config(collection_threshold(), _config.retention_bytes()));
+                  gc_config(lowest_ts_to_retain(), _config.retention_bytes()));
 
                 /*
                  * NOTE: this estimate is for local retention policy only. for a
@@ -364,7 +415,7 @@ ss::future<> log_manager::housekeeping_loop() {
                     continue;
                 }
                 co_await log->gc(
-                  gc_config(collection_threshold(), _config.retention_bytes()));
+                  gc_config(lowest_ts_to_retain(), _config.retention_bytes()));
             }
         }
 
@@ -391,9 +442,13 @@ ss::future<> log_manager::housekeeping_loop() {
         auto prev_sg = co_await ss::coroutine::switch_to(_config.compaction_sg);
 
         try {
-            co_await housekeeping_scan(collection_threshold());
-        } catch (const std::exception& e) {
-            vlog(stlog.info, "Error processing housekeeping(): {}", e);
+            co_await housekeeping_scan(lowest_ts_to_retain());
+        } catch (...) {
+            auto eptr = std::current_exception();
+            if (ssx::is_shutdown_exception(eptr)) {
+                std::rethrow_exception(eptr);
+            }
+            vlog(stlog.warn, "Error processing housekeeping(): {}", eptr);
         }
 
         co_await ss::coroutine::switch_to(prev_sg);
@@ -411,8 +466,9 @@ ss::future<ss::lw_shared_ptr<segment>> log_manager::make_log_segment(
   ss::io_priority_class pc,
   size_t read_buf_size,
   unsigned read_ahead,
+  size_t segment_size_hint,
   record_version_type version) {
-    auto gate_holder = _open_gate.hold();
+    auto gate_holder = _gate.hold();
 
     auto ntp_sanitizer_cfg = _config.maybe_get_ntp_sanitizer_config(ntp.ntp());
 
@@ -427,7 +483,8 @@ ss::future<ss::lw_shared_ptr<segment>> log_manager::make_log_segment(
       create_cache(ntp.cache_enabled()),
       _resources,
       _feature_table,
-      std::move(ntp_sanitizer_cfg));
+      std::move(ntp_sanitizer_cfg),
+      segment_size_hint);
 }
 
 std::optional<batch_cache_index>
@@ -441,14 +498,25 @@ log_manager::create_cache(with_cache ntp_cache_enabled) {
     return batch_cache_index(_batch_cache);
 }
 
-ss::future<ss::shared_ptr<log>> log_manager::manage(ntp_config cfg) {
-    auto gate = _open_gate.hold();
+ss::future<ss::shared_ptr<log>> log_manager::manage(
+  ntp_config cfg,
+  raft::group_id group,
+  std::vector<model::record_batch_type> translator_batch_types) {
+    auto gate = _gate.hold();
+    if (!translator_batch_types.empty()) {
+        // Sanity check to avoid multiple logs overwriting each others'
+        // translator state in the kvstore, which is keyed by group id.
+        vassert(
+          group != raft::group_id{},
+          "When configured to translate offsets, must supply a valid group id");
+    }
 
     auto units = co_await _resources.get_recovery_units();
-    co_return co_await do_manage(std::move(cfg));
+    co_return co_await do_manage(
+      std::move(cfg), group, std::move(translator_batch_types));
 }
 
-ss::future<> log_manager::recover_log_state(const ntp_config& cfg) {
+ss::future<> log_manager::maybe_clear_kvstore(const ntp_config& cfg) {
     return ss::file_exists(cfg.work_directory())
       .then([this,
              offset_key = internal::start_offset_key(cfg.ntp()),
@@ -459,6 +527,7 @@ ss::future<> log_manager::recover_log_state(const ntp_config& cfg) {
           }
           // directory was deleted, make sure we do not have any state in KV
           // store.
+          // NOTE: this only removes state in the storage key space.
           return _kvstore.remove(kvstore::key_space::storage, offset_key)
             .then([this, segment_key] {
                 return _kvstore.remove(
@@ -467,7 +536,10 @@ ss::future<> log_manager::recover_log_state(const ntp_config& cfg) {
       });
 }
 
-ss::future<ss::shared_ptr<log>> log_manager::do_manage(ntp_config cfg) {
+ss::future<ss::shared_ptr<log>> log_manager::do_manage(
+  ntp_config cfg,
+  raft::group_id group,
+  std::vector<model::record_batch_type> translator_batch_types) {
     if (_config.base_dir.empty()) {
         throw std::runtime_error(
           "log_manager:: cannot have empty config.base_dir");
@@ -485,7 +557,7 @@ ss::future<ss::shared_ptr<log>> log_manager::do_manage(ntp_config cfg) {
                                .segment_name;
     }
 
-    co_await recover_log_state(cfg);
+    co_await maybe_clear_kvstore(cfg);
 
     with_cache cache_enabled = cfg.cache_enabled();
     auto ntp_sanitizer_cfg = _config.maybe_get_ntp_sanitizer_config(cfg.ntp());
@@ -503,36 +575,42 @@ ss::future<ss::shared_ptr<log>> log_manager::do_manage(ntp_config cfg) {
       std::move(ntp_sanitizer_cfg));
 
     auto l = storage::make_disk_backed_log(
-      std::move(cfg), *this, std::move(segments), _kvstore, _feature_table);
+      std::move(cfg),
+      group,
+      *this,
+      std::move(segments),
+      _kvstore,
+      _feature_table,
+      std::move(translator_batch_types));
     auto [it, success] = _logs.emplace(
       l->config().ntp(), std::make_unique<log_housekeeping_meta>(l));
     _logs_list.push_back(*it->second);
-    _resources.update_partition_count(_logs.size());
+    update_log_count();
     vassert(success, "Could not keep track of:{} - concurrency issue", l);
     co_return l;
 }
 
 ss::future<> log_manager::shutdown(model::ntp ntp) {
     vlog(stlog.debug, "Asked to shutdown: {}", ntp);
-    auto gate = _open_gate.hold();
+    auto gate = _gate.hold();
     auto handle = _logs.extract(ntp);
-    if (handle.empty()) {
+    if (!handle) {
         co_return;
     }
-    co_await clean_close(handle.mapped()->handle);
+    co_await clean_close(handle.value().second->handle);
     vlog(stlog.debug, "Shutdown: {}", ntp);
 }
 
 ss::future<> log_manager::remove(model::ntp ntp) {
     vlog(stlog.info, "Asked to remove: {}", ntp);
-    gate_guard g(_open_gate);
+    auto g = _gate.hold();
     auto handle = _logs.extract(ntp);
-    _resources.update_partition_count(_logs.size());
-    if (handle.empty()) {
+    update_log_count();
+    if (!handle) {
         co_return;
     }
     // 'ss::shared_ptr<>' make a copy
-    auto lg = handle.mapped()->handle;
+    auto lg = handle.value().second->handle;
     vlog(stlog.info, "Removing: {}", lg);
     // NOTE: it is ok to *not* externally synchronize the log here
     // because remove, takes a write lock on each individual segments
@@ -594,8 +672,8 @@ ss::future<> remove_orphan_partition_files(
               vlog(stlog.info, "Cleaning up ntp directory {} ", ntp_directory);
               return ss::recursive_remove_directory(ntp_directory)
                 .handle_exception_type([ntp_directory](
-                                         std::filesystem::
-                                           filesystem_error const& err) {
+                                         const std::filesystem::
+                                           filesystem_error& err) {
                     vlog(
                       stlog.error,
                       "Exception while cleaning orphan files for {} Error: {}",
@@ -612,12 +690,16 @@ ss::future<> log_manager::remove_orphan_files(
   absl::flat_hash_set<model::ns> namespaces,
   ss::noncopyable_function<bool(model::ntp, partition_path::metadata)>
     orphan_filter) {
+    auto holder = _gate.hold();
     auto data_directory_exist = co_await ss::file_exists(data_directory_path);
     if (!data_directory_exist) {
         co_return;
     }
 
     for (const auto& ns : namespaces) {
+        if (_gate.is_closed()) {
+            co_return;
+        }
         auto namespace_directory = std::filesystem::path(data_directory_path)
                                    / std::filesystem::path(ss::sstring(ns));
         auto namespace_directory_exist = co_await ss::file_exists(
@@ -647,7 +729,7 @@ ss::future<> log_manager::remove_orphan_files(
                       topic_directory.string());
                 })
                 .handle_exception_type(
-                  [](std::filesystem::filesystem_error const& err) {
+                  [](const std::filesystem::filesystem_error& err) {
                       auto lvl = err.code()
                                      == std::errc::no_such_file_or_directory
                                    ? ss::log_level::trace
@@ -660,7 +742,7 @@ ss::future<> log_manager::remove_orphan_files(
                   });
           })
           .handle_exception_type(
-            [](std::filesystem::filesystem_error const& err) {
+            [](const std::filesystem::filesystem_error& err) {
                 vlog(
                   stlog.error, "Exception while cleaning orphan files {}", err);
             });
@@ -672,7 +754,8 @@ ss::future<> log_manager::dispatch_topic_dir_deletion(ss::sstring dir) {
     return ss::smp::submit_to(
              0,
              [dir = std::move(dir)]() mutable {
-                 static thread_local mutex fs_lock;
+                 static thread_local mutex fs_lock{
+                   "dispatch_topic_dir_deletion"};
                  return fs_lock.with([dir = std::move(dir)] {
                      return ss::file_exists(dir).then([dir](bool exists) {
                          if (!exists) {
@@ -725,13 +808,12 @@ std::ostream& operator<<(std::ostream& o, const log_config& c) {
     } else {
         o << "nullopt";
     }
-    return o << ", compaction_interval_ms:" << c.compaction_interval().count()
-             << ", delete_retention_ms:"
-             << c.delete_retention()
-                  .value_or(std::chrono::milliseconds(-1))
-                  .count()
-             << ", with_cache:" << c.cache
-             << ", reclaim_opts:" << c.reclaim_opts << "}";
+    return o
+           << ", compaction_interval_ms:" << c.compaction_interval().count()
+           << ", log_retention_ms:"
+           << c.log_retention().value_or(std::chrono::milliseconds(-1)).count()
+           << ", with_cache:" << c.cache << ", reclaim_opts:" << c.reclaim_opts
+           << "}";
 }
 std::ostream& operator<<(std::ostream& o, const log_manager& m) {
     return o << "{config:" << m._config << ", logs.size:" << m._logs.size()
@@ -745,26 +827,22 @@ ss::future<usage_report> log_manager::disk_usage() {
      * TODO: this will be factored out to make the sharing of settings easier to
      * maintain.
      */
-    model::timestamp collection_threshold;
-    if (!_config.delete_retention()) {
-        collection_threshold = model::timestamp(0);
-    } else {
-        collection_threshold = model::timestamp(
-          model::timestamp::now().value()
-          - _config.delete_retention()->count());
-    }
+    auto cfg = default_gc_config();
 
     fragmented_vector<ss::shared_ptr<log>> logs;
     for (auto& it : _logs) {
         logs.push_back(it.second->handle);
     }
 
+    ss::semaphore limit(std::max<size_t>(
+      1, config::shard_local_cfg().space_management_max_log_concurrency()));
+
     co_return co_await ss::map_reduce(
       logs.begin(),
       logs.end(),
-      [this, collection_threshold](ss::shared_ptr<log> log) {
-          return log->disk_usage(
-            gc_config(collection_threshold, _config.retention_bytes()));
+      [&limit, cfg](ss::shared_ptr<log> log) {
+          return ss::with_semaphore(
+            limit, 1, [cfg, log] { return log->disk_usage(cfg); });
       },
       usage_report{},
       [](usage_report acc, usage_report update) { return acc + update; });
@@ -789,8 +867,32 @@ void log_manager::handle_disk_notification(storage::disk_space_alert alert) {
 }
 
 void log_manager::trigger_gc() {
-    _gc_triggered = true;
-    _housekeeping_sem.signal();
+    ssx::spawn_with_gate(_gate, [this] {
+        return ss::sleep_abortable(
+                 _trigger_gc_jitter.next_duration(), _abort_source)
+          .then([this] {
+              _gc_triggered = true;
+              _housekeeping_sem.signal();
+          });
+    });
+}
+
+gc_config log_manager::default_gc_config() const {
+    model::timestamp collection_threshold;
+    if (!_config.log_retention()) {
+        collection_threshold = model::timestamp(0);
+    } else {
+        collection_threshold = model::timestamp(
+          model::timestamp::now().value() - _config.log_retention()->count());
+    }
+    return {collection_threshold, _config.retention_bytes()};
+}
+
+void log_manager::update_log_count() {
+    auto count = _logs.size();
+
+    _resources.update_partition_count(count);
+    _probe->set_log_count(count);
 }
 
 } // namespace storage

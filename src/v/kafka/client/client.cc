@@ -9,6 +9,7 @@
 
 #include "kafka/client/client.h"
 
+#include "base/seastarx.h"
 #include "kafka/client/broker.h"
 #include "kafka/client/configuration.h"
 #include "kafka/client/consumer.h"
@@ -21,15 +22,13 @@
 #include "kafka/protocol/fetch.h"
 #include "kafka/protocol/find_coordinator.h"
 #include "kafka/protocol/leave_group.h"
-#include "kafka/protocol/list_offsets.h"
-#include "kafka/types.h"
+#include "kafka/protocol/list_offset.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timeout_clock.h"
-#include "net/unresolved_address.h"
 #include "random/generators.h"
-#include "seastarx.h"
 #include "ssx/future-util.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -53,7 +52,7 @@ client::client(const YAML::Node& cfg, external_mitigate mitigater)
   , _wait_or_start_update_metadata{[this](wait_or_start::tag tag) {
       return update_metadata(tag);
   }}
-  , _producer{_config, _topic_cache, _brokers, [this](std::exception_ptr ex) {
+  , _producer{_config, _topic_cache, _brokers, _config.produce_ack_level(), [this](std::exception_ptr ex) {
       return mitigate_error(std::move(ex));
   }}
   , _external_mitigate(std::move(mitigater)) {}
@@ -82,41 +81,43 @@ ss::future<> client::connect() {
           [this, &retries](std::exception_ptr ex) {
               ++retries;
               return _external_mitigate(ex);
-          });
+          },
+          _as);
     });
 }
 
 namespace {
 template<typename Func>
-ss::future<> catch_and_log(Func&& f) noexcept {
+ss::future<> catch_and_log(const client& c, Func&& f) noexcept {
     return ss::futurize_invoke(std::forward<Func>(f))
       .discard_result()
-      .handle_exception([](std::exception_ptr e) {
-          vlog(kclog.debug, "exception during stop: {}", e);
+      .handle_exception([&c](std::exception_ptr e) {
+          vlog(kclog.debug, "{}exception during stop: {}", c, e);
       });
 }
 
 } // namespace
 
 ss::future<> client::stop() noexcept {
+    _as.request_abort();
+    co_await catch_and_log(*this, [this]() { return _producer.stop(); });
     co_await _gate.close();
-    co_await catch_and_log([this]() { return _producer.stop(); });
     for (auto& [id, group] : _consumers) {
         while (!group.empty()) {
             auto c = *group.begin();
-            co_await catch_and_log([c]() {
+            co_await catch_and_log(*this, [c]() {
                 // The consumer is constructed with an on_stopped which erases
                 // istelf from the map after leave() completes.
                 return c->leave();
             });
         }
     }
-    co_await catch_and_log([this]() { return _brokers.stop(); });
+    co_await catch_and_log(*this, [this]() { return _brokers.stop(); });
 }
 
 ss::future<> client::update_metadata(wait_or_start::tag) {
     return ss::try_with_gate(_gate, [this]() {
-        vlog(kclog.debug, "updating metadata");
+        vlog(kclog.debug, "{}updating metadata", *this);
         return _brokers.any()
           .then([this](shared_broker_t broker) {
               return broker->dispatch(metadata_request{.list_all_topics = true})
@@ -134,7 +135,8 @@ ss::future<> client::update_metadata(wait_or_start::tag) {
 
                     return apply(std::move(res));
                 })
-                .finally([]() { vlog(kclog.trace, "updated metadata"); });
+                .finally(
+                  [this]() { vlog(kclog.trace, "{}updated metadata", *this); });
           })
           .handle_exception_type(
             [this](const broker_error&) { return connect(); });
@@ -142,9 +144,14 @@ ss::future<> client::update_metadata(wait_or_start::tag) {
 }
 
 ss::future<> client::apply(metadata_response res) {
-    co_await _brokers.apply(std::move(res.data.brokers));
-    co_await _topic_cache.apply(std::move(res.data.topics));
-    _controller = res.data.controller_id;
+    try {
+        co_await _brokers.apply(std::move(res.data.brokers));
+        co_await _topic_cache.apply(std::move(res.data.topics));
+        _controller = res.data.controller_id;
+    } catch (const std::exception& ex) {
+        vlog(kclog.debug, "{}Failed to apply metadata request: {}", *this, ex);
+        throw;
+    }
 }
 
 ss::future<> client::mitigate_error(std::exception_ptr ex) {
@@ -156,13 +163,13 @@ ss::future<> client::mitigate_error(std::exception_ptr ex) {
           } catch (const broker_error& ex) {
               // If there are no brokers, reconnect
               if (ex.node_id == unknown_node_id) {
-                  vlog(kclog.warn, "broker_error: {}", ex);
+                  vlog(kclog.warn, "{}broker_error: {}", *this, ex);
                   return connect();
               } else if (ex.error == error_code::not_controller) {
-                  vlog(kclog.debug, "broker_error: {}", ex);
+                  vlog(kclog.debug, "{}broker_error: {}", *this, ex);
                   return _wait_or_start_update_metadata();
               } else {
-                  vlog(kclog.debug, "broker_error: {}", ex);
+                  vlog(kclog.debug, "{}broker_error: {}", *this, ex);
                   return _brokers.erase(ex.node_id).then([this]() {
                       return _wait_or_start_update_metadata();
                   });
@@ -170,10 +177,10 @@ ss::future<> client::mitigate_error(std::exception_ptr ex) {
           } catch (const consumer_error& ex) {
               switch (ex.error) {
               case error_code::coordinator_not_available:
-                  vlog(kclog.debug, "consumer_error: {}", ex);
+                  vlog(kclog.debug, "{}consumer_error: {}", *this, ex);
                   return _wait_or_start_update_metadata();
               default:
-                  vlog(kclog.warn, "consumer_error: {}", ex);
+                  vlog(kclog.warn, "{}consumer_error: {}", *this, ex);
                   return ss::make_exception_future(ex);
               }
           } catch (const partition_error& ex) {
@@ -181,35 +188,35 @@ ss::future<> client::mitigate_error(std::exception_ptr ex) {
               case error_code::unknown_topic_or_partition:
               case error_code::not_leader_for_partition:
               case error_code::leader_not_available: {
-                  vlog(kclog.debug, "partition_error: {}", ex);
+                  vlog(kclog.debug, "{}partition_error: {}", *this, ex);
                   return _wait_or_start_update_metadata();
               }
               default:
-                  vlog(kclog.warn, "partition_error: {}", ex);
+                  vlog(kclog.warn, "{}partition_error: {}", *this, ex);
                   return ss::make_exception_future(ex);
               }
           } catch (const topic_error& ex) {
               switch (ex.error) {
               case error_code::unknown_topic_or_partition:
-                  vlog(kclog.debug, "topic_error: {}", ex);
+                  vlog(kclog.debug, "{}topic_error: {}", *this, ex);
                   return _wait_or_start_update_metadata();
               default:
-                  vlog(kclog.warn, "topic_error: {}", ex);
+                  vlog(kclog.warn, "{}topic_error: {}", *this, ex);
                   return ss::make_exception_future(ex);
               }
           } catch (const ss::gate_closed_exception&) {
-              vlog(kclog.debug, "gate_closed_exception");
+              vlog(kclog.debug, "{}gate_closed_exception", *this);
           } catch (const std::system_error& ex) {
               if (net::is_reconnect_error(ex)) {
-                  vlog(kclog.debug, "system_error: {}", ex);
+                  vlog(kclog.debug, "{}system_error: {}", *this, ex);
                   return _wait_or_start_update_metadata();
               } else {
-                  vlog(kclog.warn, "system_error: {}", ex);
+                  vlog(kclog.warn, "{}system_error: {}", *this, ex);
                   return ss::make_exception_future(ex);
               }
           } catch (const std::exception& ex) {
               // TODO(Ben): Probably vassert
-              vlog(kclog.error, "unknown exception: {}", ex);
+              vlog(kclog.error, "{}unknown exception: {}", *this, ex);
           }
           return ss::make_exception_future(ex);
       });
@@ -221,7 +228,8 @@ ss::future<produce_response::partition> client::produce_record_batch(
       _gate, [this, tp{std::move(tp)}, batch{std::move(batch)}]() mutable {
           vlog(
             kclog.debug,
-            "produce record_batch: {}, {{record_count: {}}}",
+            "{}produce record_batch: {}, {{record_count: {}}}",
+            *this,
             tp,
             batch.record_count());
           return _producer.produce(std::move(tp), std::move(batch));
@@ -229,7 +237,7 @@ ss::future<produce_response::partition> client::produce_record_batch(
 }
 
 ss::future<produce_response> client::produce_records(
-  model::topic topic, std::vector<record_essence> records) {
+  model::topic topic, chunked_vector<record_essence> records) {
     absl::node_hash_map<model::partition_id, storage::record_batch_builder>
       partition_builders;
 
@@ -239,7 +247,7 @@ ss::future<produce_response> client::produce_records(
         if (!p_id) {
             p_id = co_await gated_retry_with_mitigation([&, this]() {
                        return _topic_cache.partition_for(topic, record);
-                   }).handle_exception_type([](const topic_error&) {
+                   }).handle_exception([](std::exception_ptr) {
                 // Assume auto topic creation is on and assign to first
                 // partition
                 return model::partition_id{0};
@@ -280,10 +288,13 @@ ss::future<produce_response> client::produce_records(
             std::move(*p.records->adapter.batch));
       });
 
+    chunked_vector<topic_produce_response> responses_cv;
+    responses_cv.emplace_back(topic_produce_response{
+      .name{std::move(topic)}, .partitions{std::move(responses)}});
+
     co_return produce_response{
       .data = produce_response_data{
-        .responses{
-          {.name{std::move(topic)}, .partitions{std::move(responses)}}},
+        .responses = std::move(responses_cv),
         .throttle_time_ms{{std::chrono::milliseconds{0}}}}};
 }
 
@@ -293,8 +304,12 @@ client::create_topic(kafka::creatable_topic req) {
         auto controller = _controller;
         return _brokers.find(controller)
           .then([req](auto broker) mutable {
-              return broker->dispatch(
-                kafka::create_topics_request{.data{.topics{std::move(req)}}});
+              chunked_vector<kafka::creatable_topic> cv;
+              cv.push_back(std::move(req));
+              return broker->dispatch(kafka::create_topics_request{
+                .data = {
+                  .topics = std::move(cv),
+                }});
           })
           .then([controller](auto res) {
               auto ec = res.data.topics[0].error_code;
@@ -303,6 +318,10 @@ client::create_topic(kafka::creatable_topic req) {
                   return ss::make_exception_future<create_topics_response>(
                     broker_error(controller, ec));
               case error_code::throttling_quota_exceeded:
+                  return ss::make_exception_future<create_topics_response>(
+                    topic_error(
+                      model::topic_view{res.data.topics[0].name}, ec));
+              case error_code::topic_authorization_failed:
                   return ss::make_exception_future<create_topics_response>(
                     topic_error(
                       model::topic_view{res.data.topics[0].name}, ec));
@@ -324,11 +343,19 @@ ss::future<list_offsets_response>
 client::do_list_offsets(model::topic_partition tp) {
     auto node_id = co_await _topic_cache.leader(tp);
     auto broker = co_await _brokers.find(node_id);
+    chunked_vector<kafka::list_offset_topic> cv;
+    cv.push_back(kafka::list_offset_topic{
+      .name{tp.topic},
+      .partitions{
+        {
+          {.partition_index{tp.partition}, .max_num_offsets = 1},
+        },
+      },
+    });
     auto res = co_await broker->dispatch(kafka::list_offsets_request{
-      .data = {.topics{
-        {{.name{tp.topic},
-          .partitions{
-            {{.partition_index{tp.partition}, .max_num_offsets = 1}}}}}}}});
+      .data = {
+        .topics = std::move(cv),
+      }});
 
     const auto& topics = res.data.topics;
     auto ec = error_code::none;
@@ -373,9 +400,10 @@ ss::future<fetch_response> client::fetch_partition(
   model::offset offset,
   int32_t max_bytes,
   std::chrono::milliseconds timeout) {
+    const auto min_bytes = _config.consumer_request_min_bytes();
     auto build_request =
-      [offset, max_bytes, timeout](model::topic_partition& tp) {
-          return make_fetch_request(tp, offset, max_bytes, timeout);
+      [offset, min_bytes, max_bytes, timeout](model::topic_partition& tp) {
+          return make_fetch_request(tp, offset, min_bytes, max_bytes, timeout);
       };
 
     return ss::do_with(
@@ -460,17 +488,18 @@ ss::future<> client::remove_consumer(group_id g_id, const member_id& name) {
 ss::future<> client::subscribe_consumer(
   const group_id& g_id,
   const member_id& name,
-  std::vector<model::topic> topics) {
+  chunked_vector<model::topic> topics) {
     return get_consumer(g_id, name)
       .then([topics{std::move(topics)}](shared_consumer_t c) mutable {
           return c->subscribe(std::move(topics));
       });
 }
 
-ss::future<std::vector<model::topic>>
+ss::future<chunked_vector<model::topic>>
 client::consumer_topics(const group_id& g_id, const member_id& name) {
     return get_consumer(g_id, name).then([](shared_consumer_t c) {
-        return ss::make_ready_future<std::vector<model::topic>>(c->topics());
+        return ss::make_ready_future<chunked_vector<model::topic>>(
+          c->topics().copy());
     });
 }
 
@@ -514,7 +543,12 @@ ss::future<kafka::fetch_response> client::consumer_fetch(
     const auto end = model::timeout_clock::now()
                      + std::min(config_timout, timeout.value_or(config_timout));
     return gated_retry_with_mitigation([this, g_id, name, end, max_bytes]() {
-        vlog(kclog.debug, "consumer_fetch: group_id: {}, name: {}", g_id, name);
+        vlog(
+          kclog.debug,
+          "{}consumer_fetch: group_id: {}, name: {}",
+          *this,
+          g_id,
+          name);
         return get_consumer(g_id, name)
           .then([end, max_bytes](shared_consumer_t c) {
               auto timeout = std::max(
@@ -528,7 +562,7 @@ ss::future<kafka::fetch_response> client::consumer_fetch(
               bool has_error = std::any_of(
                 res.data.topics.begin(),
                 res.data.topics.end(),
-                [](auto const& topics) {
+                [](const auto& topics) {
                     return std::any_of(
                       topics.partitions.begin(),
                       topics.partitions.end(),

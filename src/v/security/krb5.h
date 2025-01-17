@@ -10,12 +10,11 @@
 
 #pragma once
 
-#include "outcome.h"
-#include "seastarx.h"
+#include "base/outcome.h"
+#include "base/seastarx.h"
+#include "thirdparty/krb5/krb5.h"
 
 #include <seastar/core/sstring.hh>
-
-#include <krb5/krb5.h>
 
 namespace security::krb5 {
 

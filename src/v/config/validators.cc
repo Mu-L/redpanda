@@ -11,14 +11,19 @@
 
 #include "config/validators.h"
 
-#include "config/client_group_byte_rate_quota.h"
-#include "net/inet_address_wrapper.h"
+#include "config/configuration.h"
+#include "model/namespace.h"
+#include "model/validation.h"
+#include "serde/rw/chrono.h"
 #include "ssx/sformat.h"
+#include "utils/inet_address_wrapper.h"
 
+#include <absl/algorithm/container.h>
 #include <absl/container/flat_hash_set.h>
 #include <absl/container/node_hash_set.h>
 #include <fmt/format.h>
 
+#include <array>
 #include <optional>
 #include <unordered_map>
 
@@ -76,48 +81,53 @@ validate_connection_rate(const std::vector<ss::sstring>& ips_with_limit) {
     return std::nullopt;
 }
 
-std::optional<ss::sstring> validate_client_groups_byte_rate_quota(
-  const std::unordered_map<ss::sstring, config::client_group_quota>&
-    groups_with_limit) {
-    for (const auto& gal : groups_with_limit) {
-        if (gal.second.quota <= 0) {
-            return fmt::format(
-              "Quota must be a non zero positive number, got: {}",
-              gal.second.quota);
-        }
+std::optional<ss::sstring>
+validate_sasl_mechanisms(const std::vector<ss::sstring>& mechanisms) {
+    constexpr auto supported = std::to_array<std::string_view>(
+      {"GSSAPI", "SCRAM", "OAUTHBEARER", "PLAIN"});
 
-        for (const auto& another_group : groups_with_limit) {
-            if (another_group.first == gal.first) {
-                continue;
-            }
-            if (std::string_view(gal.second.clients_prefix)
-                  .starts_with(
-                    std::string_view(another_group.second.clients_prefix))) {
-                return fmt::format(
-                  "Group client prefix can not be prefix for another group "
-                  "name. "
-                  "Violation: {}, {}",
-                  gal.second.clients_prefix,
-                  another_group.second.clients_prefix);
-            }
+    // Validate results
+    for (const auto& m : mechanisms) {
+        if (absl::c_none_of(
+              supported, [&m](const auto& s) { return s == m; })) {
+            return ssx::sformat("'{}' is not a supported SASL mechanism", m);
         }
+    }
+
+    if (mechanisms.size() == 1 && mechanisms[0] == "PLAIN") {
+        return "When PLAIN is enabled, at least one other mechanism must be "
+               "enabled";
     }
 
     return std::nullopt;
 }
 
 std::optional<ss::sstring>
-validate_sasl_mechanisms(const std::vector<ss::sstring>& mechanisms) {
-    static const absl::flat_hash_set<std::string_view> supported{
-      "GSSAPI", "SCRAM"};
+validate_http_authn_mechanisms(const std::vector<ss::sstring>& mechanisms) {
+    constexpr auto supported = std::to_array<std::string_view>(
+      {"BASIC", "OIDC"});
 
     // Validate results
     for (const auto& m : mechanisms) {
-        if (!supported.contains(m)) {
-            return ssx::sformat("'{}' is not a supported SASL mechanism", m);
+        if (absl::c_none_of(
+              supported, [&m](const auto& s) { return s == m; })) {
+            return ssx::sformat(
+              "'{}' is not a supported HTTP authentication mechanism", m);
         }
     }
     return std::nullopt;
+}
+
+bool oidc_is_enabled_http() {
+    return absl::c_any_of(
+      config::shard_local_cfg().http_authentication(),
+      [](const auto& m) { return m == "OIDC"; });
+}
+
+bool oidc_is_enabled_kafka() {
+    return absl::c_any_of(
+      config::shard_local_cfg().sasl_mechanisms(),
+      [](const auto& m) { return m == "OAUTHBEARER"; });
 }
 
 std::optional<ss::sstring> validate_0_to_1_ratio(const double d) {
@@ -145,4 +155,107 @@ validate_non_empty_string_opt(const std::optional<ss::sstring>& os) {
         return std::nullopt;
     }
 }
+
+std::optional<ss::sstring>
+validate_audit_event_types(const std::vector<ss::sstring>& vs) {
+    /// TODO: Should match stringified enums in kafka/types.h
+    static const absl::flat_hash_set<ss::sstring> audit_event_types{
+      "management",
+      "produce",
+      "consume",
+      "describe",
+      "heartbeat",
+      "authenticate",
+      "admin",
+      "schema_registry"};
+
+    for (const auto& e : vs) {
+        if (!audit_event_types.contains(e)) {
+            return ss::format("Unsupported audit event type passed: {}", e);
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<ss::sstring>
+validate_audit_excluded_topics(const std::vector<ss::sstring>& vs) {
+    bool is_kafka_audit_topic = false;
+    std::optional<ss::sstring> is_invalid_topic_name = std::nullopt;
+    if (std::any_of(
+          vs.begin(),
+          vs.end(),
+          [&is_kafka_audit_topic,
+           &is_invalid_topic_name](const ss::sstring& topic_name) {
+              auto t = model::topic{topic_name};
+              if (t == model::kafka_audit_logging_topic) {
+                  is_kafka_audit_topic = true;
+              } else if (model::validate_kafka_topic_name(t)) {
+                  is_invalid_topic_name = topic_name;
+              }
+              return is_kafka_audit_topic || is_invalid_topic_name.has_value();
+          })) {
+        if (is_kafka_audit_topic) {
+            return ss::format(
+              "Unable to exclude audit log '{}' from auditing",
+              model::kafka_audit_logging_topic);
+        } else if (is_invalid_topic_name.has_value()) {
+            return ss::format(
+              "{} is an invalid topic name", *is_invalid_topic_name);
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<ss::sstring>
+validate_api_endpoint(const std::optional<ss::sstring>& os) {
+    if (auto non_empty_string_opt = validate_non_empty_string_opt(os);
+        non_empty_string_opt.has_value()) {
+        return non_empty_string_opt;
+    }
+
+    if (
+      os.has_value()
+      && (os.value().starts_with("http://") || os.value().starts_with("https://"))) {
+        return "String starting with URL protocol is not valid";
+    }
+
+    return std::nullopt;
+}
+
+std::optional<ss::sstring> validate_tombstone_retention_ms(
+  const std::optional<std::chrono::milliseconds>& ms) {
+    if (ms.has_value()) {
+        // For simplicity's sake, cloud storage enable/read/write permissions
+        // cannot be enabled at the same time as tombstone_retention_ms at the
+        // cluster level, to avoid the case in which redpanda refuses to create
+        // new, misconfigured topics due to cluster defaults
+        const auto& cloud_storage_enabled
+          = config::shard_local_cfg().cloud_storage_enabled;
+        const auto& cloud_storage_remote_write
+          = config::shard_local_cfg().cloud_storage_enable_remote_write;
+        const auto& cloud_storage_remote_read
+          = config::shard_local_cfg().cloud_storage_enable_remote_read;
+        if (
+          cloud_storage_enabled() || cloud_storage_remote_write()
+          || cloud_storage_remote_read()) {
+            return fmt::format(
+              "cannot set {} if any of ({}, {}, {}) are enabled at the cluster "
+              "level",
+              config::shard_local_cfg().tombstone_retention_ms.name(),
+              cloud_storage_enabled.name(),
+              cloud_storage_remote_write.name(),
+              cloud_storage_remote_read.name());
+        }
+
+        if (ms.value() < 1ms || ms.value() > serde::max_serializable_ms) {
+            return fmt::format(
+              "tombstone_retention_ms should be in range: [1, {}]",
+              serde::max_serializable_ms);
+        }
+    }
+
+    return std::nullopt;
+}
+
 }; // namespace config

@@ -58,7 +58,7 @@ Available tuners:
 
 To learn more about a tuner, run 'rpk redpanda tune help <tuner name>'.
 `, strings.Join(factory.AvailableTuners(), "\n  - ")),
-		Args: func(cmd *cobra.Command, args []string) error {
+		Args: func(_ *cobra.Command, args []string) error {
 			if len(args) < 1 {
 				return errors.New("requires the list of elements to tune")
 			}
@@ -75,7 +75,7 @@ To learn more about a tuner, run 'rpk redpanda tune help <tuner name>'.
 			}
 			return nil
 		},
-		Run: func(cmd *cobra.Command, args []string) {
+		Run: func(_ *cobra.Command, args []string) {
 			if !tunerParamsEmpty(&tunerParams) && p.ConfigFlag != "" {
 				out.Die("use either tuner params or redpanda config file")
 			}
@@ -90,9 +90,21 @@ To learn more about a tuner, run 'rpk redpanda tune help <tuner name>'.
 
 			tunerParams.CPUMask = cpuMask
 			y, err := p.LoadVirtualRedpandaYaml(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			var tunerFactory factory.TunersFactory
 			if outTuneScriptFile != "" {
+				exists, err := afero.Exists(fs, outTuneScriptFile)
+				out.MaybeDie(err, "unable to determine if file %q exists: %v", outTuneScriptFile, err)
+				if !exists {
+					zap.L().Sugar().Debugf("provided output-script file %q does not exists, creating one", outTuneScriptFile)
+					_, err = fs.Create(outTuneScriptFile)
+					out.MaybeDie(err, "unable to create file %q: %v", outTuneScriptFile, err)
+				}
+				isDir, err := afero.IsDir(fs, outTuneScriptFile)
+				out.MaybeDie(err, "unable to check if %q is a dir or a file: %v", outTuneScriptFile, err)
+				if isDir {
+					out.Die("please use a filename instead of a directory name in --output-script")
+				}
 				tunerFactory = factory.NewScriptRenderingTunersFactory(fs, y.Rpk.Tuners, outTuneScriptFile, timeout)
 			} else {
 				tunerFactory = factory.NewDirectExecutorTunersFactory(fs, y.Rpk.Tuners, timeout)
@@ -106,7 +118,7 @@ To learn more about a tuner, run 'rpk redpanda tune help <tuner name>'.
 	}
 	addTunerParamsFlags(cmd, &tunerParams)
 	cmd.Flags().StringVar(&cpuSet, "cpu-set", "all", "Set of CPUs for tuners to use in cpuset(7) format; if not specified, tuners will use all available CPUs")
-	cmd.Flags().StringVar(&outTuneScriptFile, "output-script", "", "Generate a tuning file that can later be used to tune the system")
+	cmd.Flags().StringVar(&outTuneScriptFile, "output-script", "", "If a filename is provided, it will generate a tuning file that can later be used to tune the system")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Second, "The maximum time to wait for the tune processes to complete (e.g. 300ms, 1.5s, 2h45m)")
 	// Deprecated
 	cmd.Flags().BoolVar(new(bool), "interactive", false, "Ask for confirmation on every step (e.g. configuration generation)")

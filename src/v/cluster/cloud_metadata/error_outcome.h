@@ -22,6 +22,9 @@ enum class error_outcome {
     upload_failed,
     no_matching_metadata,
     term_has_changed,
+    not_ready,
+    ntp_not_found,
+    rpc_error,
 };
 
 struct error_outcome_category final : public std::error_category {
@@ -43,6 +46,12 @@ struct error_outcome_category final : public std::error_category {
             return "No matching metadata";
         case error_outcome::term_has_changed:
             return "Term has changed";
+        case error_outcome::not_ready:
+            return "Not ready";
+        case error_outcome::ntp_not_found:
+            return "NTP not found";
+        case error_outcome::rpc_error:
+            return "RPC error";
         default:
             return fmt::format("Unknown outcome ({})", c);
         }

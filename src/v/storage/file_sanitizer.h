@@ -11,12 +11,12 @@
 
 #pragma once
 
+#include "base/vassert.h"
 #include "config/node_config.h"
 #include "ssx/sformat.h"
 #include "storage/file_sanitizer_types.h"
 #include "storage/logger.h"
 #include "storage/segment_appender.h"
-#include "vassert.h"
 
 #include <seastar/core/file.hh>
 #include <seastar/util/backtrace.hh>
@@ -33,7 +33,7 @@
 
 namespace bi = boost::intrusive;
 
-#include "seastarx.h"
+#include "base/seastarx.h"
 
 namespace storage {
 
@@ -410,7 +410,7 @@ private:
       model::record_batch_type batch_type) const {
         auto batch_types_for_next_write = _appender_ptr->batch_types_to_write();
         return batch_types_for_next_write
-               & (1U << static_cast<uint8_t>(batch_type));
+               & (1LU << static_cast<uint8_t>(batch_type));
     }
 
     void output_pending_ops() {

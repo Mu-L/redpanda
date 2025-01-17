@@ -9,11 +9,13 @@
 
 #include "storage/snapshot.h"
 
+#include "base/vlog.h"
 #include "bytes/iobuf_parser.h"
 #include "bytes/iostream.h"
 #include "hashing/crc32c.h"
 #include "random/generators.h"
 #include "reflection/adl.h"
+#include "storage/logger.h"
 #include "storage/segment_utils.h"
 #include "utils/directory_walker.h"
 
@@ -28,25 +30,29 @@
 
 namespace storage {
 
+ss::future<std::optional<ss::file>>
+snapshot_manager::open_snapshot_file(const ss::sstring& filename) const {
+    auto path = snapshot_path(filename);
+    auto exists = co_await ss::file_exists(path.string());
+    if (!exists) {
+        co_return std::nullopt;
+    }
+    co_return co_await ss::open_file_dma(path.string(), ss::open_flags::ro);
+}
+
 ss::future<std::optional<snapshot_reader>>
 snapshot_manager::open_snapshot(ss::sstring filename) {
     auto path = snapshot_path(filename);
-    return ss::file_exists(path.string()).then([this, path](bool exists) {
-        if (!exists) {
-            return ss::make_ready_future<std::optional<snapshot_reader>>(
-              std::nullopt);
-        }
-        return ss::open_file_dma(path.string(), ss::open_flags::ro)
-          .then([this, path](const ss::file& file) {
-              // ss::file::~file will automatically close the file. so no
-              // worries about leaking an fd if something goes wrong here.
-              ss::file_input_stream_options options;
-              options.io_priority_class = _io_prio;
-              auto input = ss::make_file_input_stream(file, options);
-              return ss::make_ready_future<std::optional<snapshot_reader>>(
-                snapshot_reader(file, std::move(input), path));
-          });
-    });
+    auto maybe_file = co_await open_snapshot_file(filename);
+    if (!maybe_file.has_value()) {
+        co_return std::nullopt;
+    }
+    // ss::file::~file will automatically close the file. so no
+    // worries about leaking an fd if something goes wrong here.
+    ss::file_input_stream_options options;
+    options.io_priority_class = _io_prio;
+    auto input = ss::make_file_input_stream(maybe_file.value(), options);
+    co_return snapshot_reader(maybe_file.value(), std::move(input), path);
 }
 
 ss::future<uint64_t> snapshot_manager::get_snapshot_size(ss::sstring filename) {
@@ -57,7 +63,7 @@ ss::future<uint64_t> snapshot_manager::get_snapshot_size(ss::sstring filename) {
       });
 }
 
-ss::future<snapshot_writer>
+ss::future<file_snapshot_writer>
 snapshot_manager::start_snapshot(ss::sstring target) {
     // the random suffix is added because the lowres clock doesn't produce
     // unique file names when tests run fast.
@@ -81,14 +87,18 @@ snapshot_manager::start_snapshot(ss::sstring target) {
           return ss::make_file_output_stream(std::move(file), options);
       })
       .then([this, target, path](ss::output_stream<char> output) {
-          return snapshot_writer(
+          return file_snapshot_writer(
             std::move(output), path, snapshot_path(target));
       });
 }
 
-ss::future<> snapshot_manager::finish_snapshot(snapshot_writer& writer) {
+ss::future<> snapshot_manager::finish_snapshot(file_snapshot_writer& writer) {
     return ss::rename_file(writer.path().string(), writer.target().string())
       .then([this] { return ss::sync_directory(_dir.string()); });
+}
+
+ss::future<bool> snapshot_manager::snapshot_exists(ss::sstring filename) const {
+    return ss::file_exists(snapshot_path(std::move(filename)).string());
 }
 
 ss::future<> snapshot_manager::remove_partial_snapshots() {
@@ -109,7 +119,7 @@ ss::future<> snapshot_manager::remove_partial_snapshots() {
 }
 
 ss::future<> snapshot_manager::remove_snapshot(ss::sstring target) {
-    if (co_await ss::file_exists(snapshot_path(target).string())) {
+    if (co_await snapshot_exists(target)) {
         const auto path = snapshot_path(target).string();
         vlog(
           stlog.info,
@@ -253,18 +263,19 @@ snapshot_writer::~snapshot_writer() noexcept {
     vassert(_closed, "snapshot writer has to be closed before destruction");
 }
 
-snapshot_writer::snapshot_writer(
+file_snapshot_writer::file_snapshot_writer(
   ss::output_stream<char> output,
   std::filesystem::path path,
   std::filesystem::path target) noexcept
-  : _path(std::move(path))
-  , _output(std::move(output))
+  : _writer(std::move(output))
+  , _path(std::move(path))
   , _target(std::move(target)) {}
 
+snapshot_writer::snapshot_writer(ss::output_stream<char> output) noexcept
+  : _output(std::move(output)) {}
+
 snapshot_writer::snapshot_writer(snapshot_writer&& o) noexcept
-  : _path(std::move(o._path))
-  , _output(std::move(o._output))
-  , _target(std::move(o._target))
+  : _output(std::move(o._output))
   , _closed(o._closed) {
     o._closed = true;
 }

@@ -10,13 +10,13 @@
 
 #pragma once
 
+#include "base/seastarx.h"
+#include "base/units.h"
 #include "bytes/iobuf.h"
 #include "bytes/iobuf_parser.h"
 #include "model/fundamental.h"
 #include "model/record_batch_types.h"
-#include "seastarx.h"
 #include "storage/parser.h"
-#include "units.h"
 #include "utils/delta_for.h"
 
 #include <seastar/util/log.hh>
@@ -69,6 +69,9 @@ public:
         int64_t file_pos;
     };
 
+    /// Estimate memory usage by the index
+    size_t estimate_memory_use() const;
+
     /// Find index entry which is strictly lower than the redpanda offset
     ///
     /// The returned value has rp_offset less than upper_bound.
@@ -85,6 +88,14 @@ public:
     /// returned.
     std::optional<find_result> find_kaf_offset(kafka::offset upper_bound);
 
+    /// Find index entry which is strictly lower than the timestamp
+    ///
+    /// The returned value has timestamp less than upper_bound.
+    /// If all elements are larger than 'upper_bound' nullopt is returned.
+    /// If all elements are smaller than 'upper_bound' the last value is
+    /// returned.
+    std::optional<find_result> find_timestamp(model::timestamp upper_bound);
+
     /// Builds a coarse index mapping kafka offsets to file positions. The step
     /// size is the resolution of the index. So given a step size of 16MiB, the
     /// result contains mappings of kafka offset to file position from the index
@@ -94,7 +105,7 @@ public:
     build_coarse_index(uint64_t step_size, std::string_view index_path) const;
 
     /// Serialize offset_index
-    iobuf to_iobuf();
+    iobuf to_iobuf() const;
 
     /// Deserialize offset_index
     void from_iobuf(iobuf in);
@@ -186,6 +197,8 @@ struct segment_record_stats {
     model::timestamp base_timestamp;
     // Last timestamp
     model::timestamp last_timestamp;
+
+    auto operator<=>(const segment_record_stats&) const noexcept = default;
 };
 
 class remote_segment_index_builder : public storage::batch_consumer {

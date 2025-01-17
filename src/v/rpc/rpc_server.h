@@ -8,10 +8,10 @@
 // by the Apache License, Version 2.0
 #pragma once
 
+#include "base/vassert.h"
 #include "config/configuration.h"
 #include "net/server.h"
 #include "rpc/service.h"
-#include "vassert.h"
 
 namespace rpc {
 
@@ -36,8 +36,6 @@ public:
     rpc_server& operator=(const rpc_server&) = delete;
 
     void set_all_services_added() { _all_services_added = true; }
-
-    void set_use_service_unavailable() { _service_unavailable_allowed = true; }
 
     // Adds the given services to the protocol.
     // May be called whether or not the server has already been started.
@@ -73,7 +71,6 @@ private:
       send_reply_skip_payload(ss::lw_shared_ptr<server_context_impl>, netbuf);
 
     bool _all_services_added{false};
-    bool _service_unavailable_allowed{false};
     std::vector<std::unique_ptr<service>> _services;
 };
 

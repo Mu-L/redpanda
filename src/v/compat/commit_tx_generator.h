@@ -10,7 +10,7 @@
  */
 #pragma once
 
-#include "cluster/types.h"
+#include "cluster/tx_protocol_types.h"
 #include "compat/generator.h"
 #include "compat/tx_gateway_generator.h"
 #include "model/tests/randoms.h"
@@ -47,7 +47,7 @@ template<>
 struct instance_generator<cluster::commit_tx_reply> {
     static cluster::commit_tx_reply random() {
         return cluster::commit_tx_reply(
-          instance_generator<cluster::tx_errc>::random());
+          instance_generator<cluster::tx::errc>::random());
     }
     static std::vector<cluster::commit_tx_reply> limits() { return {}; }
 };

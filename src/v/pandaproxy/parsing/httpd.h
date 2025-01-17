@@ -11,11 +11,11 @@
 
 #pragma once
 
+#include "base/vassert.h"
 #include "pandaproxy/json/types.h"
 #include "pandaproxy/parsing/exceptions.h"
 #include "pandaproxy/parsing/from_chars.h"
 #include "reflection/type_traits.h"
-#include "vassert.h"
 
 #include <seastar/http/httpd.hh>
 #include <seastar/http/request.hh>
@@ -93,14 +93,23 @@ T header(const ss::http::request& req, const ss::sstring& name) {
 
 template<typename T>
 T request_param(const ss::http::request& req, const ss::sstring& name) {
-    const auto& param{req.param[name]};
-    ss::sstring value;
-    if (!ss::http::internal::url_decode(param, value)) {
-        throw error(
-          error_code::invalid_param,
-          fmt::format("Invalid parameter '{}' got '{}'", name, param));
+    const auto& param{req.get_path_param(name)};
+    if (param.empty()) [[unlikely]] {
+        // either the param wasn't present or URL decoding failed
+        try {
+            const auto& p = req.param.at(name);
+            if (p.size() > 1) {
+                // we got something more than the leading '/', so URL decoding
+                // must have failed
+                throw error(
+                  error_code::invalid_param,
+                  fmt::format("Invalid parameter '{}' got '{}'", name, p));
+            }
+        } catch (const std::out_of_range& e) {
+            std::ignore = e;
+        }
     }
-    return detail::parse_param<T>("parameter", name, value);
+    return detail::parse_param<T>("parameter", name, param);
 }
 
 template<typename T>

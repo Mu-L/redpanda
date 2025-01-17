@@ -11,19 +11,19 @@
 
 #pragma once
 
+#include "base/outcome.h"
+#include "base/vassert.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/record_batch_types.h"
 #include "model/timeout_clock.h"
-#include "outcome.h"
 #include "raft/consensus.h"
 #include "raft/errc.h"
 #include "raft/state_machine.h"
 #include "ssx/future-util.h"
 #include "utils/expiring_promise.h"
 #include "utils/mutex.h"
-#include "vassert.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -221,10 +221,10 @@ protected:
 
     // Locked for the whole duration of writing a snapshot to ensure that there
     // are no concurrent attempts.
-    mutex _write_snapshot_mtx;
+    mutex _write_snapshot_mtx{"mex_state_machine::write_snapshot"};
     // Locked when a command is applied to the stm or when creating a snapshot
     // to ensure that the state machine state does not change.
-    mutex _apply_mtx;
+    mutex _apply_mtx{"mex_state_machine::apply"};
 
     // we keep states in a tuple to automatically dispatch updates to correct
     // state
@@ -254,12 +254,12 @@ ss::future<result<raft::replicate_result>> mux_state_machine<T...>::replicate(
           if (term) {
               return _c->replicate(
                 term.value(),
-                model::make_memory_record_batch_reader(std::move(batch)),
+                std::move(batch),
                 raft::replicate_options{raft::consistency_level::quorum_ack});
           }
 
           return _c->replicate(
-            model::make_memory_record_batch_reader(std::move(batch)),
+            std::move(batch),
             raft::replicate_options{raft::consistency_level::quorum_ack});
       });
 }

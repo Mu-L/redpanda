@@ -11,18 +11,17 @@
 
 #include "kafka/server/usage_aggregator.h"
 
+#include "serde/rw/chrono.h"
+#include "serde/rw/iobuf.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/vector.h"
+
 using namespace std::chrono_literals;
 
 namespace kafka {
 static constexpr std::string_view period_key{"period"};
 static constexpr std::string_view max_duration_key{"max_duration"};
 static constexpr std::string_view buckets_key{"buckets"};
-
-static bytes key_to_bytes(std::string_view sv) {
-    bytes k;
-    k.append(reinterpret_cast<const uint8_t*>(sv.begin()), sv.size());
-    return k;
-}
 
 struct persisted_state {
     std::chrono::seconds configured_period;
@@ -36,15 +35,15 @@ persist_to_disk(storage::kvstore& kvstore, persisted_state s) {
 
     co_await kvstore.put(
       kv_ks::usage,
-      key_to_bytes(period_key),
+      bytes::from_string(period_key),
       serde::to_iobuf(s.configured_period));
     co_await kvstore.put(
       kv_ks::usage,
-      key_to_bytes(max_duration_key),
+      bytes::from_string(max_duration_key),
       serde::to_iobuf(s.configured_windows));
     co_await kvstore.put(
       kv_ks::usage,
-      key_to_bytes(buckets_key),
+      bytes::from_string(buckets_key),
       serde::to_iobuf(std::move(s.current_state)));
 }
 
@@ -53,9 +52,10 @@ restore_from_disk(storage::kvstore& kvstore) {
     using kv_ks = storage::kvstore::key_space;
     std::optional<iobuf> period, windows, data;
     try {
-        period = kvstore.get(kv_ks::usage, key_to_bytes(period_key));
-        windows = kvstore.get(kv_ks::usage, key_to_bytes(max_duration_key));
-        data = kvstore.get(kv_ks::usage, key_to_bytes(buckets_key));
+        period = kvstore.get(kv_ks::usage, bytes::from_string(period_key));
+        windows = kvstore.get(
+          kv_ks::usage, bytes::from_string(max_duration_key));
+        data = kvstore.get(kv_ks::usage, bytes::from_string(buckets_key));
     } catch (const std::exception& ex) {
         vlog(
           klog.debug,
@@ -84,9 +84,10 @@ restore_from_disk(storage::kvstore& kvstore) {
 static ss::future<> clear_persisted_state(storage::kvstore& kvstore) {
     using kv_ks = storage::kvstore::key_space;
     try {
-        co_await kvstore.remove(kv_ks::usage, key_to_bytes(period_key));
-        co_await kvstore.remove(kv_ks::usage, key_to_bytes(max_duration_key));
-        co_await kvstore.remove(kv_ks::usage, key_to_bytes(buckets_key));
+        co_await kvstore.remove(kv_ks::usage, bytes::from_string(period_key));
+        co_await kvstore.remove(
+          kv_ks::usage, bytes::from_string(max_duration_key));
+        co_await kvstore.remove(kv_ks::usage, bytes::from_string(buckets_key));
     } catch (const std::exception& ex) {
         vlog(klog.debug, "Ignoring exception from storage layer: {}", ex);
     }
@@ -188,14 +189,23 @@ void usage_aggregator<clock_type>::rearm_window_timer() {
       std::
         is_same_v<decltype(_usage_window_width_interval), std::chrono::seconds>,
       "Interval is assumed to be in units of seconds");
-    const auto now = clock_type::now();
+    const auto now = timestamp_t::now();
+    const auto now_ts = epoch_time_secs(now);
     /// This modulo trick only works because epoch time is hour aligned
     const auto delta = std::chrono::seconds(
       epoch_time_secs(now) % _usage_window_width_interval.count());
+    vlog(
+      klog.debug,
+      "Usage based billing window_close timer fired, time_now: {} delta: {}",
+      now_ts,
+      delta.count());
     const auto duration_until_next_close = _usage_window_width_interval - delta;
     vassert(
-      duration_until_next_close >= 0s,
-      "Error correctly detecting last window delta");
+      duration_until_next_close >= 0s
+        && duration_until_next_close <= _usage_window_width_interval,
+      "Error correctly detecting last window delta: {} now: {}",
+      delta.count(),
+      now_ts);
     _close_window_timer.arm(duration_until_next_close);
 }
 
@@ -300,7 +310,7 @@ template<typename clock_type>
 ss::future<> usage_aggregator<clock_type>::grab_data(size_t idx) {
     auto gh = _gate.hold();
     try {
-        auto units = _m.get_units();
+        auto units = co_await _m.get_units();
         const auto ts = _buckets[idx].begin;
         /// Grab the data, across this scheduling point we cannot assume things
         /// like _current_window have the same value as before this call, that
@@ -347,7 +357,11 @@ void usage_aggregator<clock_type>::close_window() {
         } else {
             vlog(klog.info, "{}", err_str);
         }
-        cur.reset(now_ts);
+        /// Reset the window to the nearest interval
+        const auto true_now = timestamp_t::now();
+        const auto diff_secs = std::chrono::seconds(
+          epoch_time_secs(true_now) % _usage_window_width_interval.count());
+        cur.reset(epoch_time_secs(true_now - diff_secs));
     } else {
         const auto w = _current_window;
         _current_window = (_current_window + 1) % _buckets.size();

@@ -10,14 +10,15 @@
 
 #include "cluster/partition_balancer_state.h"
 
+#include "cluster/cluster_utils.h"
 #include "cluster/controller_snapshot.h"
 #include "cluster/logger.h"
 #include "cluster/members_table.h"
 #include "cluster/node_status_table.h"
 #include "cluster/scheduling/partition_allocator.h"
 #include "config/configuration.h"
-#include "prometheus/prometheus_sanitize.h"
-#include "ssx/metrics.h"
+#include "metrics/metrics.h"
+#include "metrics/prometheus_sanitize.h"
 
 #include <seastar/coroutine/maybe_yield.hh>
 
@@ -36,7 +37,7 @@ partition_balancer_state::partition_balancer_state(
   , _node_status(nst.local())
   , _probe(*this) {}
 
-void partition_balancer_state::handle_ntp_update(
+void partition_balancer_state::handle_ntp_move_begin_or_cancel(
   const model::ns& ns,
   const model::topic& tp,
   model::partition_id p_id,
@@ -119,7 +120,7 @@ partition_balancer_state::apply_snapshot(const controller_snapshot& snap) {
 
             if (auto it = topic.updates.find(p_id); it != topic.updates.end()) {
                 const auto& update = it->second;
-                if (update.state == reconfiguration_state::in_progress) {
+                if (!is_cancelled_state(update.state)) {
                     replicas = &update.target_assignment;
                 }
             }
@@ -137,8 +138,7 @@ partition_balancer_state::apply_snapshot(const controller_snapshot& snap) {
 }
 
 partition_balancer_state::probe::probe(const partition_balancer_state& parent)
-  : _parent(parent)
-  , _public_metrics(ssx::metrics::public_metrics_handle) {
+  : _parent(parent) {
     if (
       config::shard_local_cfg().disable_metrics() || ss::this_shard_id() != 0) {
         return;
@@ -149,7 +149,7 @@ partition_balancer_state::probe::probe(const partition_balancer_state& parent)
 }
 
 void partition_balancer_state::probe::setup_metrics(
-  ssx::metrics::metric_groups& metrics) {
+  metrics::metric_groups_base& metrics) {
     namespace sm = ss::metrics;
     metrics.add_group(
       prometheus_sanitize::metrics_name("cluster:partition"),

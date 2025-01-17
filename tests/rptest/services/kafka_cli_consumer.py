@@ -80,10 +80,14 @@ class KafkaCliConsumer(BackgroundThreadService):
 
             cmd += ["--bootstrap-server", self._redpanda.brokers()]
 
-            for _ in node.account.ssh_capture(' '.join(cmd)):
-                with self._lock:
-                    self._message_cnt += 1
-                    self._last_consumed = time.time()
+            for l in node.account.ssh_capture(' '.join(cmd)):
+                self._redpanda.logger.debug(l)
+                # last line does not correspond to a consumed message and looks like
+                # "Processed a total of N messages"
+                if not l.startswith("Processed a total of "):
+                    with self._lock:
+                        self._message_cnt += 1
+                        self._last_consumed = time.time()
         except:
             if self._stopping.is_set():
                 # Expect a non-zero exit code when killing during teardown
@@ -93,8 +97,12 @@ class KafkaCliConsumer(BackgroundThreadService):
         finally:
             self._done = True
 
+    def message_cnt(self):
+        with self._lock:
+            return self._message_cnt
+
     def wait_for_messages(self, messages, timeout=30):
-        wait_until(lambda: self._message_cnt >= messages,
+        wait_until(lambda: self.message_cnt() >= messages,
                    timeout,
                    backoff_sec=2)
 
@@ -127,6 +135,9 @@ class KafkaCliConsumer(BackgroundThreadService):
                 err_msg=
                 f"{self._instance_name} running on {node.name} failed to stop after SIGKILL"
             )
+
+    def clean_node(self, node):
+        pass
 
     def _report_progress(self):
         while (not self._stopping.is_set()):

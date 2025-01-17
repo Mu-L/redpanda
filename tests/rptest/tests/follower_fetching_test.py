@@ -18,8 +18,9 @@ from rptest.services.cluster import cluster
 from rptest.services.kafka_cli_consumer import KafkaCliConsumer
 from rptest.services.kgo_verifier_services import KgoVerifierProducer
 from rptest.services.redpanda import SISettings
+from rptest.services.admin import Admin
 from rptest.tests.prealloc_nodes import PreallocNodesTest
-from rptest.util import wait_for_local_storage_truncate
+from rptest.util import wait_for_local_storage_truncate, wait_until_result
 
 from ducktape.utils.util import wait_until
 
@@ -50,10 +51,6 @@ class FollowerFetchingTest(PreallocNodesTest):
             },
             si_settings=si_settings)
 
-    def tearDown(self):
-        self.cloud_storage_client.empty_bucket(self.s3_bucket_name)
-        super().tearDown()
-
     def setUp(self):
         # Delay startup, so that the test case can configure redpanda
         # based on test parameters before starting it.
@@ -69,15 +66,20 @@ class FollowerFetchingTest(PreallocNodesTest):
         producer.wait()
         producer.free()
 
+    def get_node_metric(self, node, topic, metric):
+        return self.redpanda.metric_sum(namespace="kafka",
+                                        nodes=[node],
+                                        topic=topic,
+                                        metric_name=metric)
+
     def get_fetch_bytes(self, node, topic):
-        metrics = self.redpanda.metrics(node)
-        total_bytes = 0
-        for family in metrics:
-            for sample in family.samples:
-                if sample.name == "vectorized_cluster_partition_bytes_fetched_total" and sample.labels[
-                        'topic'] == topic:
-                    total_bytes += sample.value
-        return total_bytes
+        return self.get_node_metric(
+            node, topic, "vectorized_cluster_partition_bytes_fetched_total")
+
+    def get_follower_fetched_bytes(self, node, topic):
+        return self.get_node_metric(
+            node, topic,
+            "vectorized_cluster_partition_bytes_fetched_from_follower_total")
 
     def create_consumer(self, topic, rack=None):
 
@@ -100,14 +102,23 @@ class FollowerFetchingTest(PreallocNodesTest):
             },
         )
 
-    def _bytes_fetched_per_node(self, topic):
-        fetched_per_node = {}
+    def _metrics_per_node(self, topic, metric):
+        per_node = {}
         for n in self.redpanda.nodes:
-            fetched_per_node[n] = self.get_fetch_bytes(n, topic)
+            per_node[n] = self.get_node_metric(n, topic, metric=metric)
             self.logger.info(
-                f"fetched {fetched_per_node[n]} bytes from node {n.account.hostname}:{self.redpanda.node_id(n)}"
+                f"{metric}={per_node[n]} at {n.account.hostname}:{self.redpanda.node_id(n)}"
             )
-        return fetched_per_node
+        return per_node
+
+    def _bytes_fetched_per_node(self, topic):
+        return self._metrics_per_node(
+            topic, "vectorized_cluster_partition_bytes_fetched_total")
+
+    def _follower_bytes_fetched_per_node(self, topic):
+        return self._metrics_per_node(
+            topic,
+            "vectorized_cluster_partition_bytes_fetched_from_follower_total")
 
     @cluster(num_nodes=5)
     @matrix(read_from_object_store=[True, False])
@@ -150,6 +161,8 @@ class FollowerFetchingTest(PreallocNodesTest):
                 f"Using consumer with {consumer_rack} in {n+1}/{number_of_samples} sample"
             )
             fetched_per_node_before = self._bytes_fetched_per_node(topic.name)
+            f_fetched_before = self._follower_bytes_fetched_per_node(
+                topic.name)
             consumer = self.create_consumer(topic.name, rack=consumer_rack)
             consumer.start()
             consumer.wait_for_messages(1000)
@@ -159,6 +172,7 @@ class FollowerFetchingTest(PreallocNodesTest):
             consumer.free()
 
             fetched_per_node_after = self._bytes_fetched_per_node(topic.name)
+            f_fetched_after = self._follower_bytes_fetched_per_node(topic.name)
             preferred_replica = self.redpanda.nodes[node_idx]
             self.logger.info(
                 f"preferred replica {preferred_replica.account.hostname}:{self.redpanda.node_id(preferred_replica)} in rack {consumer_rack}"
@@ -171,6 +185,153 @@ class FollowerFetchingTest(PreallocNodesTest):
                     assert current_bytes_fetched > 0
                 else:
                     assert current_bytes_fetched == 0
+
+            for n, new_fetched_bytes in f_fetched_after.items():
+                follower_fetched = new_fetched_bytes - f_fetched_before[n]
+                if n == preferred_replica:
+                    # follower fetched bytes may be equal to 0 if preferred replica is a leader
+                    assert follower_fetched >= 0
+                else:
+                    assert follower_fetched == 0
+
+    @cluster(num_nodes=5)
+    def test_with_leadership_transfers(self):
+        """
+        Test consuming from a single node while leadership is randomly transfered.
+        """
+
+        rack_layout = [str(i) for i in "ABC"]
+        for ix, node in enumerate(self.redpanda.nodes):
+            extra_node_conf = {
+                'rack': rack_layout[ix],
+                'enable_rack_awareness': True,
+            }
+            self.redpanda.set_extra_node_conf(node, extra_node_conf)
+        self.redpanda.start()
+
+        topic = TopicSpec(name="mytopic",
+                          partition_count=1,
+                          replication_factor=3)
+        self.client().create_topic(topic)
+
+        producer = KgoVerifierProducer(
+            self.test_context,
+            self.redpanda,
+            topic,
+            msg_size=512,
+            # some large number to get produce load till the end of test
+            msg_count=2**30,
+            rate_limit_bps=2**20)
+        producer.start()
+
+        # consume from the same rack as node 0
+        consumer = self.create_consumer(topic.name, rack=rack_layout[0])
+        consumer.start()
+
+        admin = Admin(self.redpanda)
+        prev_consumed = 0
+        for _ in range(10):
+            # do a random leadership transfer
+            admin.partition_transfer_leadership("kafka",
+                                                topic.name,
+                                                partition=0)
+
+            # ensure continuous consumer progress
+            consumer.wait_for_messages(prev_consumed + 1000)
+            prev_consumed = consumer.message_cnt()
+            self.logger.info(f"consumed {prev_consumed} msgs")
+
+        consumer.stop()
+        producer.stop()
+
+        rpk = RpkTool(self.redpanda)
+
+        def get_hwm():
+            partitions = list(rpk.describe_topic(topic.name))
+            if len(partitions) > 0:
+                return True, partitions[0].high_watermark
+            else:
+                return False
+
+        hwm = wait_until_result(get_hwm,
+                                timeout_sec=30,
+                                backoff_sec=1,
+                                err_msg="couldn't get high watermark")
+
+        # check that there were no consumer group resets caused by offset_out_of_range error
+        self.logger.info(
+            f"produced {hwm}, consumed {consumer.message_cnt()} msgs")
+        assert consumer.message_cnt() <= hwm
+
+    @cluster(num_nodes=5)
+    def test_follower_fetching_with_maintenance_mode(self):
+        rack_layout_str = "ABC"
+        rack_layout = [str(i) for i in rack_layout_str]
+
+        for ix, node in enumerate(self.redpanda.nodes):
+            extra_node_conf = {
+                # We're introducing two racks, small and large.
+                # The small rack has only one node and the
+                # large one has four nodes.
+                'rack': rack_layout[ix],
+                # This parameter enables rack awareness
+                'enable_rack_awareness': True,
+            }
+            self.redpanda.set_extra_node_conf(node, extra_node_conf)
+
+        self.redpanda.start()
+        topic = TopicSpec(partition_count=1, replication_factor=3)
+
+        self.client().create_topic(topic)
+
+        self.produce(topic.name)
+        self.logger.info(f"Producing to {topic.name} finished")
+
+        number_of_samples = 10
+        enable_maintenance_mode = True
+        rpk = RpkTool(self.redpanda)
+        for n in range(0, number_of_samples):
+            node_idx = random.randint(0, 2)
+            consumer_rack = rack_layout_str[node_idx]
+            self.logger.info(
+                f"Using consumer with {consumer_rack} in {n+1}/{number_of_samples} sample"
+            )
+            preferred_replica = self.redpanda.nodes[node_idx]
+            self.logger.info(
+                f"preferred replica {preferred_replica.account.hostname}:{self.redpanda.node_id(preferred_replica)} in rack {consumer_rack}"
+            )
+            if enable_maintenance_mode:
+                rpk.cluster_maintenance_enable(
+                    self.redpanda.node_id(preferred_replica), wait=True)
+
+            fetched_per_node_before = self._bytes_fetched_per_node(topic.name)
+            consumer = self.create_consumer(topic.name, rack=consumer_rack)
+            consumer.start()
+            consumer.wait_for_messages(1000)
+            consumer.stop()
+            consumer.wait()
+            consumer.clean()
+            consumer.free()
+
+            fetched_per_node_after = self._bytes_fetched_per_node(topic.name)
+
+            for n, new_fetched_bytes in fetched_per_node_after.items():
+                current_bytes_fetched = new_fetched_bytes - fetched_per_node_before[
+                    n]
+
+                if enable_maintenance_mode:
+                    if n == preferred_replica:
+                        assert current_bytes_fetched == 0
+                else:
+                    if n == preferred_replica:
+                        assert current_bytes_fetched > 0
+                    else:
+                        assert current_bytes_fetched == 0
+            if enable_maintenance_mode:
+                rpk.cluster_maintenance_disable(
+                    self.redpanda.node_id(preferred_replica))
+
+            enable_maintenance_mode = not enable_maintenance_mode
 
 
 class IncrementalFollowerFetchingTest(PreallocNodesTest):

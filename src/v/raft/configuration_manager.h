@@ -11,14 +11,15 @@
 
 #pragma once
 
+#include "base/units.h"
+#include "group_configuration.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "raft/consensus_utils.h"
+#include "raft/fundamental.h"
 #include "raft/logger.h"
-#include "raft/types.h"
 #include "ssx/semaphore.h"
 #include "storage/fwd.h"
-#include "units.h"
 #include "utils/mutex.h"
 
 #include <seastar/core/abort_source.hh>
@@ -91,7 +92,7 @@ public:
     /**
      * Add all configurations
      */
-    ss::future<> add(std::vector<offset_configuration>);
+    ss::future<> add(chunked_vector<offset_configuration>);
 
     /**
      * Get the configuration that is valid for given offset. This method return
@@ -167,10 +168,27 @@ public:
 
     ss::future<> adjust_configuration_idx(configuration_idx);
 
+    /**
+     * Sets a forced override for current configuration. The override is active
+     * and returned as latest configuration until it is cleared by adding a new
+     * configuration to group configuration manage.
+     *
+     * @param cfg the configuration to override with
+     */
+    void set_override(group_configuration);
+
+    /**
+     * Checks if configuration override is active
+     */
+    bool has_configuration_override() const {
+        return _configuration_force_override != nullptr;
+    }
+
     friend std::ostream&
     operator<<(std::ostream&, const configuration_manager&);
 
 private:
+    void reset_override(model::revision_id);
     ss::future<> store_configurations();
     ss::future<> store_highest_known_offset();
     bytes configurations_map_key() const {
@@ -202,7 +220,7 @@ private:
     model::offset _highest_known_offset;
     storage::api& _storage;
     ss::condition_variable _config_changed;
-    mutex _lock;
+    mutex _lock{"configuration_manager"};
     /**
      * We will persist highest known offset every 64MB, given this during
      * bootstrap redpanda will have to read up to 64MB per raft group.
@@ -219,5 +237,7 @@ private:
     model::revision_id _initial_revision{};
     ctx_log& _ctxlog;
     configuration_idx _next_index{0};
+    std::unique_ptr<group_configuration> _configuration_force_override
+      = nullptr;
 };
 } // namespace raft

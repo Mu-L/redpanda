@@ -55,6 +55,7 @@ class RedpandaConfig:
     data_directory: pathlib.Path
     rpc_server: NetworkAddress
     advertised_rpc_api: NetworkAddress
+    advertised_kafka_api: NetworkAddress
     kafka_api: NetworkAddress
     admin: NetworkAddress
     seed_servers: list[NetworkAddress]
@@ -142,7 +143,7 @@ async def main():
                         "--directory",
                         type=pathlib.Path,
                         help="data directory",
-                        default="data")
+                        default=None)
     parser.add_argument("--base-rpc-port",
                         type=int,
                         help="rpc port",
@@ -168,7 +169,7 @@ async def main():
     parser.add_argument("--listen-address",
                         type=str,
                         help="listening address",
-                        default="0.0.0.0")
+                        default="127.0.0.1")
     parser.add_argument("--racks",
                         dest='racks',
                         help="racks for each of node",
@@ -182,6 +183,10 @@ async def main():
         # Re-do with strict parse: this will surface unknown argument errors
         args = parser.parse_args()
 
+    if args.directory is None:
+        args.directory = pathlib.Path(
+            os.environ.get("BUILD_WORKSPACE_DIRECTORY", ".")) / "data"
+
     # Use the first 3 nodes as seed servers
     rpc_addresses = [
         NetworkAddress(args.listen_address, args.base_rpc_port + i)
@@ -194,6 +199,8 @@ async def main():
         redpanda = RedpandaConfig(data_directory=data_dir,
                                   rpc_server=rpc_address,
                                   advertised_rpc_api=rpc_address,
+                                  advertised_kafka_api=make_address(
+                                      args.base_kafka_port),
                                   kafka_api=make_address(args.base_kafka_port),
                                   admin=make_address(args.base_admin_port),
                                   seed_servers=rpc_addresses[:3],

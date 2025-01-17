@@ -15,10 +15,12 @@ import time
 from dataclasses import dataclass
 from collections import defaultdict, namedtuple
 from enum import Enum
-from typing import Sequence, Optional, NewType, NamedTuple, Iterator
+from typing import Literal, Sequence, Optional, NewType, NamedTuple, Iterator
 
+from rptest.clients.offline_log_viewer import OfflineLogViewer
 import xxhash
 
+from botocore.exceptions import ClientError
 from rptest.archival.s3_client import ObjectMetadata, S3Client
 from rptest.archival.abs_client import ABSClient
 from rptest.clients.rp_storage_tool import RpStorageTool
@@ -110,13 +112,41 @@ class CloudLogSize:
             return self.stm.total + self.archive.total
 
 
+class ControllerSnapshotComponents(NamedTuple):
+    """
+    Keys that uniquely identify a controller snapshot.
+    """
+    cluster_uuid: str
+    offset: int
+
+
+class ClusterMetadataComponents(NamedTuple):
+    """
+    Keys that uniquely identify a cluster metadata manifest.
+    """
+    cluster_uuid: str
+    metadata_id: int
+
+
+class ClusterMetadata(NamedTuple):
+    """
+    Metadata associated with a single cluster.
+    """
+    # metadata_id => deserialized manifest
+    cluster_metadata_manifests: dict[int, dict]
+
+    # offset => snapshot size
+    controller_snapshot_sizes: dict[int, int]
+
+
 TopicManifestMetadata = namedtuple('TopicManifestMetadata',
                                    ['ntp', 'revision'])
 SegmentMetadata = namedtuple(
     'SegmentMetadata',
     ['ntp', 'revision', 'base_offset', 'term', 'md5', 'size'])
 
-SegmentPathComponents = namedtuple('SegmentPathComponents', ['ntpr', 'name'])
+SegmentPathComponents = namedtuple('SegmentPathComponents',
+                                   ['ntpr', 'name', 'base_offset'])
 
 MISSING_DATA_ERRORS = [
     "No segments found. Empty partition manifest generated",
@@ -147,6 +177,8 @@ class SegmentSummary(NamedTuple):
     size_bytes: int
 
 
+# NB: SegmentReader is duplicated compute_storage.py for deployment reasons. If
+# making changes please adapt both.
 class SegmentReader:
     HDR_FMT_RP = "<IiqbIhiqqqhii"
     HEADER_SIZE = struct.calcsize(HDR_FMT_RP)
@@ -233,9 +265,44 @@ def make_segment_summary(ntpr: NTPR, reader: SegmentReader) -> SegmentSummary:
                           size_bytes=size_bytes)
 
 
+def parse_s3_topic_label(path: str) -> str:
+    """
+    Parse S3 manifest path. Return the label, or an empty string if not
+    labeled with the cluster uuid.
+
+    Sample name: 50000000/meta/kafka/panda-topic/topic_manifest.json
+        Output: ""
+    Sample name: meta/kafka/panda-topic/6e94ccdc-443a-4807-b105-0bb86e8f97f7/0/topic_manifest.json
+        Output: "6e94ccdc-443a-4807-b105-0bb86e8f97f7"
+    """
+    items = path.split('/')
+    if len(items[0]) == 8 and items[0].endswith('0000000'):
+        return ""
+    return items[3]
+
+
+def parse_s3_partition_path_label(path: str) -> str:
+    """
+    Parse S3 manifest path. Return the label, or an empty string if not
+    labeled with the cluster uuid.
+
+    Sample name: 50000000/meta/kafka/panda-topic/0_19/manifest.json
+        Output: ""
+    Sample name: 6e94ccdc-443a-4807-b105-0bb86e8f97f7/meta/kafka/panda-topic/0_18/manifest.bin
+        Output: "6e94ccdc-443a-4807-b105-0bb86e8f97f7"
+    Sample name: 6e94ccdc-443a-4807-b105-0bb86e8f97f7/meta/kafka/panda-topic/0_18/manifest.bin.0.21.0.20.1719867209267.1719867209268
+        Output: "6e94ccdc-443a-4807-b105-0bb86e8f97f7"
+    """
+    items = path.split('/')
+    if len(items[0]) == 8 and items[0].endswith('0000000'):
+        return ""
+    return items[0]
+
+
 def parse_s3_manifest_path(path: str) -> NTPR:
     """Parse S3 manifest path. Return ntp and revision.
     Sample name: 50000000/meta/kafka/panda-topic/0_19/manifest.json
+    Sample name: 6e94ccdc-443a-4807-b105-0bb86e8f97f7/meta/kafka/panda-topic/0_18/manifest.bin
     """
     items = path.split('/')
     ns = items[2]
@@ -244,6 +311,35 @@ def parse_s3_manifest_path(path: str) -> NTPR:
     partition = int(part_rev[0])
     revision = int(part_rev[1])
     return NTPR(ns=ns, topic=topic, partition=partition, revision=revision)
+
+
+def parse_cluster_metadata_manifest_path(
+        path: str) -> ClusterMetadataComponents:
+    """
+    Parse S3 cluster metadata manifest path. Return the cluster UUID and
+    metadata ID.
+    Sample name: cluster_metadata/6e94ccdc-443a-4807-b105-0bb86e8f97f7/manifests/0/cluster_manifest.json
+    """
+    items = path.split('/')
+    assert items[
+        0] == "cluster_metadata", f"Invalid cluster metadata manifest path: {path}"
+    cluster_uuid = items[1]
+    meta_id = int(items[3])
+    return ClusterMetadataComponents(cluster_uuid, meta_id)
+
+
+def parse_controller_snapshot_path(path: str) -> ClusterMetadataComponents:
+    """
+    Parse S3 cluster controller snapshot path. Return the cluster UUID and
+    metadata ID.
+    Sample name: cluster_metadata/6e94ccdc-443a-4807-b105-0bb86e8f97f7/0/controller.snapshot
+    """
+    items = path.split('/')
+    assert items[
+        0] == "cluster_metadata", f"Invalid cluster metadata manifest path: {path}"
+    cluster_uuid = items[1]
+    meta_id = int(items[2])
+    return ClusterMetadataComponents(cluster_uuid, meta_id)
 
 
 def parse_s3_segment_path(path) -> SegmentPathComponents:
@@ -257,8 +353,11 @@ def parse_s3_segment_path(path) -> SegmentPathComponents:
     partition = int(part_rev[0])
     revision = int(part_rev[1])
     fname = items[4]
+    base_offset = int(fname.split('-')[0])
     ntpr = NTPR(ns=ns, topic=topic, partition=partition, revision=revision)
-    return SegmentPathComponents(ntpr=ntpr, name=fname)
+    return SegmentPathComponents(ntpr=ntpr,
+                                 name=fname,
+                                 base_offset=base_offset)
 
 
 def _parse_checksum_entry(path, value, ignore_rev):
@@ -308,8 +407,10 @@ def verify_file_layout(baseline_per_host,
         that maps host to dict of ntps where each ntp is mapped to the list of
         segments. The result is a map from ntp to the partition size on disk.
         """
+        first_host = None
+
         ntps = defaultdict(int)
-        for _, fdata in fdata_per_host.items():
+        for host, fdata in fdata_per_host.items():
             ntp_size = defaultdict(int)
             for path, entry in fdata.items():
                 it = _parse_checksum_entry(path, entry, ignore_rev=True)
@@ -319,6 +420,13 @@ def verify_file_layout(baseline_per_host,
                         # which are created after recovery
                         ntp_size[it.ntp] += it.size
 
+            if first_host is None:
+                first_host = host
+            else:
+                assert set(ntps.keys()) == set(
+                    ntp_size.keys()
+                ), f"NTPs on {host} differ from first host {first_host}: {set(ntps.keys())} vs {host}: {set(ntp_size.keys())}"
+
             for ntp, total_size in ntp_size.items():
                 if ntp in ntps and not hosts_can_vary:
                     # the size of the partition should be the
@@ -327,7 +435,8 @@ def verify_file_layout(baseline_per_host,
                     logger.info(
                         f"checking size of the partition for {ntp}, new {total_size} vs already accounted {ntps[ntp]}"
                     )
-                    assert total_size == ntps[ntp]
+                    assert total_size == ntps[ntp],\
+                          f"{ntp=} new {total_size=} differs from already accounted size={ntps[ntp]}"
                 else:
                     ntps[ntp] = max(total_size, ntps[ntp])
         return ntps
@@ -362,20 +471,30 @@ def verify_file_layout(baseline_per_host,
             f" The original is {orig_ntp_size} bytes which {delta} bytes larger."
 
 
-def gen_topic_manifest_path(topic: NT):
-    x = xxhash.xxh32()
+def gen_topic_manifest_path(topic: NT,
+                            manifest_format: Literal['json', 'bin'] = 'bin',
+                            remote_label: str = "",
+                            rev: int = 0):
+    assert manifest_format in ['json', 'bin']
     path = f"{topic.ns}/{topic.topic}"
-    x.update(path.encode('ascii'))
-    hash = x.hexdigest()[0] + '0000000'
-    return f"{hash}/meta/{path}/topic_manifest.json"
+    if len(remote_label) == 0:
+        x = xxhash.xxh32()
+        x.update(path.encode('ascii'))
+        hash = x.hexdigest()[0] + '0000000'
+        return f"{hash}/meta/{path}/topic_manifest.{manifest_format}"
+    return f"meta/{path}/{remote_label}/{rev}/topic_manifest.{manifest_format}"
 
 
-def gen_topic_lifecycle_marker_path(topic: NT):
-    x = xxhash.xxh32()
+def gen_topic_lifecycle_marker_path(topic: NT,
+                                    rev: int,
+                                    remote_label: str = ""):
     path = f"{topic.ns}/{topic.topic}"
-    x.update(path.encode('ascii'))
-    hash = x.hexdigest()[0] + '0000000'
-    return f"{hash}/meta/{path}/topic_manifest.json"
+    if len(remote_label) == 0:
+        x = xxhash.xxh32()
+        x.update(path.encode('ascii'))
+        hash = x.hexdigest()[0] + '0000000'
+        return f"{hash}/meta/{path}/{rev}_lifecycle.bin"
+    return f"meta/{path}/{remote_label}/{rev}_lifecycle.bin"
 
 
 def gen_segment_name_from_meta(meta: dict, key: str) -> str:
@@ -467,24 +586,43 @@ def get_expected_ntp_restored_size(nodes_segments_report: NodeSegmentsReport,
     return expected_restored_sizes
 
 
-def nodes_report_cloud_segments(redpanda, target_segments):
+def nodes_report_cloud_segments(redpanda, target_segments, topic_name=None):
     """
     Returns true if the nodes in the cluster collectively report having
-    above the given number of segments.
+    above the given number of segments for a specific topic, if provided.
 
+    Args:
+        redpanda: The Redpanda instance.
+        target_segments (int): The target number of segments to check for.
+        topic_name (str, optional): The name of the topic for which to count the segments.
+    
     NOTE: we're explicitly not checking the manifest via cloud client
     because we expect the number of items in our bucket to be quite large,
     and for associated ListObjects calls to take a long time.
     """
     try:
-        num_segments = redpanda.metric_sum(
-            "redpanda_cloud_storage_segments",
-            metrics_endpoint=MetricsEndpoint.PUBLIC_METRICS)
-        redpanda.logger.info(
+        metrics_endpoint = MetricsEndpoint.PUBLIC_METRICS
+        if topic_name:
+            num_segments = redpanda.metric_sum(
+                "redpanda_cloud_storage_segments",
+                metrics_endpoint=metrics_endpoint,
+                topic=topic_name)
+        else:
+            # Fetch total number of segments without filtering by specific topic
+            num_segments = redpanda.metric_sum(
+                "redpanda_cloud_storage_segments",
+                metrics_endpoint=metrics_endpoint)
+
+        message = (f"Cluster metrics for topic '{topic_name}' report "
+                   f"{num_segments} / {target_segments} cloud segments") \
+            if topic_name else \
             f"Cluster metrics report {num_segments} / {target_segments} cloud segments"
-        )
-    except:
+
+        redpanda.logger.info(message)
+    except Exception as e:
+        redpanda.logger.error(f"Error fetching metrics: {e}")
         return False
+
     return num_segments >= target_segments
 
 
@@ -493,7 +631,7 @@ def is_close_size(actual_size, expected_size):
     The actual size shouldn't be less than expected. Also, the difference
     between two values shouldn't be greater than the size of one segment.
     """
-    lower_bound = expected_size
+    lower_bound = int(expected_size * 0.95)
     upper_bound = expected_size + default_log_segment_size + \
                   int(default_log_segment_size * 0.2)
     return actual_size in range(lower_bound, upper_bound)
@@ -504,9 +642,12 @@ class PathMatcher:
         self.expected_topics = expected_topics
         if self.expected_topics is not None:
             self.topic_names = {t.name for t in self.expected_topics}
+            # topic_manifest can end in .json for redpanda before v24.1, and .bin for redpanda after v24.1.
             self.topic_manifest_paths = {
-                f'/{t}/topic_manifest.json'
+                manifest_key
                 for t in self.topic_names
+                for manifest_key in (f'/{t}/topic_manifest.json',
+                                     f'/{t}/topic_manifest.bin')
             }
         else:
             self.topic_names = None
@@ -519,10 +660,23 @@ class PathMatcher:
             return any(tn in key for tn in self.topic_names)
 
     def _match_topic_manifest(self, key):
-        if self.topic_manifest_paths is None:
+        if self.topic_names is None:
             return True
         else:
-            return any(key.endswith(t) for t in self.topic_manifest_paths)
+            for t in self.topic_names:
+                if not key.endswith(
+                        "/topic_manifest.bin") and not key.endswith(
+                            "/topic_manifest.json"):
+                    continue
+                if t in key:
+                    return True
+            return False
+
+    def is_cluster_metadata_manifest(self, o: ObjectMetadata) -> bool:
+        return o.key.endswith('/cluster_manifest.json')
+
+    def is_controller_snapshot(self, o: ObjectMetadata) -> bool:
+        return o.key.endswith('/controller.snapshot')
 
     def is_partition_manifest(self, o: ObjectMetadata) -> bool:
         return (o.key.endswith('/manifest.json')
@@ -581,7 +735,10 @@ class PathMatcher:
         return self._match_partition_manifest(path)
 
 
-def quiesce_uploads(redpanda, topic_names: list[str], timeout_sec):
+def quiesce_uploads(redpanda,
+                    topic_names: list[str],
+                    timeout_sec,
+                    target_label: Optional[str] = None):
     """
     Wait until all local data for all topics in `topic_names` has been uploaded
     to remote storage.  This function expects that no new data is being produced:
@@ -591,26 +748,29 @@ def quiesce_uploads(redpanda, topic_names: list[str], timeout_sec):
     **Important**: you must have interval uploads enabled, or this function
     will fail: it expects all data to be uploaded eventually.
     """
+
+    last_msg = ""
+
     def remote_has_reached_hwm(ntp: NTP, hwm: int):
+        nonlocal last_msg
         view = BucketView(redpanda)
         try:
-            manifest = view.get_partition_manifest(ntp)
+            manifest = view.get_partition_manifest(ntp, target_label)
         except Exception as e:
-            redpanda.logger.debug(
-                f"Partition {ntp} doesn't have a manifest yet ({e})")
+            last_msg = f"Partition {ntp} doesn't have a manifest yet ({e})"
+            redpanda.logger.debug(last_msg)
             return False
 
         remote_committed_offset = BucketView.kafka_last_offset(manifest)
         if remote_committed_offset is None:
-            redpanda.logger.debug(
-                f"Partition {ntp} does not have committed offset yet")
+            last_msg = f"Partition {ntp} does not have committed offset yet"
+            redpanda.logger.debug(last_msg)
             return False
         else:
             ready = remote_committed_offset >= hwm - 1
             if not ready:
-                redpanda.logger.debug(
-                    f"Partition {ntp} not yet ready ({remote_committed_offset} < {hwm-1})"
-                )
+                last_msg = f"Partition {ntp} not yet ready ({remote_committed_offset} < {hwm-1})"
+                redpanda.logger.debug(last_msg)
             return ready
 
     t_initial = time.time()
@@ -631,7 +791,8 @@ def quiesce_uploads(redpanda, topic_names: list[str], timeout_sec):
 
             redpanda.wait_until(lambda: remote_has_reached_hwm(ntp, hwm),
                                 timeout_sec=timeout,
-                                backoff_sec=1)
+                                backoff_sec=1,
+                                err_msg=lambda: last_msg)
             redpanda.logger.debug(f"Partition {ntp} ready (reached HWM {hwm})")
 
         if p_count == 0:
@@ -655,12 +816,12 @@ class SpillMeta:
     def make(ntpr: NTPR, path: str):
         base, last, base_kafka, last_kafka, base_ts, last_ts = SpillMeta._parse_path(
             ntpr, path)
-        return SpillMeta(base=base,
-                         last=last,
-                         base_kafka=base_kafka,
-                         last_kafka=last_kafka,
-                         base_ts=base_ts,
-                         last_ts=last_ts,
+        return SpillMeta(base=int(base),
+                         last=int(last),
+                         base_kafka=int(base_kafka),
+                         last_kafka=int(last_kafka),
+                         base_ts=int(base_ts),
+                         last_ts=int(last_ts),
                          ntpr=ntpr,
                          path=path)
 
@@ -672,7 +833,8 @@ class SpillMeta:
         {base}.{base_rp_offset}.{last_rp_offest}.{base_kafka_offset}.{last_kafka_offset}.{first_ts}.{last_ts}
         where base = {hash}/meta/{ntpr.ns}/{ntpr.topic}/{ntpr.partition}_{ntpr.revision}/manifest"
         """
-        base = BucketView.gen_manifest_path(ntpr)
+        label = parse_s3_partition_path_label(path)
+        base = BucketView.gen_manifest_path(ntpr, remote_label=label)
         suffix = path.removeprefix(f"{base}.")
 
         split = suffix.split(".")
@@ -695,12 +857,14 @@ class BucketViewState:
         self.ignored_objects: int = 0
         self.tx_manifests: int = 0
         self.segment_indexes: int = 0
-        self.topic_manifests: dict[NT, dict] = {}
-        self.partition_manifests: dict[NTP, dict] = {}
-        self.spillover_manifests: dict[NTP, dict[SpillMeta, dict]] = {}
+        self.topic_manifests: dict[str, dict[NT, dict]] = {}
+        self.partition_manifests: dict[str, dict[NTP, dict]] = {}
+        self.spillover_manifests: dict[str, dict[NTP, dict[SpillMeta,
+                                                           dict]]] = {}
         # List of summaries for all segments. These summaries refer
         # to data in the bucket and not segments in the manifests.
-        self.segment_summaries: dict[NTP, list[SegmentSummary]] = {}
+        self.segment_summaries: dict[str, dict[NTP, list[SegmentSummary]]] = {}
+        self.cluster_metadata: dict[str, ClusterMetadata] = {}
 
 
 class ManifestFormat(Enum):
@@ -781,9 +945,35 @@ class BucketView:
         return self._state.ignored_objects
 
     @property
+    def cluster_metadata(self) -> dict[str, ClusterMetadata]:
+        self._ensure_listing()
+        return self._state.cluster_metadata
+
+    @property
+    def latest_cluster_metadata_manifest(self) -> dict:
+        self._ensure_listing()
+        latest_cluster_metadata = ClusterMetadata(dict(), dict())
+        highest_meta_id = -1
+        for _, meta in self.cluster_metadata.items():
+            for meta_id, _ in meta.cluster_metadata_manifests.items():
+                if meta_id > highest_meta_id:
+                    latest_cluster_metadata = meta
+                    highest_meta_id = meta_id
+        if highest_meta_id == -1:
+            return dict()
+
+        highest_manifest = latest_cluster_metadata.cluster_metadata_manifests[
+            highest_meta_id]
+        return highest_manifest
+
+    @property
     def partition_manifests(self) -> dict[NTP, dict]:
         self._ensure_listing()
-        return self._state.partition_manifests
+        if len(self._state.partition_manifests) != 1:
+            raise Exception(
+                f"Bucket doesn't have exactly one cluster's data: {self._state.partition_manifests.keys()}"
+            )
+        return next(iter(self._state.partition_manifests.values()))
 
     @staticmethod
     def kafka_start_offset(manifest) -> Optional[int]:
@@ -834,9 +1024,15 @@ class BucketView:
         Returns the cloud log size summed over all ntps.
         """
         self._do_listing()
+        if len(self._state.partition_manifests) != 1:
+            raise Exception(
+                f"Bucket doesn't have exactly one cluster's data: {self._state.partition_manifests.keys()}"
+            )
 
         total = CloudLogSize.make_empty()
-        for ns, topic, partition in self._state.partition_manifests.keys():
+        partition_manifests = next(
+            iter(self._state.partition_manifests.values()))
+        for ns, topic, partition in partition_manifests.keys():
             val = self.cloud_log_size_for_ntp(topic, partition, ns)
             self.logger.debug(f"{topic}/{partition} log_size={val}")
             total += val
@@ -863,13 +1059,25 @@ class BucketView:
                 self._state.segment_objects += 1
                 if self._scan_segments:
                     spc = parse_s3_segment_path(o.key)
-                    self._add_segment_metadata(o.key, spc)
+                    try:
+                        self._add_segment_metadata(o.key, spc)
+                    except ClientError as err:
+                        # The segment was listed by ListObjectV2 request
+                        # and deleted by Redpanda concurrently.
+                        # We don't expect this to happen with the manifests
+                        # so this error is only handled in case of segments
+                        if err['Error']['Code'] == 'NoSuchKey':
+                            self._state.ignored_objects += 1
             elif self.path_matcher.is_topic_manifest(o):
                 pass
             elif self.path_matcher.is_tx_manifest(o):
                 self._state.tx_manifests += 1
             elif self.path_matcher.is_segment_index(o):
                 self._state.segment_indexes += 1
+            elif self.path_matcher.is_cluster_metadata_manifest(o):
+                self._load_cluster_metadata_manifest(o.key)
+            elif self.path_matcher.is_controller_snapshot(o):
+                self._load_controller_snapshot_size(o.key)
             else:
                 self._state.ignored_objects += 1
         if self._scan_segments:
@@ -877,52 +1085,36 @@ class BucketView:
 
     def _sort_segment_summaries(self):
         """Sort segment summary lists by base offset"""
-        res = {}
-        for ntp, lst in self._state.segment_summaries.items():
-            self.logger.debug(f"Sorting segment summaries for {ntp}")
-            res[ntp] = sorted(lst, key=lambda x: x.base_offset)
-        self._state.segment_summaries = res
+        for label, summaries in self._state.segment_summaries.items():
+            res = {}
+            for ntp, lst in summaries.items():
+                self.logger.debug(
+                    f"Sorting segment summaries for {label}/{ntp}")
+                res[ntp] = sorted(lst, key=lambda x: x.base_offset)
+            self._state.segment_summaries[label] = res
 
-    def _get_manifest(self, ntpr: NTPR, path: Optional[str] = None) -> dict:
+    def _get_manifest(self, ntpr: NTPR, path: str) -> dict:
         """
         Having composed the path for a manifest, download it and return the manifest dict
 
         Raises KeyError if the object is not found.
         """
 
-        if path is None:
-            # implicit path, try .bin and fall back to .json
-            path = BucketView.gen_manifest_path(ntpr, "bin")
+        # explicit path, only try loading that and fail if it fails
+        if ".bin" in path:
             format = ManifestFormat.BINARY
-            try:
-                data = self.client.get_object_data(self.bucket, path)
-            except Exception as e:
-                self.logger.debug(f"Exception loading {path}: {e}")
-                try:
-                    path = BucketView.gen_manifest_path(ntpr, "json")
-                    format = ManifestFormat.JSON
-                    data = self.client.get_object_data(self.bucket, path)
-                except Exception as e:
-                    # Very generic exception handling because the storage client
-                    # may be one of several classes with their own exceptions
-                    self.logger.debug(f"Exception loading {path}: {e}")
-                    raise KeyError(f"Manifest for ntp {ntpr} not found")
+        elif ".json" in path:
+            format = ManifestFormat.JSON
         else:
-            # explicit path, only try loading that and fail if it fails
-            if ".bin" in path:
-                format = ManifestFormat.BINARY
-            elif ".json" in path:
-                format = ManifestFormat.JSON
-            else:
-                raise RuntimeError(f"Unknown manifest key format: '{path}'")
+            raise RuntimeError(f"Unknown manifest key format: '{path}'")
 
-            try:
-                data = self.client.get_object_data(self.bucket, path)
-            except Exception as e:
-                # Very generic exception handling because the storage client
-                # may be one of several classes with their own exceptions
-                self.logger.debug(f"Exception loading {path}: {e}")
-                raise KeyError(f"Manifest for ntp {ntpr} not found")
+        try:
+            data = self.client.get_object_data(self.bucket, path)
+        except Exception as e:
+            # Very generic exception handling because the storage client
+            # may be one of several classes with their own exceptions
+            self.logger.debug(f"Exception loading {path}: {e}")
+            raise KeyError(f"Manifest for ntp {ntpr} not found")
 
         if format == ManifestFormat.BINARY:
             manifest = RpStorageTool(
@@ -932,12 +1124,16 @@ class BucketView:
 
         return manifest
 
-    def _load_manifest(self, ntpr: NTPR, path: Optional[str] = None) -> dict:
+    def _load_manifest(self, ntpr: NTPR, path: str) -> dict:
         manifest = self._get_manifest(ntpr, path)
-        self._state.partition_manifests[ntpr.to_ntp()] = manifest
+
+        label = parse_s3_partition_path_label(path)
+        if label not in self._state.partition_manifests:
+            self._state.partition_manifests[label] = {}
+        self._state.partition_manifests[label][ntpr.to_ntp()] = manifest
 
         self.logger.debug(
-            f"Loaded manifest for {ntpr}: {pprint.pformat(manifest, indent=2)}"
+            f"Loaded manifest for {ntpr} at {path}: {pprint.pformat(manifest, indent=2)}"
         )
 
         return manifest
@@ -946,15 +1142,18 @@ class BucketView:
                                  path: str) -> tuple[SpillMeta, dict]:
         manifest = self._get_manifest(ntpr, path)
         ntp = ntpr.to_ntp()
+        label = parse_s3_partition_path_label(path)
 
-        if ntp not in self._state.spillover_manifests:
-            self._state.spillover_manifests[ntp] = {}
+        if label not in self._state.spillover_manifests:
+            self._state.spillover_manifests[label] = {}
+        if ntp not in self._state.spillover_manifests[label]:
+            self._state.spillover_manifests[label][ntp] = {}
 
         meta = SpillMeta.make(ntpr, path)
-        self._state.spillover_manifests[ntp][meta] = manifest
+        self._state.spillover_manifests[label][ntp][meta] = manifest
 
         self.logger.debug(
-            f"Loaded spillover manifest for {ntpr}: {pprint.pformat(manifest, indent=2)}"
+            f"Loaded spillover manifest for {ntpr} at {path}: {pprint.pformat(manifest, indent=2)}"
         )
 
         return meta, manifest
@@ -965,17 +1164,23 @@ class BucketView:
         if path.endswith(".tx"):
             return
         self.logger.debug(f"Parsing segment {spc} at {path}")
+        label = parse_s3_partition_path_label(path)
         ntp = spc.ntpr.to_ntp()
-        if ntp not in self._state.segment_summaries:
-            self._state.segment_summaries[ntp] = []
+        if label not in self._state.segment_summaries:
+            self._state.segment_summaries[label] = {}
+        if ntp not in self._state.segment_summaries[label]:
+            self._state.segment_summaries[label][ntp] = []
         payload = self.client.get_object_data(self.bucket, path)
         reader = SegmentReader(io.BytesIO(payload))
         summary = make_segment_summary(spc.ntpr, reader)
-        self._state.segment_summaries[ntp].append(summary)
+        self._state.segment_summaries[label][ntp].append(summary)
 
-    def _discover_spillover_manifests(self, ntpr: NTPR) -> list[SpillMeta]:
+    def _discover_spillover_manifests(self,
+                                      ntpr: NTPR,
+                                      label: str = "") -> list[SpillMeta]:
         list_res = self.client.list_objects(
-            bucket=self.bucket, prefix=BucketView.gen_manifest_path(ntpr))
+            bucket=self.bucket,
+            prefix=BucketView.gen_manifest_path(ntpr, remote_label=label))
 
         def is_spillover_manifest_path(path: str) -> bool:
             return not (path.endswith(".json") or path.endswith(".bin"))
@@ -987,30 +1192,107 @@ class BucketView:
 
         return sorted(spill_metas)
 
-    @staticmethod
-    def gen_manifest_path(ntpr: NTPR, extension: str = "bin"):
-        x = xxhash.xxh32()
-        path = f"{ntpr.ns}/{ntpr.topic}/{ntpr.partition}_{ntpr.revision}"
-        x.update(path.encode('ascii'))
-        hash = x.hexdigest()[0] + '0000000'
-        return f"{hash}/meta/{path}/manifest.{extension}"
+    def _load_cluster_metadata_manifest(self, path: str) -> dict:
+        try:
+            data = self.client.get_object_data(self.bucket, path)
+        except Exception as e:
+            self.logger.debug(f"Exception loading {path}: {e}")
+            raise KeyError(f"Cluster manifest at {path} failed to load")
+        manifest = json.loads(data)
+        self.logger.debug(
+            f"Loaded cluster manifest at {path}: {pprint.pformat(manifest)}")
+        cluster_uuid, meta_id = parse_cluster_metadata_manifest_path(path)
+        if cluster_uuid not in self._state.cluster_metadata:
+            self._state.cluster_metadata[cluster_uuid] = ClusterMetadata(
+                dict(), dict())
+        self._state.cluster_metadata[cluster_uuid].cluster_metadata_manifests[
+            meta_id] = manifest
+        return manifest
 
-    def get_partition_manifest(self, ntp: NTP | NTPR) -> dict:
+    def _load_controller_snapshot_size(self, path: str) -> int:
+        try:
+            meta = self.client.get_object_meta(self.bucket, path)
+        except Exception as e:
+            self.logger.debug(f"Exception loading {path}: {e}")
+            raise KeyError(f"Cluster manifest at {path} failed to load")
+        self.logger.debug(f"Loaded controller snapshot at {path}: {meta}")
+        cluster_uuid, offset = parse_controller_snapshot_path(path)
+        if cluster_uuid not in self._state.cluster_metadata:
+            self._state.cluster_metadata[cluster_uuid] = ClusterMetadata(
+                dict(), dict())
+        self._state.cluster_metadata[cluster_uuid].controller_snapshot_sizes[
+            offset] = meta.content_length
+        return meta.content_length
+
+    @staticmethod
+    def gen_manifest_path(ntpr: NTPR,
+                          extension: str = "bin",
+                          remote_label: str = ""):
+        path = f"{ntpr.ns}/{ntpr.topic}/{ntpr.partition}_{ntpr.revision}"
+        if len(remote_label) == 0:
+            x = xxhash.xxh32()
+            x.update(path.encode('ascii'))
+            hash = x.hexdigest()[0] + '0000000'
+            return f"{hash}/meta/{path}/manifest.{extension}"
+        return f"{remote_label}/meta/{path}/manifest.{extension}"
+
+    def get_partition_manifest(self,
+                               ntp: NTP | NTPR,
+                               target_label: Optional[str] = None) -> dict:
         """
         Fetch a manifest, looking up revision as needed.
+
+        If a specific remote label is not being targeted, expects there to be
+        at most one matching manifest in the bucket.
         """
         ntpr = None
         if isinstance(ntp, NTPR):
             ntpr = ntp
             ntp = ntpr.to_ntp()
 
-        if ntp in self._state.partition_manifests:
-            return self._state.partition_manifests[ntp]
+        matching_labels = []
+        for label, pms in self._state.partition_manifests.items():
+            if target_label is not None and target_label != label:
+                continue
+            if ntp in pms:
+                matching_labels.append(label)
+        if len(matching_labels) > 1:
+            raise Exception(
+                f"Multiple labels contain {ntp}: {matching_labels}")
+
+        if len(matching_labels) == 1:
+            return self._state.partition_manifests[matching_labels[0]][ntp]
 
         if not ntpr:
             ntpr = self.ntp_to_ntpr(ntp)
 
-        return self._load_manifest(ntpr)
+        # If we need to look for the partition manifest, look for topic
+        # manifests first to see what cluster uuid labels to expect (note,
+        # based on the naming scheme, it's easier to find topic manifests
+        # without the cluster uuid in hand than it is to find partition
+        # manifests)
+        topic = NT(ntpr.ns, ntpr.topic)
+        topic_manifest_paths = self._find_topic_manifest_paths(topic)
+
+        for tm_path in topic_manifest_paths:
+            label = parse_s3_topic_label(tm_path)
+            if target_label is not None and target_label != label:
+                continue
+            paths = [BucketView.gen_manifest_path(ntpr, "bin", label)]
+            if len(label) == 0:
+                # Versions of Redpanda below 24.2 don't have labels. Farther
+                # back, we also supported JSON manifests. As a crude heuristic
+                # assume we may need to look for JSON if we don't have a label.
+                paths.append(BucketView.gen_manifest_path(ntpr, "json", label))
+
+            for path in paths:
+                m: dict = {}
+                try:
+                    m = self._load_manifest(ntpr, path)
+                except KeyError:
+                    continue
+                return m
+        raise KeyError(f"Manifest for ntp {ntpr} not found")
 
     def get_spillover_metadata(self, ntp: NTP | NTPR) -> list[SpillMeta]:
         """
@@ -1025,7 +1307,16 @@ class BucketView:
         if not ntpr:
             ntpr = self.ntp_to_ntpr(ntp)
 
-        return self._discover_spillover_manifests(ntpr)
+        topic = NT(ntpr.ns, ntpr.topic)
+        topic_manifest_paths = self._find_topic_manifest_paths(topic)
+
+        for tm_path in topic_manifest_paths:
+            label = parse_s3_topic_label(tm_path)
+            spills = self._discover_spillover_manifests(ntpr, label)
+            if len(spills) == 0:
+                continue
+            return spills
+        return []
 
     def get_spillover_manifests(
             self, ntp: NTP | NTPR) -> Optional[dict[SpillMeta, dict]]:
@@ -1039,62 +1330,161 @@ class BucketView:
             ntpr = ntp
             ntp = ntpr.to_ntp()
 
-        if ntp in self._state.spillover_manifests:
-            return self._state.spillover_manifests[ntp]
+        matching_labels = []
+        for label, pms in self._state.spillover_manifests.items():
+            if ntp in pms:
+                matching_labels.append(label)
+        if len(matching_labels) > 1:
+            raise Exception(
+                f"Multiple labels contain {ntp}: {matching_labels}")
+
+        if len(matching_labels) == 1:
+            return self._state.spillover_manifests[matching_labels[0]][ntp]
 
         if not ntpr:
             ntpr = self.ntp_to_ntpr(ntp)
 
-        spills = self._discover_spillover_manifests(ntpr)
-        for spill in spills:
-            self._load_spillover_manifest(spill.ntpr, spill.path)
+        topic = NT(ntpr.ns, ntpr.topic)
+        topic_manifest_paths = self._find_topic_manifest_paths(topic)
 
-        if ntp in self._state.spillover_manifests:
-            return self._state.spillover_manifests[ntp]
+        # If we need to look for the spillover manifests, look for topic
+        # manifests first to see what cluster uuid labels to expect (note,
+        # based on the naming scheme, it's easier to find topic manifests
+        # without the cluster uuid in hand than it is to find partition
+        # manifests)
+        for tm_path in topic_manifest_paths:
+            label = parse_s3_topic_label(tm_path)
+            spills = self._discover_spillover_manifests(ntpr, label)
+            if len(spills) == 0:
+                continue
+            for spill in spills:
+                self._load_spillover_manifest(spill.ntpr, spill.path)
+            return self._state.spillover_manifests[label][ntp]
+        return None
+
+    def _load_manifest_v1_from_data(
+            self, data, manifest_format: Literal['json', 'bin']) -> dict:
+        """
+        Either decode a bin topic_manifest or json load a json topic_manifest.
+        the result is a dict of only the fields that were serialized in v1 of topic_manifest
+        """
+        if manifest_format == 'bin':
+            return OfflineLogViewer(self.redpanda).read_bin_topic_manifest(
+                data, return_legacy_format=True)
         else:
-            return None
+            return json.loads(data)
 
-    def _load_topic_manifest(self, topic: NT, path: str):
+    def _load_topic_manifest(self, topic: NT, path: str,
+                             manifest_format: Literal['json', 'bin']):
         try:
             data = self.client.get_object_data(self.bucket, path)
         except Exception as e:
             self.logger.debug(f"Exception loading {path}: {e}")
             raise KeyError(f"Manifest for topic {topic} not found")
 
-        manifest = json.loads(data)
+        manifest = self._load_manifest_v1_from_data(
+            data, manifest_format=manifest_format)
 
         self.logger.debug(
-            f"Loaded topic manifest {topic}: {pprint.pformat(manifest)}")
+            f"Loaded topic manifest from {path} {topic}: {pprint.pformat(manifest)}"
+        )
 
-        self._state.topic_manifests[topic] = manifest
+        label = parse_s3_topic_label(path)
+        if label not in self._state.topic_manifests:
+            self._state.topic_manifests[label] = {}
+        self._state.topic_manifests[label][topic] = manifest
         return manifest
 
-    def get_topic_manifest(self, topic: NT) -> dict:
-        if topic in self._state.topic_manifests:
-            return self._state.topic_manifests[topic]
+    def get_topic_manifest_from_path(self, path: str) -> dict:
+        """
+        Download the object at `path` and decode it as topic_manifest.
+        supports bin and json formats.
+        """
+        try:
+            data = self.client.get_object_data(self.bucket, path)
+        except Exception as e:
+            self.logger.debug(f"Exception loading {path}: {e}")
+            raise KeyError(f"Manifest @path={path} not found")
 
-        path = gen_topic_manifest_path(topic)
-        return self._load_topic_manifest(topic, path)
+        manifest = self._load_manifest_v1_from_data(
+            data, manifest_format='bin' if path.endswith('bin') else 'json')
+        self.logger.debug(
+            f"Loaded topic manifest from {path} for {manifest['topic']}: {pprint.pformat(manifest)}"
+        )
+        return manifest
 
-    def get_lifecycle_marker_objects(self, topic: NT) -> list[ObjectMetadata]:
+    def _find_topic_metas(self, topic: NT) -> list:
+        path = f"{topic.ns}/{topic.topic}"
+        list_prefixes = []
+
+        # First, look for newer, labeled manifests.
+        list_prefixes.append(f"meta/{path}/")
+
+        # If none, we'll fall back on legacy, hash-prefixed manifests.
+        x = xxhash.xxh32()
+        x.update(path.encode('ascii'))
+        hash = x.hexdigest()[0] + '0000000'
+        list_prefixes.append(f"{hash}/meta/{path}/")
+
+        ret = []
+        for prefix in list_prefixes:
+            for obj_meta in self.client.list_objects(self.bucket,
+                                                     prefix=prefix):
+                ret.append(obj_meta)
+        return ret
+
+    def _find_topic_manifest_paths(self, topic: NT) -> list:
+        return [
+            meta.key for meta in self._find_topic_metas(topic)
+            if meta.key.endswith("topic_manifest.bin")
+            or meta.key.endswith("topic_manifest.json")
+        ]
+
+    def get_topic_manifest(self,
+                           topic: NT,
+                           target_label: Optional[str] = None) -> dict:
+        """
+        try to download a topic_manifest.bin for topic. if no object is found, fallback to topic_manifest.json
+        """
+        matching_labels = []
+        for label, tms in self._state.topic_manifests.items():
+            if target_label is not None and target_label != label:
+                continue
+            if topic in tms:
+                matching_labels.append(label)
+        if len(matching_labels) > 1:
+            raise Exception(
+                f"Multiple labels contain {topic}: {matching_labels}")
+
+        if len(matching_labels) == 1:
+            return self._state.topic_manifests[matching_labels[0]][topic]
+
+        topic_manifest_paths = self._find_topic_manifest_paths(topic)
+        for path in topic_manifest_paths:
+            label = parse_s3_topic_label(path)
+            if target_label is not None and target_label != label:
+                continue
+            format = "bin" if path.endswith(".bin") else "json"
+            return self._load_topic_manifest(topic,
+                                             path,
+                                             manifest_format=format)
+
+        raise KeyError(f"Topic manifest not found for {topic}")
+
+    def get_lifecycle_marker_objects(
+        self,
+        topic: NT,
+    ) -> list[ObjectMetadata]:
         """
         Topic manifests are identified by namespace-topic, whereas lifecycle
         markers are identified by namespace-topic-revision.
 
         It is convenient in tests to retrieve by NT though.
         """
-
-        x = xxhash.xxh32()
-        path = f"{topic.ns}/{topic.topic}"
-        x.update(path.encode('ascii'))
-        hash = x.hexdigest()[0] + '0000000'
-        prefix = f"{hash}/meta/{path}/"
-        results = []
-        for obj_meta in self.client.list_objects(self.bucket, prefix=prefix):
-            if obj_meta.key.endswith("lifecycle.bin"):
-                results.append(obj_meta)
-
-        return results
+        return [
+            meta for meta in self._find_topic_metas(topic)
+            if meta.key.endswith("lifecycle.bin")
+        ]
 
     def get_lifecycle_marker(self, topic: NT) -> dict:
         """
@@ -1115,20 +1505,21 @@ class BucketView:
         )
         return decoded
 
-    def is_segment_part_of_a_manifest(self, o: ObjectMetadata) -> bool:
+    def find_segment_in_manifests(self, o: ObjectMetadata) -> Optional[dict]:
         """
-        Queries that given object is a segment, and is a part of one of the test partition manifests
-        with a matching archiver term
+        Checks that given object is a segment, and is a part of one of the test partition manifests
+        with a matching archiver term. If that's the case, the metadata associated with the segment
+        is returned.
         """
         try:
             if not self.path_matcher.is_segment(o):
-                return False
+                return None
 
             segment_path = parse_s3_segment_path(o.key)
             partition_manifest = self.get_partition_manifest(segment_path.ntpr)
             if not partition_manifest:
                 self.logger.warn(f'no manifest found for {segment_path.ntpr}')
-                return False
+                return None
 
             segments_in_manifest = partition_manifest['segments']
 
@@ -1146,20 +1537,20 @@ class BucketView:
                     f'no entry found for segment path {manifest_key} '
                     f'in manifest: {pprint.pformat(segments_in_manifest, indent=2)}'
                 )
-                return False
+                return None
 
             # Archiver term should match the value in partition manifest
             manifest_archiver_term = str(segment_entry['archiver_term'])
             if archiver_term == manifest_archiver_term:
-                return True
+                return segment_entry
 
             self.logger.warn(
                 f'{segment_path} has archiver term {archiver_term} '
                 f'which does not match manifest term {manifest_archiver_term}')
-            return False
+            return None
         except Exception as e:
             self.logger.info(f'error {e} while checking if {o} is a segment')
-            return False
+            return None
 
     def is_ntp_in_manifest(self,
                            topic: str,
@@ -1291,12 +1682,29 @@ class BucketView:
                             key=lambda seg: seg['base_offset'])
         assert first_segment['base_offset'] > 0
 
-    def segment_summaries(self, ntp: NTP):
+    def segment_summaries(self, ntp: NTP) -> list[SegmentSummary]:
         self._ensure_listing()
-        if ntp in self._state.segment_summaries:
-            return self._state.segment_summaries[ntp]
-        else:
-            return dict()
+        matching_labels = []
+        for label, summaries in self._state.segment_summaries.items():
+            if ntp in summaries:
+                matching_labels.append(label)
+        if len(matching_labels) > 1:
+            raise Exception(
+                f"Multiple labels contain {ntp}: {matching_labels}")
+
+        if len(matching_labels) == 1:
+            return self._state.segment_summaries[matching_labels[0]][ntp]
+
+        return []
+
+    def are_all_segments_config_batches(self, summaries):
+        all_config_batches = all(
+            [summary.num_data_records == 0 for summary in summaries])
+        if all_config_batches:
+            self.logger.debug(
+                "Segments left in archive are composed of all non-data batches"
+            )
+        return all_config_batches
 
     def is_archive_cleanup_complete(self, ntp: NTP):
         self._ensure_listing()
@@ -1316,6 +1724,13 @@ class BucketView:
                 f"archive is empty, start: {aso}, clean: {aco}, len: {num}")
             return True
 
+        if self.are_all_segments_config_batches(summaries):
+            # quiesce_uploads() would not have waited for these segments
+            # to have been uploaded and the partition manifest
+            # to have been marked clean and reuploaded, since they
+            # didn't contribute to the HWM. Treat this race-y case as successful.
+            return True
+
         first_segment = min(summaries, key=lambda seg: seg.base_offset)
 
         if first_segment.base_offset != aso:
@@ -1332,10 +1747,15 @@ class BucketView:
         summaries = self.segment_summaries(ntp)
         if len(summaries) == 0:
             assert 'archive_start_offset' not in manifest
-            assert 'archive_start_offset' not in manifest
         else:
+            if self.are_all_segments_config_batches(summaries):
+                # quiesce_uploads() would not have waited for these segments
+                # to have been uploaded and the partition manifest
+                # to have been marked clean and reuploaded, since they
+                # didn't contribute to the HWM. Treat this race-y case as successful.
+                return
+
             next_base_offset = manifest.get('archive_start_offset')
-            stm_start_offset = manifest.get('start_offset')
             expected_last = manifest.get('last_offset')
 
             for summary in summaries:

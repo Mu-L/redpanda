@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 # Copyright 2020 Redpanda Data, Inc.
 #
 # Use of this software is governed by the Business Source License
@@ -25,18 +26,18 @@ RPC_TEMPLATE = """
 #pragma once
 
 #include "config/configuration.h"
+#include "metrics/metrics.h"
 #include "reflection/adl.h"
 #include "rpc/types.h"
 #include "rpc/parse_utils.h"
 #include "rpc/transport.h"
 #include "rpc/service.h"
 #include "finjector/hbadger.h"
-#include "utils/string_switch.h"
+#include "strings/string_switch.h"
 #include "random/fast_prng.h"
-#include "outcome.h"
-#include "prometheus/prometheus_sanitize.h"
-#include "seastarx.h"
-#include "ssx/metrics.h"
+#include "base/outcome.h"
+#include "metrics/prometheus_sanitize.h"
+#include "base/seastarx.h"
 
 // extra includes
 {%- for include in includes %}
@@ -56,12 +57,12 @@ RPC_TEMPLATE = """
 namespace {{namespace}} {
 
 template<typename Codec>
-class {{service_name}}_service_base : public rpc::service {
+class {{service_name}}_service_base : public ::rpc::service {
 public:
     class failure_probes;
 
     {% for method in methods %}
-    static constexpr rpc::method_info {{method.name}}_method = {"{{service_name}}::{{method.name}}", {{method.id}}};
+    static constexpr ::rpc::method_info {{method.name}}_method = {"{{service_name}}::{{method.name}}", {{method.id}}};
     {%- endfor %}
 
     {{service_name}}_service_base(ss::scheduling_group sc, ss::smp_service_group ssg)
@@ -89,18 +90,14 @@ public:
             std::vector<ss::metrics::label_instance> labels{
               service_label("{{service_name}}"),
               method_label("{{method.name}}")};
-                auto aggregate_labels
-                  = config::shard_local_cfg().aggregate_metrics()
-                      ? std::vector<sm::label>{sm::shard_label, method_label}
-                      : std::vector<sm::label>{};
             _metrics.add_group(
               prometheus_sanitize::metrics_name("internal_rpc"),
               {sm::make_histogram(
                 "latency",
                 [this] { return _methods[{{loop.index-1}}].probes.latency_hist().internal_histogram_logform(); },
                 sm::description("Internal RPC service latency"),
-                labels)
-                .aggregate(aggregate_labels)});
+                labels),
+                }, {}, {sm::shard_label, method_label});
         }
       {%- endfor %}
     }
@@ -113,7 +110,7 @@ public:
        return _ssg;
     }
 
-    rpc::method* method_from_id(uint32_t id) final {
+    ::rpc::method* method_from_id(uint32_t id) final {
        switch(id) {
        {%- for method in methods %}
          case {{method.id}}: return &_methods[{{loop.index - 1}}];
@@ -123,54 +120,54 @@ public:
     }
     {%- for method in methods %}
     /// \\brief {{method.input_type}} -> {{method.output_type}}
-    virtual ss::future<rpc::netbuf>
-    raw_{{method.name}}(ss::input_stream<char>& in, rpc::streaming_context& ctx) {
+    virtual ss::future<::rpc::netbuf>
+    raw_{{method.name}}(ss::input_stream<char>& in, ::rpc::streaming_context& ctx) {
       return execution_helper<{{method.input_type}},
                               {{method.output_type}},
                               Codec>::exec(in, ctx, {{method.name}}_method,
       [this](
-          {{method.input_type}}&& t, rpc::streaming_context& ctx) -> ss::future<{{method.output_type}}> {
+          {{method.input_type}} t, ::rpc::streaming_context& ctx) -> ss::future<{{method.output_type}}> {
           return {{method.name}}(std::move(t), ctx);
       });
     }
     virtual ss::future<{{method.output_type}}>
-    {{method.name}}({{method.input_type}}&&, rpc::streaming_context&) {
+    {{method.name}}({{method.input_type}}, ::rpc::streaming_context&) {
        throw std::runtime_error("unimplemented method");
     }
     {%- endfor %}
 private:
     ss::scheduling_group _sc;
     ss::smp_service_group _ssg;
-    std::array<rpc::method, {{methods|length}}> _methods{%raw %}{{{% endraw %}
+    std::array<::rpc::method, {{methods|length}}> _methods{%raw %}{{{% endraw %}
       {%- for method in methods %}
-      rpc::method([this] (ss::input_stream<char>& in, rpc::streaming_context& ctx) {
+      ::rpc::method([this] (ss::input_stream<char>& in, ::rpc::streaming_context& ctx) {
          return raw_{{method.name}}(in, ctx);
       }){{ "," if not loop.last }}
       {%- endfor %}
     {% raw %}}}{% endraw %};
-    ssx::metrics::metric_groups _metrics;
+    metrics::internal_metric_groups _metrics;
 };
 
-using {{service_name}}_service = {{service_name}}_service_base<rpc::default_message_codec>;
+using {{service_name}}_service = {{service_name}}_service_base<::rpc::default_message_codec>;
 
 class {{service_name}}_client_protocol {
 public:
-    explicit {{service_name}}_client_protocol(ss::lw_shared_ptr<rpc::transport> t)
+    explicit {{service_name}}_client_protocol(ss::lw_shared_ptr<::rpc::transport> t)
       : _transport(t) {
     }
 
     virtual ~{{service_name}}_client_protocol() = default;
 
     {%- for method in methods %}
-    virtual inline ss::future<result<rpc::client_context<{{method.output_type}}>>>
-    {{method.name}}({{method.input_type}}&& r, rpc::client_opts opts) {
+    virtual inline ss::future<result<::rpc::client_context<{{method.output_type}}>>>
+    {{method.name}}({{method.input_type}}&& r, ::rpc::client_opts opts) {
        return _transport->send_typed<{{method.input_type}}, {{method.output_type}}>(std::move(r),
               {{service_name}}_service::{{method.name}}_method, std::move(opts));
     }
     {%- endfor %}
 
 private:
-    ss::lw_shared_ptr<rpc::transport> _transport;
+    ss::lw_shared_ptr<::rpc::transport> _transport;
 };
 
 template<typename Codec>

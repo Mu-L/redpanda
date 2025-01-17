@@ -9,17 +9,21 @@
 
 #include "cluster/scheduling/partition_allocator.h"
 
+#include "base/units.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/controller_snapshot.h"
 #include "cluster/logger.h"
 #include "cluster/members_table.h"
 #include "cluster/scheduling/constraints.h"
+#include "cluster/scheduling/topic_memory_per_partition_default.h"
 #include "cluster/scheduling/types.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
+#include "features/feature_table.h"
 #include "model/metadata.h"
-#include "storage/segment_appender.h"
-#include "units.h"
+#include "random/generators.h"
+#include "resource_mgmt/memory_groups.h"
+#include "ssx/async_algorithm.h"
 #include "utils/human.h"
 
 #include <seastar/core/chunked_fifo.hh>
@@ -42,72 +46,132 @@ namespace cluster {
 
 partition_allocator::partition_allocator(
   ss::sharded<members_table>& members,
-  config::binding<std::optional<size_t>> memory_per_partition,
+  ss::sharded<features::feature_table>& feature_table,
   config::binding<std::optional<int32_t>> fds_per_partition,
   config::binding<uint32_t> partitions_per_shard,
   config::binding<uint32_t> partitions_reserve_shard0,
   config::binding<std::vector<ss::sstring>> internal_kafka_topics,
   config::binding<bool> enable_rack_awareness)
   : _state(std::make_unique<allocation_state>(
-    partitions_per_shard, partitions_reserve_shard0, internal_kafka_topics))
-  , _allocation_strategy(simple_allocation_strategy())
+      feature_table.local(),
+      partitions_per_shard,
+      partitions_reserve_shard0,
+      internal_kafka_topics))
   , _members(members)
-  , _memory_per_partition(std::move(memory_per_partition))
+  , _feature_table(feature_table.local())
   , _fds_per_partition(std::move(fds_per_partition))
   , _partitions_per_shard(std::move(partitions_per_shard))
   , _partitions_reserve_shard0(std::move(partitions_reserve_shard0))
   , _internal_kafka_topics(std::move(internal_kafka_topics))
   , _enable_rack_awareness(std::move(enable_rack_awareness)) {}
 
-allocation_constraints partition_allocator::default_constraints(
-  const partition_allocation_domain domain) {
+allocation_constraints partition_allocator::default_constraints() {
     allocation_constraints req;
 
+    // hard constraints
     req.add(distinct_nodes());
     req.add(not_fully_allocated());
     req.add(is_active());
 
-    if (domain == partition_allocation_domains::common) {
-        req.add(max_final_capacity());
-    } else {
-        req.add(max_final_capacity_in_domain(domain));
-    }
+    // soft constraints
     if (_enable_rack_awareness()) {
         req.add(distinct_rack_preferred(_members.local()));
     }
+
     return req;
 }
 
-result<allocated_partition> partition_allocator::allocate_new_partition(
-  model::topic_namespace nt,
-  partition_constraints p_constraints,
-  const partition_allocation_domain domain) {
-    vlog(
-      clusterlog.trace,
-      "allocating new partition with constraints: {}",
-      p_constraints);
+bool guess_is_memory_group_aware_memory_limit() {
+    // Here we are trying to guess whether `topic_memory_per_partition` is
+    // memory group aware.
+    //
+    // Originally the property was chosen such that at maxed out
+    // `topic_partitions_per_shard` we wouldn't run into OOM issues on 4 or 8GiB
+    // per shard hosts.
+    //
+    // These days we have a better understanding of how much memory a partition
+    // actually uses at rest based on memory profiler and metrics analysis.
+    // Hence we now set it to a more realistic value in the XXXKiB range.
+    //
+    // At the same time we also made the memory_groups reserve a percentage of
+    // the total memory space for partitions. Instead of dividing the whole
+    // memory space by `topic_memory_per_partition` we now only do that with the
+    // reserved value.
+    //
+    // Because of the latter making this change isn't trivial. Users might have
+    // lowered the `topic_memory_per_partition` property to gain higher
+    // partition density. With only using the reserved memory space when
+    // checking memory limits this might lead to now actually having less
+    // partition density. Hence, we need to guess whether the property was set
+    // before this change or after. If it was set before we just use the old
+    // rules (while still reserving a part of the memory) when checking memory
+    // limits to not break existing behaviour.
+    //
+    // Note that if we get this guess wrong that isn't immediately fatal. This
+    // only becomes active when creating new topics or modifying existing
+    // topics. At that point users can increase the memory reservation if
+    // needed.
 
-    uint16_t replicas_to_allocate = p_constraints.replication_factor;
-    if (
-      replicas_to_allocate == 0
-      || _state->available_nodes() < replicas_to_allocate) {
-        return errc::topic_invalid_replication_factor;
+    // not overriden so definitely memory group aware
+    if (!config::shard_local_cfg().topic_memory_per_partition.is_overriden()) {
+        return true;
     }
 
-    auto effective_constraints = default_constraints(domain);
-    effective_constraints.add(p_constraints.constraints);
+    auto value = config::shard_local_cfg().topic_memory_per_partition.value();
 
-    model::ntp ntp{
-      std::move(nt.ns), std::move(nt.tp), p_constraints.partition_id};
-    allocated_partition ret{std::move(ntp), {}, domain, *_state};
-    for (auto r = 0; r < replicas_to_allocate; ++r) {
-        auto replica = do_allocate_replica(
-          ret, std::nullopt, effective_constraints);
-        if (!replica) {
-            return replica.error();
-        }
+    // Previous default was 4MiB. New one is more than 10x smaller. We assume
+    // it's unlikely someone would have changed the value to be that much
+    // smaller and hence guess that all the values larger than 2 times the new
+    // default are old values. Equally in the new world it's unlikely anybody
+    // would increase the value (at all really).
+
+    return value < 2 * ORIGINAL_MEMORY_GROUP_AWARE_TMPP;
+}
+
+std::error_code partition_allocator::check_memory_limits(
+  uint64_t new_partitions_replicas_requested,
+  uint64_t proposed_total_partitions,
+  uint64_t effective_cluster_memory) const {
+    // Refuse to create partitions that would violate the configured
+    // memory per partition.
+    auto memory_per_partition_replica
+      = config::shard_local_cfg().topic_memory_per_partition();
+
+    if (!memory_per_partition_replica.has_value()) {
+        return errc::success;
     }
-    return ret;
+
+    bool is_memory_aware = guess_is_memory_group_aware_memory_limit();
+
+    uint64_t partition_memory;
+    if (is_memory_aware) {
+        partition_memory = effective_cluster_memory
+                           * memory_groups().partitions_max_memory_share();
+    } else {
+        partition_memory = effective_cluster_memory;
+    }
+
+    uint64_t memory_limit = partition_memory
+                            / memory_per_partition_replica.value();
+
+    if (proposed_total_partitions > memory_limit) {
+        vlog(
+          clusterlog.warn,
+          "Refusing to create {} new partitions as total partition count "
+          "{} "
+          "would exceed memory limit of {} partitions. Cluster partition "
+          "memory: {} - "
+          "required memory per partition: {} - memory group aware: {}",
+          new_partitions_replicas_requested,
+          proposed_total_partitions,
+          memory_limit,
+          partition_memory,
+          memory_per_partition_replica.value(),
+          is_memory_aware);
+        return errc::topic_invalid_partitions_memory_limit;
+    }
+
+    return errc::success;
 }
 
 /**
@@ -137,11 +201,16 @@ result<allocated_partition> partition_allocator::allocate_new_partition(
  * with partitions that cannot be re-accommodated on smaller peers).
  */
 std::error_code partition_allocator::check_cluster_limits(
-  allocation_request const& request) const {
+  const uint64_t new_partitions_replicas_requested,
+  const model::topic_namespace& topic) const {
     if (_members.local().nodes().empty()) {
         // Empty members table, we're probably running in a unit test
         return errc::success;
     }
+    if (allocation_node::is_internal_topic(_internal_kafka_topics, topic)) {
+        return errc::success;
+    }
+
     // Calculate how many partition-replicas already exist, so that we can
     // check if the new topic would take us past any limits.
     uint64_t existent_partitions{0};
@@ -149,13 +218,8 @@ std::error_code partition_allocator::check_cluster_limits(
         existent_partitions += uint64_t(i.second->allocated_partitions());
     }
 
-    // Partition-replicas requested
-    uint64_t create_count{0};
-    for (const auto& i : request.partitions) {
-        create_count += uint64_t(i.replication_factor);
-    }
-
-    uint64_t proposed_total_partitions = existent_partitions + create_count;
+    uint64_t proposed_total_partitions = existent_partitions
+                                         + new_partitions_replicas_requested;
 
     // Gather information about system-wide resource sizes
     uint32_t min_core_count = 0;
@@ -170,13 +234,11 @@ std::error_code partition_allocator::check_cluster_limits(
             min_core_count = std::min(min_core_count, b_properties.cores);
         }
 
-        // In redpanda <= 21.11.x, available_memory_gb and available_disk_gb
-        // are not populated.  If they're zero we skip the check later.
         if (min_memory_bytes == 0) {
-            min_memory_bytes = b_properties.available_memory_gb * 1_GiB;
-        } else if (b_properties.available_memory_gb > 0) {
+            min_memory_bytes = b.broker.memory_bytes();
+        } else {
             min_memory_bytes = std::min(
-              min_memory_bytes, b_properties.available_memory_gb * 1_GiB);
+              min_memory_bytes, b.broker.memory_bytes());
         }
 
         if (min_disk_bytes == 0) {
@@ -204,33 +266,29 @@ std::error_code partition_allocator::check_cluster_limits(
 
     // Refuse to create a partition count that would violate the per-core
     // limit.
-    const uint64_t core_limit = (effective_cpu_count * _partitions_per_shard());
+    const uint64_t core_limit = (effective_cpu_count * _partitions_per_shard())
+                                - (broker_count * _partitions_reserve_shard0());
     if (proposed_total_partitions > core_limit) {
         vlog(
           clusterlog.warn,
-          "Refusing to create {} partitions, exceeds core limit {}",
-          create_count,
-          effective_cpu_count * _partitions_per_shard());
-        return errc::topic_invalid_partitions;
+          "Refusing to create {} partitions as total partition count {} would "
+          "exceed the core-based limit {} (per-shard limit: {}, shard0 "
+          "reservation: {})",
+          new_partitions_replicas_requested,
+          proposed_total_partitions,
+          core_limit,
+          _partitions_per_shard(),
+          _partitions_reserve_shard0());
+        return errc::topic_invalid_partitions_core_limit;
     }
 
-    // Refuse to create partitions that would violate the configured
-    // memory per partition.
-    auto memory_per_partition_replica = _memory_per_partition();
-    if (
-      memory_per_partition_replica.has_value()
-      && memory_per_partition_replica.value() > 0) {
-        const uint64_t memory_limit = effective_cluster_memory
-                                      / memory_per_partition_replica.value();
+    auto memory_errc = check_memory_limits(
+      new_partitions_replicas_requested,
+      proposed_total_partitions,
+      effective_cluster_memory);
 
-        if (memory_limit > 0 && proposed_total_partitions > memory_limit) {
-            vlog(
-              clusterlog.warn,
-              "Refusing to create {} partitions, exceeds memory limit {}",
-              create_count,
-              memory_limit);
-            return errc::topic_invalid_partitions;
-        }
+    if (memory_errc != errc::success) {
+        return memory_errc;
     }
 
     // Refuse to create partitions that would exhaust our nfiles ulimit
@@ -246,10 +304,12 @@ std::error_code partition_allocator::check_cluster_limits(
                 if (proposed_total_partitions > fds_limit) {
                     vlog(
                       clusterlog.warn,
-                      "Refusing to create {} partitions, exceeds FD limit {}",
-                      create_count,
+                      "Refusing to create {} partitions as total partition "
+                      "count {} would exceed FD limit {}",
+                      new_partitions_replicas_requested,
+                      proposed_total_partitions,
                       fds_limit);
-                    return errc::topic_invalid_partitions;
+                    return errc::topic_invalid_partitions_fd_limit;
                 }
             }
         } else {
@@ -262,99 +322,228 @@ std::error_code partition_allocator::check_cluster_limits(
 }
 
 ss::future<result<allocation_units::pointer>>
+partition_allocator::allocate(simple_allocation_request simple_req) {
+    vlog(
+      clusterlog.trace,
+      "allocation request for {} partitions",
+      simple_req.additional_partitions);
+
+    const uint64_t create_count
+      = static_cast<uint64_t>(simple_req.additional_partitions)
+        * static_cast<uint64_t>(simple_req.replication_factor);
+    auto cluster_errc = check_cluster_limits(create_count, simple_req.tp_ns);
+    if (cluster_errc) {
+        co_return cluster_errc;
+    }
+
+    allocation_request req(simple_req.tp_ns);
+    req.partitions.reserve(simple_req.additional_partitions);
+    for (auto p = 0; p < simple_req.additional_partitions; ++p) {
+        req.partitions.emplace_back(
+          model::partition_id(p), simple_req.replication_factor);
+    }
+    req.existing_replica_counts = std::move(simple_req.existing_replica_counts);
+
+    co_return co_await do_allocate(std::move(req));
+}
+
+ss::future<result<allocation_units::pointer>>
 partition_allocator::allocate(allocation_request request) {
     vlog(
       clusterlog.trace,
       "allocation request for {} partitions",
       request.partitions.size());
 
-    auto cluster_errc = check_cluster_limits(request);
+    // Partition-replicas requested
+    uint64_t create_count{0};
+    for (const auto& i : request.partitions) {
+        if (i.replication_factor > i.existing_replicas.size()) {
+            create_count += uint64_t(
+              i.replication_factor - i.existing_replicas.size());
+        }
+    }
+
+    auto cluster_errc = check_cluster_limits(create_count, request._nt);
     if (cluster_errc) {
         co_return cluster_errc;
     }
 
-    intermediate_allocation assignments(
-      *_state, request.partitions.size(), request.domain);
+    co_return co_await do_allocate(std::move(request));
+}
+
+ss::future<result<allocation_units::pointer>>
+partition_allocator::do_allocate(allocation_request request) {
+    std::optional<node2count_t> node2count;
+    if (request.existing_replica_counts) {
+        node2count = std::move(*request.existing_replica_counts);
+    }
 
     const auto& nt = request._nt;
+
+    struct allocation_info {
+        allocated_partition partition;
+        allocation_constraints constraints;
+        size_t replication_factor = 0;
+        std::optional<raft::group_id> existing_group;
+    };
+
+    chunked_vector<allocation_info> allocations;
+    allocations.reserve(request.partitions.size());
     for (auto& p_constraints : request.partitions) {
-        auto const partition_id = p_constraints.partition_id;
-        auto allocated = allocate_new_partition(
-          nt, std::move(p_constraints), request.domain);
-        if (!allocated) {
-            co_return allocated.error();
+        int16_t num_new_replicas = p_constraints.replication_factor
+                                   - p_constraints.existing_replicas.size();
+        if (
+          _state->available_nodes() < p_constraints.replication_factor
+          || num_new_replicas < 0) {
+            co_return errc::topic_invalid_replication_factor;
         }
-        assignments.emplace_back(
-          _state->next_group_id(),
-          partition_id,
-          allocated.value().release_new_partition());
+
+        auto effective_constraints = default_constraints();
+        if (node2count) {
+            effective_constraints.ensure_new_level();
+            effective_constraints.add(
+              min_count_in_map("min topic-wise count", *node2count));
+        }
+        effective_constraints.ensure_new_level();
+        effective_constraints.add(max_final_capacity());
+        effective_constraints.add(p_constraints.constraints);
+
+        auto ntp = model::ntp(nt.ns, nt.tp, p_constraints.partition_id);
+
+        vlog(
+          clusterlog.trace,
+          "allocating new partition {} with constraints: {}",
+          ntp,
+          p_constraints);
+
+        allocations.push_back(allocation_info{
+          .partition = allocated_partition(
+            std::move(ntp),
+            std::move(p_constraints.existing_replicas),
+            *_state),
+          .constraints = std::move(effective_constraints),
+          .replication_factor = p_constraints.replication_factor,
+          .existing_group = p_constraints.existing_group,
+        });
+
         co_await ss::coroutine::maybe_yield();
     }
 
-    co_return ss::make_foreign(std::make_unique<allocation_units>(
-      std::move(assignments).finish(), *_state, request.domain));
+    // Allocate replicas in random order (i.e. not all replicas for a partition
+    // at once) to prevent formation of replica clusters - an undesireable
+    // allocation pattern where many partitions have the exact same replica set.
+
+    chunked_vector<size_t> in_progress;
+    in_progress.reserve(allocations.size());
+    for (size_t i = 0; i < allocations.size(); ++i) {
+        if (
+          allocations[i].replication_factor
+          > allocations[i].partition.replicas().size()) {
+            in_progress.push_back(i);
+        }
+    }
+
+    while (!in_progress.empty()) {
+        size_t idx = random_generators::get_int(in_progress.size() - 1);
+        auto& allocation = allocations[in_progress[idx]];
+        auto replica = do_allocate_replica(
+          allocation.partition, std::nullopt, allocation.constraints);
+        if (!replica) {
+            co_return replica.error();
+        }
+
+        if (node2count) {
+            (*node2count)[replica.value().current().node_id] += 1;
+        }
+
+        if (
+          allocation.partition.replicas().size()
+          == allocation.replication_factor) {
+            std::swap(in_progress[idx], in_progress.back());
+            in_progress.pop_back();
+        }
+
+        co_await ss::coroutine::maybe_yield();
+    }
+
+    allocation_units units(*_state);
+    units._assignments.reserve(allocations.size());
+    co_await ssx::async_for_each(
+      allocations.begin(), allocations.end(), [&](allocation_info& p) {
+          raft::group_id group = p.existing_group ? *p.existing_group
+                                                  : _state->next_group_id();
+          units._assignments.emplace_back(
+            group,
+            p.partition.ntp().tp.partition,
+            p.partition.release_new_partition(units._added_replicas));
+      });
+
+    co_return ss::make_foreign(
+      std::make_unique<allocation_units>(std::move(units)));
 }
 
 result<allocated_partition> partition_allocator::reallocate_partition(
-  model::topic_namespace nt,
-  partition_constraints p_constraints,
-  const partition_assignment& current_assignment,
-  const partition_allocation_domain domain,
-  const std::vector<model::node_id>& replicas_to_reallocate) {
+  model::ntp ntp,
+  std::vector<model::broker_shard> current_replicas,
+  const std::vector<model::node_id>& replicas_to_reallocate,
+  allocation_constraints constraints,
+  node2count_t* existing_replica_counts) {
     vlog(
       clusterlog.debug,
       "reallocating {}, current replicas: {}, to move: {}",
-      p_constraints,
-      current_assignment.replicas,
+      ntp,
+      current_replicas,
       replicas_to_reallocate);
 
-    int16_t num_new_replicas = p_constraints.replication_factor
-                               - current_assignment.replicas.size();
-    if (
-      _state->available_nodes() < p_constraints.replication_factor
-      || num_new_replicas < 0) {
-        return errc::topic_invalid_replication_factor;
-    }
-
-    model::ntp ntp{
-      std::move(nt.ns), std::move(nt.tp), p_constraints.partition_id};
     allocated_partition res{
-      std::move(ntp), current_assignment.replicas, domain, *_state};
+      std::move(ntp), std::move(current_replicas), *_state};
 
-    if (num_new_replicas == 0 && replicas_to_reallocate.empty()) {
+    if (replicas_to_reallocate.empty()) {
         // nothing to do
         return res;
     }
 
-    auto effective_constraints = default_constraints(domain);
-    effective_constraints.add(std::move(p_constraints.constraints));
+    std::optional<node2count_t> node2count;
+    if (existing_replica_counts) {
+        node2count = *existing_replica_counts;
+    }
 
-    // first, move existing replicas
+    auto effective_constraints = default_constraints();
+    if (node2count) {
+        effective_constraints.ensure_new_level();
+        effective_constraints.add(
+          min_count_in_map("min topic-wise count", *node2count));
+    }
+    effective_constraints.ensure_new_level();
+    effective_constraints.add(max_final_capacity());
+    effective_constraints.add(std::move(constraints));
+
     for (model::node_id prev : replicas_to_reallocate) {
         auto replica = do_allocate_replica(res, prev, effective_constraints);
         if (!replica) {
             return replica.error();
         }
-    }
-
-    // next, allocate new ones
-    for (int i = 0; i < num_new_replicas; ++i) {
-        auto replica = do_allocate_replica(
-          res, std::nullopt, effective_constraints);
-        if (!replica) {
-            return replica.error();
+        if (node2count) {
+            node2count.value()[replica.value().current().node_id] += 1;
+            size_t& prev_count = node2count.value().at(prev);
+            prev_count -= 1;
+            if (prev_count == 0) {
+                node2count.value().erase(prev);
+            }
         }
     }
 
+    if (existing_replica_counts) {
+        // update only at the very end, after all alocations have been
+        // successful.
+        *existing_replica_counts = std::move(node2count.value());
+    }
     return res;
 }
 
 allocated_partition partition_allocator::make_allocated_partition(
-  model::ntp ntp,
-  std::vector<model::broker_shard> replicas,
-  partition_allocation_domain domain) const {
-    return allocated_partition{
-      std::move(ntp), std::move(replicas), domain, *_state};
+  model::ntp ntp, std::vector<model::broker_shard> replicas) const {
+    return allocated_partition{std::move(ntp), std::move(replicas), *_state};
 }
 
 result<reallocation_step> partition_allocator::reallocate_replica(
@@ -369,7 +558,7 @@ result<reallocation_step> partition_allocator::reallocate_replica(
       partition.replicas(),
       constraints);
 
-    auto effective_constraints = default_constraints(partition._domain);
+    auto effective_constraints = default_constraints();
     effective_constraints.add(std::move(constraints));
 
     return do_allocate_replica(partition, prev_node, effective_constraints);
@@ -386,23 +575,13 @@ result<reallocation_step> partition_allocator::do_allocate_replica(
             return errc::node_does_not_exists;
         }
     }
-    auto revert = ss::defer([&] {
-        if (prev) {
-            partition.cancel_move(*prev);
-        }
-    });
 
     auto node = _allocation_strategy.choose_node(
-      partition._ntp,
-      partition._replicas,
-      effective_constraints,
-      *_state,
-      partition._domain);
+      *_state, effective_constraints, partition, prev_node);
     if (!node) {
         return node.error();
     }
 
-    revert.cancel();
     auto new_replica = partition.add_replica(node.value(), prev);
     std::optional<model::broker_shard> prev_replica;
     if (prev) {
@@ -412,40 +591,37 @@ result<reallocation_step> partition_allocator::do_allocate_replica(
 }
 
 void partition_allocator::add_allocations(
-  const std::vector<model::broker_shard>& to_add,
-  const partition_allocation_domain domain) {
+  const std::vector<model::broker_shard>& to_add) {
     for (const auto& bs : to_add) {
-        _state->add_allocation(bs, domain);
+        _state->add_allocation(bs);
     }
 }
 
 void partition_allocator::remove_allocations(
-  const std::vector<model::broker_shard>& to_remove,
-  const partition_allocation_domain domain) {
+  const std::vector<model::broker_shard>& to_remove) {
     for (const auto& bs : to_remove) {
-        _state->remove_allocation(bs, domain);
+        _state->remove_allocation(bs);
     }
 }
 
 void partition_allocator::add_final_counts(
-  const std::vector<model::broker_shard>& to_add,
-  const partition_allocation_domain domain) {
+  const std::vector<model::broker_shard>& to_add) {
     for (const auto& bs : to_add) {
-        _state->add_final_count(bs, domain);
+        _state->add_final_count(bs);
     }
 }
 
 void partition_allocator::remove_final_counts(
-  const std::vector<model::broker_shard>& to_remove,
-  const partition_allocation_domain domain) {
+  const std::vector<model::broker_shard>& to_remove) {
     for (const auto& bs : to_remove) {
-        _state->remove_final_count(bs, domain);
+        _state->remove_final_count(bs);
     }
 }
 
 ss::future<>
 partition_allocator::apply_snapshot(const controller_snapshot& snap) {
     auto new_state = std::make_unique<allocation_state>(
+      _feature_table,
       _partitions_per_shard,
       _partitions_reserve_shard0,
       _internal_kafka_topics);
@@ -472,10 +648,9 @@ partition_allocator::apply_snapshot(const controller_snapshot& snap) {
 
     const auto& topics_snap = snap.topics.topics;
     for (const auto& [ns_tp, topic] : topics_snap) {
-        auto domain = get_allocation_domain(ns_tp);
         for (const auto& [p_id, partition] : topic.partitions) {
             for (const auto& bs : partition.replicas) {
-                new_state->add_allocation(bs, domain);
+                new_state->add_allocation(bs);
             }
 
             const std::vector<model::broker_shard>* final_replicas = nullptr;
@@ -484,29 +659,24 @@ partition_allocator::apply_snapshot(const controller_snapshot& snap) {
                 const auto& update = it->second;
                 // Both old and new replicas contribute to allocator weights
                 // regardless of the update state.
-                auto additional_replicas = subtract_replica_sets(
+                auto additional_replicas = subtract(
                   update.target_assignment, partition.replicas);
                 for (const auto& bs : additional_replicas) {
-                    new_state->add_allocation(bs, domain);
+                    new_state->add_allocation(bs);
                 }
 
                 // final counts depend on the update state
-                switch (update.state) {
-                case reconfiguration_state::in_progress:
-                case reconfiguration_state::force_update:
-                    final_replicas = &update.target_assignment;
-                    break;
-                case reconfiguration_state::cancelled:
-                case reconfiguration_state::force_cancelled:
+                if (is_cancelled_state(update.state)) {
                     final_replicas = &partition.replicas;
-                    break;
+                } else {
+                    final_replicas = &update.target_assignment;
                 }
             } else {
                 final_replicas = &partition.replicas;
             }
 
             for (const auto& bs : *final_replicas) {
-                new_state->add_final_count(bs, domain);
+                new_state->add_final_count(bs);
             }
 
             co_await ss::coroutine::maybe_yield();

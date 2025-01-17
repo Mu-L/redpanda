@@ -29,9 +29,9 @@ This is a tiny command that simply prints the current profile name, which may
 be useful in scripts, or a PS1, or to confirm what you have selected.
 `,
 		Args: cobra.ExactArgs(0),
-		Run: func(_ *cobra.Command, args []string) {
+		Run: func(_ *cobra.Command, _ []string) {
 			cfg, err := p.Load(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
 
 			if !noNewline {
 				defer fmt.Println()

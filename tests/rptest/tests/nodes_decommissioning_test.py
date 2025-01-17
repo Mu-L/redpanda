@@ -16,6 +16,7 @@ from rptest.clients.kafka_cat import KafkaCat
 from time import sleep
 from rptest.clients.default import DefaultClient
 from rptest.services.kgo_verifier_services import KgoVerifierConsumerGroupConsumer, KgoVerifierProducer
+from rptest.services.redpanda_installer import RedpandaInstaller
 from rptest.tests.prealloc_nodes import PreallocNodesTest
 
 from rptest.utils.mode_checks import skip_debug_mode
@@ -29,7 +30,7 @@ from ducktape.mark import matrix
 from rptest.clients.types import TopicSpec
 from rptest.tests.end_to_end import EndToEndTest
 from rptest.services.admin import Admin
-from rptest.services.redpanda import CHAOS_LOG_ALLOW_LIST, RESTART_LOG_ALLOW_LIST, RedpandaService, make_redpanda_service, SISettings
+from rptest.services.redpanda import CHAOS_LOG_ALLOW_LIST, RESTART_LOG_ALLOW_LIST, RedpandaService, SISettings
 from rptest.utils.node_operations import NodeDecommissionWaiter
 
 
@@ -165,6 +166,9 @@ class NodesDecommissioningTest(PreallocNodesTest):
                 brokers = self.admin.get_brokers(n)
                 config_ids = [s['node_id'] for s in cfg_status]
                 brokers_ids = [b['node_id'] for b in brokers]
+                self.logger.info(
+                    f"broker_ids: {brokers_ids}, ids from configuration status: {config_ids}"
+                )
                 if sorted(brokers_ids) != sorted(config_ids):
                     return False
                 if decommissioned_id in brokers_ids:
@@ -172,7 +176,13 @@ class NodesDecommissioningTest(PreallocNodesTest):
 
             return True
 
-        wait_until(_state_consistent, 10, 1)
+        wait_until(
+            _state_consistent,
+            10,
+            1,
+            err_msg=
+            "Timeout waiting for nodes reported from configuration and cluster state to be consistent"
+        )
 
     def _wait_for_node_removed(self, decommissioned_id):
 
@@ -273,6 +283,8 @@ class NodesDecommissioningTest(PreallocNodesTest):
             self.msg_size,
             readers=1,
             nodes=self.preallocated_nodes)
+
+        self.consumer.start(clean=False)
 
     def verify(self):
         self.logger.info(
@@ -407,6 +419,69 @@ class NodesDecommissioningTest(PreallocNodesTest):
         self._wait_for_node_removed(to_decommission)
         # stop decommissioned node
         self.redpanda.stop_node(self.redpanda.get_node_by_id(to_decommission))
+
+        self.verify()
+
+    @skip_debug_mode
+    @cluster(num_nodes=6)
+    def test_learner_gap_metrics(self):
+        self.start_redpanda()
+        # set small segment size to calculate the gap correctly
+        self.redpanda.set_cluster_config({"log_segment_size": 1024 * 1024})
+        self._topic = TopicSpec(name="gap-test-topic", partition_count=10)
+        self.client().create_topic(self._topic)
+
+        self.start_producer()
+        self.start_consumer()
+        # set recovery rate to small value to stop moves
+        self._set_recovery_rate(1)
+
+        def calculate_total_learners_gap() -> int | None:
+            gap = self.redpanda.metrics_sample("learners_gap_bytes")
+            if gap is None:
+                return None
+            return sum(g.value for g in gap.samples)
+
+        assert calculate_total_learners_gap(
+        ) == 0, "when there are no pending partition movements the reported gap should be equal to 0"
+
+        to_decommission = random.choice(self.redpanda.nodes)
+        to_decommission_id = self.redpanda.node_id(to_decommission)
+
+        self.logger.info(f"decommissioning node: {to_decommission_id}", )
+        self._decommission(to_decommission_id)
+        self.producer.wait()
+
+        def learner_gap_reported(decommissioned_node_id: int):
+            total_gap = calculate_total_learners_gap()
+            p_size = self.redpanda.metrics_sample("partition_size")
+            if not total_gap or not p_size:
+                return False
+            total_size = sum(
+                ps.value for ps in p_size.samples
+                if self.redpanda.node_id(ps.node) == decommissioned_node_id)
+
+            self.logger.info(
+                f"decommissioned node total size: {total_size}, total_gap: {total_gap}"
+            )
+            assert total_gap < total_size, "gap can not be larger than the size of partitions"
+            # assume that the total gap is equal to the total size of
+            # decommissioned node with the tolerance of 5%
+            return (total_size - total_gap) < total_size * 0.05
+
+        wait_until(lambda: learner_gap_reported(to_decommission_id),
+                   timeout_sec=60,
+                   backoff_sec=1)
+        self._set_recovery_rate(100 * 1024 * 1024)
+        # wait for decommissioned node to be removed
+        self._wait_for_node_removed(to_decommission_id)
+
+        # Stop the decommissioned node, because redpanda internally does not
+        # fence it, it is the responsibility of external orchestrator to
+        # stop the node they intend to remove.
+        # This can be removed when we change redpanda to prevent decommissioned nodes
+        # from responding to client Kafka requests.
+        self.redpanda.stop_node(to_decommission)
 
         self.verify()
 
@@ -604,6 +679,13 @@ class NodesDecommissioningTest(PreallocNodesTest):
         self.start_producer()
         self.start_consumer()
 
+        # wait for more data to be produced, so that the cluster re-balancing will not finish immediately
+        wait_until(lambda: self.producer.produce_status.acked >
+                   (self.msg_count / 2),
+                   timeout_sec=240,
+                   backoff_sec=1)
+        # set recovery rate to small value but allow the controller to recover
+        self._set_recovery_rate(10 * 1024)
         # throttle recovery
         self.redpanda.clean_node(self.redpanda.nodes[-1],
                                  preserve_current_install=True)
@@ -826,6 +908,173 @@ class NodesDecommissioningTest(PreallocNodesTest):
 
         assert len(self.admin.get_brokers(node=self.redpanda.nodes[0])) == 5
 
+    @cluster(
+        num_nodes=6,
+        # A decom can look like a restart in terms of logs from peers dropping
+        # connections with it
+        log_allow_list=RESTART_LOG_ALLOW_LIST)
+    def test_decommissioning_and_upgrade(self):
+        self.installer = self.redpanda._installer
+        # upgrade from previous to current version
+        versions = [
+            self.installer.highest_from_prior_feature_version(
+                RedpandaInstaller.HEAD), RedpandaInstaller.HEAD
+        ]
+        to_decommission = None
+        to_decommission_id = None
+        for v in self.upgrade_through_versions(versions_in=versions,
+                                               auto_assign_node_id=True):
+            if v == versions[0]:
+                self._create_topics()
+
+                self.start_producer()
+                self.start_consumer()
+                # decommission node
+                to_decommission = self.redpanda.nodes[-1]
+                to_decommission_id = self.redpanda.node_id(to_decommission)
+                self.logger.info(f"decommissioning node: {to_decommission_id}")
+                self._decommission(to_decommission_id)
+
+                self._wait_for_node_removed(to_decommission_id)
+                self.redpanda.stop_node(to_decommission)
+                self.redpanda.clean_node(to_decommission,
+                                         preserve_logs=True,
+                                         preserve_current_install=True)
+                self.redpanda.start_node(to_decommission,
+                                         auto_assign_node_id=True)
+                # refresh node ids for rolling restarter
+                self.redpanda.node_id(to_decommission, force_refresh=True)
+
+            # check that the nodes reported from configuration status and
+            # brokers endpoint is consistent
+
+            self._check_state_consistent(to_decommission_id)
+
+    @cluster(num_nodes=6)
+    @matrix(auto_assign_node_id=[True, False])
+    def test_recycle_all_nodes(self, auto_assign_node_id):
+
+        # start redpanda on initial pool of nodes
+        self.redpanda.start(nodes=self.redpanda.nodes,
+                            auto_assign_node_id=auto_assign_node_id,
+                            omit_seeds_on_idx_one=(not auto_assign_node_id))
+        # configure controller not to take snapshot
+        self.redpanda.set_cluster_config(
+            {"controller_snapshot_max_age_sec": 20000})
+
+        spec = TopicSpec(name=f"migration-test-workload",
+                         partition_count=32,
+                         replication_factor=3)
+
+        self.client().create_topic(spec)
+        self._topic = spec.name
+
+        self.start_producer()
+        self.start_consumer()
+
+        # wait for some messages before executing actions
+        self.producer.wait_for_acks(0.2 * self.msg_count,
+                                    timeout_sec=60,
+                                    backoff_sec=2)
+
+        current_replicas = {
+            self.redpanda.node_id(n)
+            for n in self.redpanda.nodes
+        }
+        left_to_decommission = [
+            self.redpanda.node_id(n) for n in self.redpanda.nodes
+        ]
+
+        next_id = 10
+        admin = Admin(self.redpanda)
+
+        def cluster_view_is_consistent():
+            versions = set()
+            for n in self.redpanda.started_nodes():
+                node_id = self.redpanda.node_id(n)
+                cv = admin.get_cluster_view(node=n)
+                cv_nodes = {b['node_id'] for b in cv['brokers']}
+                versions.add(cv['version'])
+                self.logger.info(
+                    f"cluster view from node {node_id} - {cv_nodes}, version: {cv['version']}"
+                )
+                if cv_nodes != current_replicas:
+                    self.logger.warn(
+                        f"inconsistent cluster view from {node_id}, expected: {current_replicas}, current: {cv_nodes}"
+                    )
+                    return False
+
+                controller = admin.get_partition(ns="redpanda",
+                                                 topic="controller",
+                                                 id=0,
+                                                 node=n)
+                controller_replicas = {
+                    r['node_id']
+                    for r in controller['replicas']
+                }
+                self.logger.info(
+                    f"controller partition replicas from node {node_id} - {controller_replicas}"
+                )
+                if controller_replicas != current_replicas:
+                    self.logger.warn(
+                        f"inconsistent controller replicas {node_id}, expected: {current_replicas}, current: {cv_nodes}"
+                    )
+                    return False
+
+            return len(versions) == 1
+
+        while len(left_to_decommission) > 0:
+            decommissioned_id = left_to_decommission.pop()
+            n = self.redpanda.get_node_by_id(decommissioned_id)
+            assert n is not None
+            self.logger.info(
+                f"decommissioning node with id: {decommissioned_id} - {n.account.hostname}"
+            )
+            # force taking controller snapshot after first node is decommissioned
+            if len(left_to_decommission) == (len(self.redpanda.nodes) - 1):
+                self.redpanda.set_cluster_config(
+                    {"controller_snapshot_max_age_sec": 10})
+                self.redpanda.wait_for_controller_snapshot(
+                    self.redpanda.controller(),
+                    prev_start_offset=0,
+                    timeout_sec=60)
+
+            admin.decommission_broker(decommissioned_id)
+            if len(left_to_decommission) == 5:
+                self.redpanda.set_cluster_config(
+                    {"controller_snapshot_max_age_sec": 20000})
+
+            current_replicas.remove(decommissioned_id)
+            # wait until node is decommissioned
+            waiter = NodeDecommissionWaiter(
+                self.redpanda,
+                decommissioned_id,
+                self.logger,
+                60,
+                decommissioned_node_ids=[decommissioned_id])
+            waiter.wait_for_removal()
+
+            # clean the node data
+            self.redpanda.clean_node(n,
+                                     preserve_logs=True,
+                                     preserve_current_install=True)
+
+            # start with new id
+            self.logger.info(f"adding {n.account.hostname} with id {next_id}")
+
+            self.redpanda.start_node(
+                n,
+                auto_assign_node_id=auto_assign_node_id,
+                omit_seeds_on_idx_one=(not auto_assign_node_id),
+                node_id_override=None if auto_assign_node_id else next_id)
+            current_replicas.add(self.redpanda.node_id(n, force_refresh=True))
+            next_id += 1
+
+            wait_until(cluster_view_is_consistent, 60, 1,
+                       "error waiting for consistent view of the cluster")
+
+        self.verify()
+
 
 class NodeDecommissionFailureReportingTest(RedpandaTest):
     def __init__(self, *args, **kwargs):
@@ -955,17 +1204,20 @@ class NodeDecommissionSpaceManagementTest(RedpandaTest):
 
     @skip_debug_mode
     @cluster(num_nodes=5)
-    def test_decommission(self):
+    @matrix(single_partition=[True, False])
+    def test_decommission(self, single_partition):
         log_segment_size = 1024 * 1024
 
-        partition_count = 16
-        replication_factor = 3
         segments_per_partition = 50
         segments_per_partition_trimmed = 20
-
-        # decommission gets stuck with the following:
-        # partition_count = 4
-        # replication_factor = 1
+        if single_partition:
+            # decommission will get stuck with the following params
+            # if we don't take reclaimable partition sizes into account:
+            partition_count = 4
+            replication_factor = 1
+        else:
+            partition_count = 16
+            replication_factor = 3
 
         target_size = log_segment_size * (
             segments_per_partition * partition_count * replication_factor //
@@ -1047,11 +1299,12 @@ class NodeDecommissionSpaceManagementTest(RedpandaTest):
 
         totals = self._kafka_usage()
         self.logger.info(f"totals: {hmb(totals)}")
-
-        to_decommission_id = self.redpanda.node_id(self.redpanda.nodes[3])
+        to_decommission = self.redpanda.nodes[3]
+        to_decommission_id = self.redpanda.node_id(to_decommission)
         Admin(self.redpanda).decommission_broker(to_decommission_id)
         waiter = NodeDecommissionWaiter(self.redpanda,
                                         to_decommission_id,
                                         self.logger,
                                         progress_timeout=60)
         waiter.wait_for_removal()
+        self.redpanda.stop_node(to_decommission)

@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "base/seastarx.h"
 #include "ssx/semaphore.h"
 
 /**
@@ -79,6 +80,23 @@ public:
      */
     ss::future<ssx::semaphore_units> get_units(size_t units) {
         return ss::get_units(_sem, units);
+    }
+
+    /**
+     * Blocking get units: will block until units are available or until abort
+     * source is triggered.
+     */
+    ss::future<ssx::semaphore_units>
+    get_units(size_t units, ss::abort_source& as) {
+        return ss::get_units(_sem, units, as);
+    }
+
+    /**
+     * Attempts to immediately get units from the semaphore, returning
+     * std::nullopt if no units exist.
+     */
+    std::optional<ssx::semaphore_units> try_get_units(size_t units) {
+        return ss::try_get_units(_sem, units);
     }
 
     size_t current() const noexcept { return _sem.current(); }

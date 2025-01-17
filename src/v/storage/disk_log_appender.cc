@@ -9,13 +9,13 @@
 
 #include "storage/disk_log_appender.h"
 
-#include "likely.h"
+#include "base/likely.h"
+#include "base/vlog.h"
 #include "model/record_utils.h"
 #include "storage/disk_log_impl.h"
 #include "storage/logger.h"
 #include "storage/segment.h"
 #include "storage/segment_appender.h"
-#include "vlog.h"
 
 #include <seastar/coroutine/exception.hh>
 
@@ -50,7 +50,7 @@ ss::future<> disk_log_appender::initialize() {
 }
 
 bool disk_log_appender::segment_is_appendable(model::term_id batch_term) const {
-    if (!_seg || !_seg->has_appender()) {
+    if (!_seg || !_seg->has_appender() || _seg->is_tombstone()) {
         // The latest segment with which this log_appender has called
         // initialize() has been rolled and no longer has an segment appender
         // (e.g. because segment.ms rolled onto a new segment). There is likely
@@ -110,7 +110,9 @@ disk_log_appender::operator()(model::record_batch& batch) {
               _last_term, _idx, _config.io_priority);
             co_await initialize();
         }
-        co_return co_await append_batch_to_segment(batch);
+        auto stop = co_await append_batch_to_segment(batch);
+        _log.offset_translator().process(batch);
+        co_return stop;
     } catch (...) {
         release_lock();
         vlog(
@@ -159,13 +161,14 @@ ss::future<append_result> disk_log_appender::end_of_stream() {
       .last_offset = _last_offset,
       .byte_size = _byte_size,
       .last_term = _last_term};
-    if (_config.should_fsync == storage::log_append_config::fsync::no) {
-        return ss::make_ready_future<append_result>(retval);
-    }
-    return _log.flush().then([this, retval] {
+    if (_config.should_fsync == storage::log_append_config::fsync::yes) {
+        co_await _log.flush();
         release_lock();
-        return retval;
-    });
+    }
+    // Do checkpointing in the background to avoid latency spikes in the write
+    // path caused by KVStore flush debouncing.
+    _log.bg_checkpoint_offset_translator();
+    co_return retval;
 }
 
 std::ostream& operator<<(std::ostream& o, const disk_log_appender& a) {

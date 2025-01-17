@@ -10,9 +10,9 @@
  */
 
 #pragma once
+#include "base/seastarx.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "seastarx.h"
 
 #include <seastar/core/smp.hh>
 
@@ -23,6 +23,8 @@ inline const model::ns redpanda_ns("redpanda");
 inline const model::ntp controller_ntp(
   redpanda_ns, model::topic("controller"), model::partition_id(0));
 
+inline const topic_namespace
+  controller_nt(controller_ntp.ns, controller_ntp.tp.topic);
 /*
  * The kvstore is organized as an ntp with a partition per core.
  */
@@ -39,6 +41,11 @@ inline const model::topic kafka_consumer_offsets_topic("__consumer_offsets");
 
 inline const model::topic_namespace kafka_consumer_offsets_nt(
   model::kafka_namespace, kafka_consumer_offsets_topic);
+
+inline const model::topic kafka_audit_logging_topic("_redpanda.audit_log");
+
+inline const model::topic_namespace
+  kafka_audit_logging_nt(model::kafka_namespace, kafka_audit_logging_topic);
 
 inline const model::topic tx_manager_topic("tx");
 inline const model::topic_namespace
@@ -59,15 +66,34 @@ inline const model::ntp id_allocator_ntp(
   model::id_allocator_topic,
   model::partition_id(0));
 
-inline const model::topic tx_registry_topic("tx_registry");
-inline const model::topic_namespace
-  tx_registry_nt(model::kafka_internal_namespace, tx_registry_topic);
-inline const model::ntp tx_registry_ntp(
-  model::kafka_internal_namespace,
-  model::tx_registry_topic,
-  model::partition_id(0));
-
 inline const model::topic_partition schema_registry_internal_tp{
   model::topic{"_schemas"}, model::partition_id{0}};
+
+inline const model::ntp wasm_binaries_internal_ntp(
+  model::kafka_internal_namespace,
+  model::topic("wasm_binaries"),
+  model::partition_id(0));
+
+inline const model::topic
+  transform_log_internal_topic("_redpanda.transform_logs");
+
+inline const model::topic_namespace transform_log_internal_nt(
+  model::kafka_namespace, model::transform_log_internal_topic);
+
+inline const model::topic datalake_coordinator_topic("datalake_coordinator");
+inline const model::topic_namespace datalake_coordinator_nt(
+  model::kafka_internal_namespace, model::datalake_coordinator_topic);
+
+inline bool is_user_topic(topic_namespace_view tp_ns) {
+    return tp_ns.ns == kafka_namespace
+           && tp_ns.tp != kafka_consumer_offsets_topic
+           && tp_ns.tp != schema_registry_internal_tp.topic
+           && tp_ns.tp != kafka_audit_logging_topic
+           && tp_ns.tp != transform_log_internal_topic;
+}
+
+inline bool is_user_topic(const ntp& ntp) {
+    return is_user_topic(topic_namespace_view{ntp});
+}
 
 } // namespace model

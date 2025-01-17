@@ -10,6 +10,7 @@
  */
 #include "kafka/server/handlers/describe_acls.h"
 
+#include "cluster/security_frontend.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/server/handlers/details/security.h"
 #include "kafka/server/request_context.h"
@@ -77,11 +78,35 @@ ss::future<response_ptr> describe_acls_handler::handle(
     request.decode(ctx.reader(), ctx.header().version);
     log_request(ctx.header(), request);
 
-    if (!ctx.authorized(
-          security::acl_operation::describe, security::default_cluster_name)) {
+    auto authz = ctx.authorized(
+      security::acl_operation::describe, security::default_cluster_name);
+
+    if (!ctx.audit()) {
+        describe_acls_response resp;
+        resp.data.error_code = error_code::broker_not_available;
+        resp.data.error_message = "Broker not available - audit system failure";
+
+        co_return co_await ctx.respond(std::move(resp));
+    }
+
+    if (!authz) {
         describe_acls_response resp;
         resp.data.error_code = error_code::cluster_authorization_failed;
         co_return co_await ctx.respond(std::move(resp));
+    }
+
+    /// To prevent stale responses in the case this node is not the controller
+    /// leader, wait until it catches up with the current controller leaders
+    /// current last_applied offset of the controller log
+    static const auto catchup_timeout = 5s;
+    const auto error_code = co_await ctx.security_frontend()
+                              .wait_until_caughtup_with_leader(catchup_timeout);
+    if (error_code) {
+        vlog(
+          klog.info,
+          "Failed waiting on catchup with controller leader before handling "
+          "describeACLs request (reason: {}), stale results may be returned",
+          error_code);
     }
 
     describe_acls_response_data data;

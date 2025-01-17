@@ -9,35 +9,37 @@
 
 #include "cluster/partition_manager.h"
 
-#include "archival/ntp_archiver_service.h"
-#include "archival/types.h"
+#include "base/vlog.h"
 #include "cloud_storage/cache_service.h"
 #include "cloud_storage/partition_manifest.h"
 #include "cloud_storage/remote.h"
+#include "cloud_storage/remote_label.h"
 #include "cloud_storage/remote_partition.h"
-#include "cluster/archival_metadata_stm.h"
+#include "cloud_storage/remote_path_provider.h"
+#include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/ntp_archiver_service.h"
+#include "cluster/archival/types.h"
 #include "cluster/fwd.h"
 #include "cluster/logger.h"
+#include "cluster/partition.h"
 #include "cluster/partition_recovery_manager.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
 #include "model/metadata.h"
 #include "raft/consensus.h"
 #include "raft/consensus_utils.h"
+#include "raft/fundamental.h"
 #include "raft/group_configuration.h"
-#include "raft/offset_translator.h"
 #include "raft/rpc_client_protocol.h"
-#include "raft/types.h"
 #include "resource_mgmt/io_priority.h"
 #include "ssx/async-clear.h"
-#include "storage/offset_translator_state.h"
 #include "storage/segment_utils.h"
 #include "storage/snapshot.h"
 #include "utils/retry_chain_node.h"
-#include "vlog.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/io_priority_class.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/smp.hh>
@@ -45,32 +47,29 @@
 #include <algorithm>
 #include <exception>
 #include <iterator>
+#include <utility>
 
 namespace cluster {
 
 partition_manager::partition_manager(
   ss::sharded<storage::api>& storage,
   ss::sharded<raft::group_manager>& raft,
-  ss::sharded<cluster::tx_gateway_frontend>& tx_gateway_frontend,
   ss::sharded<cloud_storage::partition_recovery_manager>& recovery_mgr,
   ss::sharded<cloud_storage::remote>& cloud_storage_api,
   ss::sharded<cloud_storage::cache>& cloud_storage_cache,
   ss::lw_shared_ptr<const archival::configuration> archival_conf,
   ss::sharded<features::feature_table>& feature_table,
-  ss::sharded<cluster::tm_stm_cache_manager>& tm_stm_cache_manager,
   ss::sharded<archival::upload_housekeeping_service>& upload_hks,
-  config::binding<uint64_t> max_concurrent_producer_ids)
+  config::binding<std::chrono::milliseconds> partition_shutdown_timeout)
   : _storage(storage.local())
   , _raft_manager(raft)
-  , _tx_gateway_frontend(tx_gateway_frontend)
   , _partition_recovery_mgr(recovery_mgr)
   , _cloud_storage_api(cloud_storage_api)
   , _cloud_storage_cache(cloud_storage_cache)
   , _archival_conf(std::move(archival_conf))
   , _feature_table(feature_table)
-  , _tm_stm_cache_manager(tm_stm_cache_manager)
   , _upload_hks(upload_hks)
-  , _max_concurrent_producer_ids(max_concurrent_producer_ids) {
+  , _partition_shutdown_timeout(std::move(partition_shutdown_timeout)) {
     _leader_notify_handle
       = _raft_manager.local().register_leadership_notification(
         [this](
@@ -85,6 +84,8 @@ partition_manager::partition_manager(
                 }
             }
         });
+    _shutdown_watchdog.set_callback(
+      [this] { check_partitions_shutdown_state(); });
 }
 
 partition_manager::~partition_manager() {
@@ -106,16 +107,57 @@ partition_manager::get_topic_partition_table(
     return rs;
 }
 
+ss::future<> partition_manager::start() {
+    maybe_arm_shutdown_watchdog();
+    co_return;
+}
+
 ss::future<consensus_ptr> partition_manager::manage(
   storage::ntp_config ntp_cfg,
   raft::group_id group,
-  std::vector<model::broker> initial_nodes,
+  std::vector<raft::vnode> initial_nodes,
+  raft::with_learner_recovery_throttle enable_learner_recovery_throttle,
+  raft::keep_snapshotted_log keep_snapshotted_log,
+  std::optional<xshard_transfer_state> xst_state,
   std::optional<remote_topic_properties> rtp,
   std::optional<cloud_storage_clients::bucket_name> read_replica_bucket,
-  raft::with_learner_recovery_throttle enable_learner_recovery_throttle,
-  raft::keep_snapshotted_log keep_snapshotted_log) {
-    gate_guard guard(_gate);
-    auto dl_result = co_await maybe_download_log(ntp_cfg, rtp);
+  std::optional<cloud_storage::remote_label> remote_label,
+  std::optional<model::topic_namespace> topic_namespace_override) {
+    vlog(
+      clusterlog.trace,
+      "Creating partition with configuration: {}, raft group_id: {}, "
+      "initial_nodes: {}, remote topic properties: {}, remote label: {}, "
+      "topic_namespace_override: {}",
+      ntp_cfg,
+      group,
+      initial_nodes,
+      rtp,
+      remote_label,
+      topic_namespace_override);
+
+    auto guard = _gate.hold();
+    // topic_namespace_override is used in case of a cluster migration.
+    // The original ("source") topic name must be used in the tiered
+    // storage/archival subsystems, while the alias ("destination") will be used
+    // for local storage on the new cluster.
+    if (topic_namespace_override.has_value()) {
+        vlog(
+          clusterlog.info,
+          "Topic namespace override present for ntp {}: topic namespace {} "
+          "used for remote path providing",
+          ntp_cfg.ntp(),
+          topic_namespace_override.value());
+    }
+
+    // NOTE: while the source cluster UUIDs of the path providers will
+    // ultimately be the same, this is a different path provider than what will
+    // be used at runtime by the partition. The latter is owned by the archival
+    // metadata STM and its lifecycle is therefore tied to the partition, which
+    // hasn't been constructed yet.
+    cloud_storage::remote_path_provider path_provider(
+      remote_label, topic_namespace_override);
+    auto dl_result = co_await maybe_download_log(ntp_cfg, rtp, path_provider);
+
     auto& [logs_recovered, clean_download, min_offset, max_offset, manifest, ot_state]
       = dl_result;
     if (logs_recovered) {
@@ -157,8 +199,7 @@ ss::future<consensus_ptr> partition_manager::manage(
                   ntp_cfg, manifest, max_offset);
             }
         } else {
-            // Manifest is not empty since we were able to recovery
-            // some data.
+            // Manifest is not empty since we were able to recover some data.
             auto last_segment = manifest.last_segment();
             vassert(last_segment.has_value(), "Manifest is empty");
             auto last_included_term = last_segment->archiver_term;
@@ -208,7 +249,10 @@ ss::future<consensus_ptr> partition_manager::manage(
               ntp_cfg, manifest, max_offset);
         }
     }
-    auto log = co_await _storage.log_mgr().manage(std::move(ntp_cfg));
+    auto translator_batch_types = raft::offset_translator_batch_types(
+      ntp_cfg.ntp());
+    auto log = co_await _storage.log_mgr().manage(
+      std::move(ntp_cfg), group, std::move(translator_batch_types));
     vlog(
       clusterlog.debug,
       "Log created manage completed, ntp: {}, rev: {}, {} "
@@ -228,15 +272,11 @@ ss::future<consensus_ptr> partition_manager::manage(
 
     auto p = ss::make_lw_shared<partition>(
       c,
-      _tx_gateway_frontend,
       _cloud_storage_api,
       _cloud_storage_cache,
       _archival_conf,
       _feature_table,
-      _tm_stm_cache_manager,
       _upload_hks,
-      _storage.kvs(),
-      _max_concurrent_producer_ids,
       read_replica_bucket);
 
     _ntp_table.emplace(log->config().ntp(), p);
@@ -254,27 +294,47 @@ ss::future<consensus_ptr> partition_manager::manage(
         p->block_new_leadership();
     }
 
-    _manage_watchers.notify(p->ntp(), p);
+    co_await p->start(_stm_registry, xst_state);
 
-    co_await p->start();
+    // this is not done in partition::start itself because the purpose of this
+    // flag is to operate in an uninterruptible context with watcher
+    // notification below to avoid registration while this fiber is blocked,
+    // leading to double notifications.
+    p->mark_started();
+
+    _manage_watchers.notify(p->ntp(), p);
 
     co_return c;
 }
 
 ss::future<cloud_storage::log_recovery_result>
 partition_manager::maybe_download_log(
-  storage::ntp_config& ntp_cfg, std::optional<remote_topic_properties> rtp) {
-    if (rtp.has_value() && _partition_recovery_mgr.local_is_initialized()) {
-        auto res = co_await _partition_recovery_mgr.local().download_log(
-          ntp_cfg, rtp->remote_revision, rtp->remote_partition_count);
-        co_return res;
+  storage::ntp_config& ntp_cfg,
+  std::optional<remote_topic_properties> rtp,
+  cloud_storage::remote_path_provider& path_provider) {
+    if (!rtp.has_value() || !_partition_recovery_mgr.local_is_initialized()) {
+        vlog(
+          clusterlog.debug,
+          "Logs can't be downloaded because cloud storage is not configured. "
+          "Continue creating {} without downloading the logs.",
+          ntp_cfg);
+        co_return cloud_storage::log_recovery_result{};
     }
-    vlog(
-      clusterlog.debug,
-      "Logs can't be downloaded because cloud storage is not configured. "
-      "Continue creating {} witout downloading the logs.",
-      ntp_cfg);
-    co_return cloud_storage::log_recovery_result{};
+
+    if (co_await archival_metadata_stm::has_snapshot(ntp_cfg)) {
+        vlog(
+          clusterlog.debug,
+          "Skip logs download for {}, as archival_metadata_stm snapshot "
+          "already exists",
+          ntp_cfg.ntp());
+        co_return cloud_storage::log_recovery_result{};
+    }
+
+    co_return co_await _partition_recovery_mgr.local().download_log(
+      ntp_cfg,
+      rtp->remote_revision,
+      rtp->remote_partition_count,
+      path_provider);
 }
 
 ss::future<> partition_manager::stop_partitions() {
@@ -288,22 +348,31 @@ ss::future<> partition_manager::stop_partitions() {
     // prevent partitions from being accessed
     auto partitions = std::exchange(_ntp_table, {});
 
-    co_await ssx::async_clear(_raft_table)();
+    co_await ssx::async_clear(_raft_table);
 
     // shutdown all partitions
-    co_await ss::max_concurrent_for_each(
-      partitions, 1024, [this](auto& e) { return do_shutdown(e.second); });
+    co_await ss::max_concurrent_for_each(partitions, 1024, [this](auto& e) {
+        return do_shutdown(e.second).discard_result();
+    });
 
-    co_await ssx::async_clear(partitions)();
+    co_await ssx::async_clear(partitions);
 }
 
-ss::future<>
+ss::future<xshard_transfer_state>
 partition_manager::do_shutdown(ss::lw_shared_ptr<partition> partition) {
+    partition_shutdown_state shutdown_state(partition);
+    _partitions_shutting_down.push_back(shutdown_state);
+
+    xshard_transfer_state xst_state;
     try {
         auto ntp = partition->ntp();
-        co_await _raft_manager.local().shutdown(partition->raft());
+        shutdown_state.update(partition_shutdown_stage::stopping_raft);
+        xst_state.raft = co_await _raft_manager.local().shutdown(
+          partition->raft());
         _unmanage_watchers.notify(ntp, model::topic_partition_view(ntp.tp));
+        shutdown_state.update(partition_shutdown_stage::stopping_partition);
         co_await partition->stop();
+        shutdown_state.update(partition_shutdown_stage::stopping_storage);
         co_await _storage.log_mgr().shutdown(partition->ntp());
     } catch (...) {
         vassert(
@@ -314,57 +383,100 @@ partition_manager::do_shutdown(ss::lw_shared_ptr<partition> partition) {
           *this,
           std::current_exception());
     }
+
+    co_return xst_state;
 }
 
 ss::future<>
 partition_manager::remove(const model::ntp& ntp, partition_removal_mode mode) {
+    auto guard = _gate.hold();
+
     auto partition = get(ntp);
 
     if (!partition) {
-        return ss::make_exception_future<>(std::invalid_argument(fmt::format(
+        throw std::invalid_argument(fmt::format(
           "Can not remove partition. NTP {} is not present in partition "
           "manager",
-          ntp)));
+          ntp));
     }
+    vlog(clusterlog.debug, "removing partition {}", ntp);
+    partition_shutdown_state shutdown_state(partition);
+    _partitions_shutting_down.push_back(shutdown_state);
     auto group_id = partition->group();
 
     // remove partition from ntp & raft tables
     _ntp_table.erase(ntp);
     _raft_table.erase(group_id);
+    shutdown_state.update(partition_shutdown_stage::stopping_raft);
+    co_await _raft_manager.local().remove(partition->raft());
+    _unmanage_watchers.notify(
+      ntp, model::topic_partition_view(partition->ntp().tp));
+    shutdown_state.update(partition_shutdown_stage::stopping_partition);
+    co_await partition->stop();
+    shutdown_state.update(partition_shutdown_stage::removing_persistent_state);
+    co_await partition->remove_persistent_state();
+    shutdown_state.update(partition_shutdown_stage::removing_storage);
+    co_await _storage.log_mgr().remove(partition->ntp());
 
-    return _raft_manager.local()
-      .remove(partition->raft())
-      .then([this, ntp] {
-          _unmanage_watchers.notify(ntp, model::topic_partition_view(ntp.tp));
-      })
-      .then([partition] { return partition->stop(); })
-      .then([partition] { return partition->remove_persistent_state(); })
-      .then([this, ntp] { return _storage.log_mgr().remove(ntp); })
-      .then([this, partition, mode] {
-          if (mode == partition_removal_mode::global) {
-              return partition->finalize_remote_partition(_as);
-          } else {
-              return ss::now();
-          }
-      })
-      .finally([partition] {}); // in the end remove partition
+    if (mode == partition_removal_mode::global) {
+        shutdown_state.update(
+          partition_shutdown_stage::finalizing_remote_storage);
+        co_await partition->finalize_remote_partition(_as);
+    }
 }
 
-ss::future<> partition_manager::shutdown(const model::ntp& ntp) {
+ss::future<xshard_transfer_state>
+partition_manager::shutdown(const model::ntp& ntp) {
+    auto guard = _gate.hold();
+
     auto partition = get(ntp);
     if (!partition) {
-        return ss::make_exception_future<>(std::invalid_argument(fmt::format(
-          "Can not shutdown partition. NTP {} is not present in "
-          "partition "
-          "manager",
-          ntp)));
+        return ss::make_exception_future<xshard_transfer_state>(
+          std::invalid_argument(fmt::format(
+            "Can not shutdown partition. NTP {} is not present in "
+            "partition "
+            "manager",
+            ntp)));
     }
-
     // remove partition from ntp & raft tables
     _ntp_table.erase(ntp);
     _raft_table.erase(partition->group());
 
     return do_shutdown(partition);
+}
+
+partition_manager::partition_shutdown_state::partition_shutdown_state(
+  ss::lw_shared_ptr<cluster::partition> p)
+  : partition(std::move(p))
+  , stage(partition_manager::partition_shutdown_stage::shutdown_requested)
+  , last_update_timestamp(ss::lowres_clock::now()) {}
+
+void partition_manager::partition_shutdown_state::update(
+  partition_shutdown_stage s) {
+    stage = s;
+    last_update_timestamp = ss::lowres_clock::now();
+}
+
+void partition_manager::check_partitions_shutdown_state() {
+    const auto now = ss::lowres_clock::now();
+    for (auto& state : _partitions_shutting_down) {
+        if (state.last_update_timestamp < now - _partition_shutdown_timeout()) {
+            vlog(
+              clusterlog.error,
+              "partition {} shutdown takes longer than expected, current "
+              "shutdown stage: {} time since last update: {} seconds",
+              state.partition->ntp(),
+              state.stage,
+              (now - state.last_update_timestamp) / 1s);
+        }
+    }
+    maybe_arm_shutdown_watchdog();
+}
+
+void partition_manager::maybe_arm_shutdown_watchdog() {
+    if (!_as.abort_requested()) {
+        _shutdown_watchdog.arm(_partition_shutdown_timeout() / 5);
+    }
 }
 
 uint64_t partition_manager::upload_backlog_size() const {
@@ -418,6 +530,28 @@ partition_manager::get_cloud_cache_disk_usage_target() const {
       },
       cloud_storage::cache_usage_target{},
       [](auto acc, auto update) { return acc + update; });
+}
+
+std::ostream& operator<<(
+  std::ostream& o, const partition_manager::partition_shutdown_stage& stage) {
+    switch (stage) {
+    case partition_manager::partition_shutdown_stage::shutdown_requested:
+        return o << "shutdown_requested";
+    case partition_manager::partition_shutdown_stage::stopping_raft:
+        return o << "stopping_raft";
+    case partition_manager::partition_shutdown_stage::removing_raft:
+        return o << "removing_raft";
+    case partition_manager::partition_shutdown_stage::stopping_partition:
+        return o << "stopping_partition";
+    case partition_manager::partition_shutdown_stage::removing_persistent_state:
+        return o << "removing_persistent_state";
+    case partition_manager::partition_shutdown_stage::stopping_storage:
+        return o << "stopping_storage";
+    case partition_manager::partition_shutdown_stage::removing_storage:
+        return o << "removing_storage";
+    case partition_manager::partition_shutdown_stage::finalizing_remote_storage:
+        return o << "finalizing_remote_storage";
+    }
 }
 
 } // namespace cluster

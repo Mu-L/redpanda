@@ -13,7 +13,7 @@
 
 #include "cluster/fwd.h"
 #include "cluster/metadata_dissemination_rpc_service.h"
-#include "raft/types.h"
+#include "container/fragmented_vector.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/scheduling.hh>
@@ -40,14 +40,14 @@ public:
       ss::sharded<partition_leaders_table>&);
 
     ss::future<get_leadership_reply>
-    get_leadership(get_leadership_request&&, rpc::streaming_context&) final;
+    get_leadership(get_leadership_request, rpc::streaming_context&) final;
 
     ss::future<update_leadership_reply> update_leadership_v2(
-      update_leadership_request_v2&&, rpc::streaming_context&) final;
+      update_leadership_request_v2, rpc::streaming_context&) final;
 
 private:
     ss::future<update_leadership_reply>
-      do_update_leadership(ss::chunked_fifo<ntp_leader_revision>);
+      do_update_leadership(chunked_vector<ntp_leader_revision>);
 
     ss::sharded<partition_leaders_table>& _leaders;
 }; // namespace cluster

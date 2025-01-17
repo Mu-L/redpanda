@@ -20,6 +20,7 @@ from rptest.tests.prealloc_nodes import PreallocNodesTest
 from rptest.clients.types import TopicSpec
 from rptest.clients.rpk import RpkTool
 from rptest.services.rpk_producer import RpkProducer
+from rptest.utils.mode_checks import skip_debug_mode
 
 
 class OffsetForLeaderEpochTest(PreallocNodesTest):
@@ -37,7 +38,11 @@ class OffsetForLeaderEpochTest(PreallocNodesTest):
         return True
 
     def _produce(self, topic, msg_cnt):
-        wait_until(lambda: self._all_have_leaders(), 20, backoff_sec=2)
+        wait_until(
+            lambda: self._all_have_leaders(),
+            50,
+            backoff_sec=2,
+            err_msg="Timeout waiting for all partitions to have leaders")
 
         producer = RpkProducer(self.test_context,
                                self.redpanda,
@@ -162,6 +167,7 @@ class OffsetForLeaderEpochTest(PreallocNodesTest):
             # but the requested
             assert o.error == '' and o.leader_epoch == 15000 and o.epoch_end_offset == -1
 
+    @skip_debug_mode
     @cluster(num_nodes=6, log_allow_list=RESTART_LOG_ALLOW_LIST)
     def test_offset_for_leader_epoch_transfer(self):
 

@@ -10,10 +10,12 @@
 
 #pragma once
 
+#include "base/outcome.h"
 #include "cloud_storage/fwd.h"
 #include "cloud_storage/materialized_manifest_cache.h"
-#include "cloud_storage/partition_probe.h"
-#include "cloud_storage/probe.h"
+#include "cloud_storage/read_path_probes.h"
+#include "cloud_storage/remote_path_provider.h"
+#include "cloud_storage/remote_probe.h"
 #include "cloud_storage/types.h"
 #include "cloud_storage_clients/types.h"
 #include "model/metadata.h"
@@ -25,6 +27,7 @@
 #include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/timed_out_error.hh>
 
@@ -37,9 +40,32 @@
 
 namespace cloud_storage {
 
+struct async_view_timestamp_query {
+    async_view_timestamp_query(
+      kafka::offset min_offset, model::timestamp ts, kafka::offset max_offset)
+      : min_offset(min_offset)
+      , ts(ts)
+      , max_offset(max_offset) {}
+
+    friend std::ostream&
+    operator<<(std::ostream& o, const async_view_timestamp_query& q) {
+        fmt::print(
+          o,
+          "async_view_timestamp_query{{min_offset:{}, ts:{}, max_offset:{}}}",
+          q.min_offset,
+          q.ts,
+          q.max_offset);
+        return o;
+    }
+
+    kafka::offset min_offset;
+    model::timestamp ts;
+    kafka::offset max_offset;
+};
+
 /// Search query type
 using async_view_search_query_t
-  = std::variant<model::offset, kafka::offset, model::timestamp>;
+  = std::variant<model::offset, kafka::offset, async_view_timestamp_query>;
 
 std::ostream& operator<<(std::ostream&, const async_view_search_query_t&);
 
@@ -61,16 +87,6 @@ using manifest_section_t = std::variant<
   ss::shared_ptr<materialized_manifest>,
   std::reference_wrapper<const partition_manifest>>;
 
-/// Result of the ListObjectsV2 scan
-struct spillover_manifest_list {
-    /// List of manifest paths
-    std::deque<remote_manifest_path> manifests;
-    /// List of decoded path components (offsets and timestamps)
-    std::deque<spillover_manifest_path_components> components;
-    /// List of manifest sizes (in binary format)
-    std::deque<size_t> sizes;
-};
-
 class async_manifest_view_cursor;
 
 /// Service that maintains a view of the entire
@@ -86,10 +102,21 @@ public:
       ss::sharded<cache>& cache,
       const partition_manifest& stm_manifest,
       cloud_storage_clients::bucket_name bucket,
-      partition_probe& probe);
+      const remote_path_provider& path_provider);
 
     ss::future<> start();
     ss::future<> stop();
+
+    enum class cursor_base_t {
+        archive_start_offset,
+
+        /// Special case that is used when computing retention.
+        ///
+        /// For details, see:
+        /// GitHub: https://github.com/redpanda-data/redpanda/pull/12177
+        /// Commit: 1b6ab7be8818e3878a32f9037694ae5c4cf4fea2
+        archive_clean_offset,
+    };
 
     /// Get active spillover manifests asynchronously
     ///
@@ -100,7 +127,8 @@ public:
       result<std::unique_ptr<async_manifest_view_cursor>, error_outcome>>
     get_cursor(
       async_view_search_query_t q,
-      std::optional<model::offset> end_inclusive = std::nullopt) noexcept;
+      std::optional<model::offset> end_inclusive = std::nullopt,
+      cursor_base_t cursor_base = cursor_base_t::archive_start_offset) noexcept;
 
     /// Get inactive spillover manifests which are waiting for
     /// retention
@@ -131,6 +159,10 @@ public:
     compute_retention(
       std::optional<size_t> size_limit,
       std::optional<std::chrono::milliseconds> time_limit) noexcept;
+
+    const remote_path_provider& path_provider() const {
+        return _remote_path_provider;
+    }
 
 private:
     ss::future<result<archive_start_offset_advance, error_outcome>>
@@ -196,9 +228,10 @@ private:
     mutable ss::gate _gate;
     ss::abort_source _as;
     cloud_storage_clients::bucket_name _bucket;
+    const remote_path_provider& _remote_path_provider;
     ss::sharded<remote>& _remote;
     ss::sharded<cache>& _cache;
-    partition_probe& _probe;
+    ts_read_path_probe& _ts_probe;
 
     const partition_manifest& _stm_manifest;
     mutable retry_chain_node _rtcnode;
@@ -218,7 +251,7 @@ private:
     struct materialization_request_t {
         segment_meta search_vec;
         ss::promise<result<manifest_section_t, error_outcome>> promise;
-        std::unique_ptr<partition_probe::hist_t::measurement> _measurement;
+        std::unique_ptr<ts_read_path_probe::hist_t::measurement> _measurement;
     };
     std::deque<materialization_request_t> _requests;
     ss::condition_variable _cvar;

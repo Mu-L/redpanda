@@ -8,11 +8,11 @@
  * the Business Source License, use of this software will be governed
  * by the Apache License, Version 2.0
  */
+#include "base/seastarx.h"
 #include "compat/check.h"
 #include "compat/run.h"
 #include "json/prettywriter.h"
 #include "model/compression.h"
-#include "seastarx.h"
 #include "test_utils/tmp_dir.h"
 #include "utils/directory_walker.h"
 #include "utils/file_io.h"
@@ -21,6 +21,8 @@
 #include <seastar/testing/thread_test_case.hh>
 
 #include <boost/test/unit_test.hpp>
+
+#include <limits>
 
 namespace {
 // NOLINTNEXTLINE(misc-no-recursion)
@@ -60,7 +62,9 @@ perturb(json::Value& value, json::Document& doc, std::string& path) {
             }
         }
         const auto orig = v;
-        const int modifier = v == 0 ? 1 : -1;
+        const int modifier = (v == 0 || v == std::numeric_limits<T>::min())
+                               ? 1
+                               : -1;
         v += modifier;
         path = fmt::format("{} = {} ({}/{})", path, v, orig, modifier);
         return v;

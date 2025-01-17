@@ -9,32 +9,33 @@
 
 #include "raft/consensus_utils.h"
 
+#include "base/likely.h"
+#include "base/vassert.h"
 #include "bytes/iostream.h"
-#include "cluster/archival_metadata_stm.h"
-#include "likely.h"
+#include "container/fragmented_vector.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/record_utils.h"
 #include "model/timestamp.h"
 #include "raft/group_configuration.h"
 #include "raft/logger.h"
-#include "raft/offset_translator.h"
 #include "raft/types.h"
 #include "random/generators.h"
 #include "reflection/adl.h"
 #include "resource_mgmt/io_priority.h"
+#include "serde/peek.h"
+#include "serde/rw/rw.h"
 #include "ssx/future-util.h"
 #include "storage/api.h"
 #include "storage/fs_utils.h"
 #include "storage/kvstore.h"
 #include "storage/ntp_config.h"
+#include "storage/offset_translator.h"
 #include "storage/offset_translator_state.h"
 #include "storage/record_batch_builder.h"
-#include "storage/segment_appender_utils.h"
+#include "storage/record_batch_utils.h"
 #include "storage/segment_utils.h"
 #include "storage/version.h"
-#include "utils/fragmented_vector.h"
-#include "vassert.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
@@ -123,7 +124,7 @@ ss::future<std::vector<model::record_batch_reader>> share_reader(
           for (auto& b : batches) {
               auto r = use_foreign_share
                          ? model::make_foreign_memory_record_batch_reader(
-                           std::move(b))
+                             std::move(b))
                          : model::make_memory_record_batch_reader(std::move(b));
               retval.emplace_back(std::move(r));
           }
@@ -167,107 +168,26 @@ ss::future<configuration_bootstrap_state> read_bootstrap_state(
       });
 }
 
+iobuf serialize_configuration(group_configuration cfg) {
+    if (likely(cfg.version() >= raft::group_configuration::v_6)) {
+        return serde::to_iobuf(std::move(cfg));
+    }
+
+    return reflection::to_iobuf(std::move(cfg));
+}
+
 ss::circular_buffer<model::record_batch>
 serialize_configuration_as_batches(group_configuration cfg) {
-    auto batch = std::move(
-                   storage::record_batch_builder(
-                     model::record_batch_type::raft_configuration,
-                     model::offset(0))
-                     .add_raw_kv(iobuf(), reflection::to_iobuf(std::move(cfg))))
-                   .build();
+    auto batch
+      = std::move(
+          storage::record_batch_builder(
+            model::record_batch_type::raft_configuration, model::offset(0))
+            .add_raw_kv(iobuf(), serialize_configuration(std::move(cfg))))
+          .build();
     ss::circular_buffer<model::record_batch> batches;
     batches.reserve(1);
     batches.push_back(std::move(batch));
     return batches;
-}
-
-model::record_batch_reader serialize_configuration(group_configuration cfg) {
-    return model::make_memory_record_batch_reader(
-      serialize_configuration_as_batches(std::move(cfg)));
-}
-
-model::record_batch make_ghost_batch(
-  model::offset start_offset, model::offset end_offset, model::term_id term) {
-    auto delta = end_offset - start_offset;
-    auto now = model::timestamp::now();
-    model::record_batch_header header = {
-      .size_bytes = model::packed_record_batch_header_size,
-      .base_offset = start_offset,
-      .type = model::record_batch_type::ghost_batch,
-      .crc = 0, // crc computed later
-      .attrs = model::record_batch_attributes{} |= model::compression::none,
-      .last_offset_delta = static_cast<int32_t>(delta),
-      .first_timestamp = now,
-      .max_timestamp = now,
-      .producer_id = -1,
-      .producer_epoch = -1,
-      .base_sequence = -1,
-      .record_count = static_cast<int32_t>(delta() + 1),
-      .ctx = model::record_batch_header::context(term, ss::this_shard_id())};
-
-    model::record_batch batch(
-      std::move(header), model::record_batch::compressed_records{});
-
-    batch.header().crc = model::crc_record_batch(batch);
-    batch.header().header_crc = model::internal_header_only_crc(batch.header());
-    return batch;
-}
-
-/**
- * makes multiple ghost batches required to fill the gap in a way that max batch
- * size (max of int32_t) is not exceeded
- */
-std::vector<model::record_batch> make_ghost_batches(
-  model::offset start_offset, model::offset end_offset, model::term_id term) {
-    std::vector<model::record_batch> batches;
-    while (start_offset <= end_offset) {
-        static constexpr model::offset max_batch_size{
-          std::numeric_limits<int32_t>::max()};
-        // limit max batch size
-        const model::offset delta = std::min<model::offset>(
-          max_batch_size, end_offset - start_offset);
-
-        batches.push_back(
-          make_ghost_batch(start_offset, delta + start_offset, term));
-        start_offset = next_offset(batches.back().last_offset());
-    }
-
-    return batches;
-}
-
-ss::circular_buffer<model::record_batch> make_ghost_batches_in_gaps(
-  model::offset expected_start,
-  ss::circular_buffer<model::record_batch>&& batches) {
-    ss::circular_buffer<model::record_batch> res;
-    res.reserve(batches.size());
-    for (auto& b : batches) {
-        // gap
-        if (b.base_offset() > expected_start) {
-            auto gb = make_ghost_batches(
-              expected_start, prev_offset(b.base_offset()), b.term());
-            std::move(gb.begin(), gb.end(), std::back_inserter(res));
-        }
-        expected_start = next_offset(b.last_offset());
-        res.push_back(std::move(b));
-    }
-    return res;
-}
-
-fragmented_vector<model::record_batch> make_ghost_batches_in_gaps(
-  model::offset expected_start,
-  fragmented_vector<model::record_batch>&& batches) {
-    fragmented_vector<model::record_batch> res;
-    for (auto& b : batches) {
-        // gap
-        if (b.base_offset() > expected_start) {
-            auto gb = make_ghost_batches(
-              expected_start, prev_offset(b.base_offset()), b.term());
-            std::move(gb.begin(), gb.end(), std::back_inserter(res));
-        }
-        expected_start = next_offset(b.last_offset());
-        res.push_back(std::move(b));
-    }
-    return res;
 }
 
 ss::future<> persist_snapshot(
@@ -276,11 +196,11 @@ ss::future<> persist_snapshot(
   iobuf&& data) {
     return snapshot_manager.start_snapshot().then(
       [&snapshot_manager, md = std::move(md), data = std::move(data)](
-        storage::snapshot_writer writer) mutable {
+        storage::file_snapshot_writer writer) mutable {
           return ss::do_with(
             std::move(writer),
             [&snapshot_manager, md = std::move(md), data = std::move(data)](
-              storage::snapshot_writer& writer) mutable {
+              storage::file_snapshot_writer& writer) mutable {
                 return writer
                   .write_metadata(reflection::to_iobuf(std::move(md)))
                   .then([&writer, data = std::move(data)]() mutable {
@@ -294,83 +214,21 @@ ss::future<> persist_snapshot(
             });
       });
 }
+group_configuration deserialize_configuration(iobuf_parser& parser) {
+    const auto version = serde::peek_version(parser);
+    if (likely(version >= group_configuration::v_6())) {
+        return serde::read<group_configuration>(parser);
+    }
 
-model::record_batch_reader make_config_extracting_reader(
-  model::offset base_offset,
-  std::vector<offset_configuration>& target,
-  model::record_batch_reader&& source) {
-    class extracting_reader final : public model::record_batch_reader::impl {
-    private:
-        using storage_t = model::record_batch_reader::storage_t;
-        using data_t = model::record_batch_reader::data_t;
-        using foreign_t = model::record_batch_reader::foreign_data_t;
+    return reflection::adl<group_configuration>{}.from(parser);
+}
+group_configuration deserialize_nested_configuration(iobuf_parser& parser) {
+    const auto version = serde::peek_version(parser);
+    if (likely(version >= group_configuration::v_6())) {
+        return serde::read_nested<group_configuration>(parser, 0UL);
+    }
 
-    public:
-        explicit extracting_reader(
-          model::offset o,
-          std::vector<offset_configuration>& target,
-          std::unique_ptr<model::record_batch_reader::impl> src)
-          : _next_offset(
-            o < model::offset(0) ? model::offset(0) : o + model::offset(1))
-          , _configurations(target)
-          , _ptr(std::move(src)) {}
-        extracting_reader(const extracting_reader&) = delete;
-        extracting_reader& operator=(const extracting_reader&) = delete;
-        extracting_reader(extracting_reader&&) = delete;
-        extracting_reader& operator=(extracting_reader&&) = delete;
-        ~extracting_reader() override = default;
-
-        bool is_end_of_stream() const final {
-            // ok to copy a bool
-            return _ptr->is_end_of_stream();
-        }
-
-        void print(std::ostream& os) final {
-            fmt::print(os, "configuration extracting reader, proxy for ");
-            _ptr->print(os);
-        }
-
-        data_t& get_batches(storage_t& st) {
-            if (std::holds_alternative<data_t>(st)) {
-                return std::get<data_t>(st);
-            } else {
-                return *std::get<foreign_t>(st).buffer;
-            }
-        }
-
-        ss::future<storage_t>
-        do_load_slice(model::timeout_clock::time_point t) final {
-            return _ptr->do_load_slice(t).then([this](storage_t recs) {
-                for (auto& batch : get_batches(recs)) {
-                    if (
-                      batch.header().type
-                      == model::record_batch_type::raft_configuration) {
-                        extract_configuration(batch);
-                    }
-                    // calculate next offset
-                    _next_offset += model::offset(
-                                      batch.header().last_offset_delta)
-                                    + model::offset(1);
-                }
-                return recs;
-            });
-        }
-
-        void extract_configuration(model::record_batch& batch) {
-            auto cfg = reflection::from_iobuf<group_configuration>(
-              batch.copy_records().begin()->value().copy());
-            _configurations.emplace_back(_next_offset, std::move(cfg));
-        }
-
-    private:
-        model::offset _next_offset;
-        std::vector<offset_configuration>& _configurations;
-        std::unique_ptr<model::record_batch_reader::impl> _ptr;
-    };
-    auto reader = std::make_unique<extracting_reader>(
-      base_offset, target, std::move(source).release());
-
-    return model::record_batch_reader(std::move(reader));
+    return reflection::adl<group_configuration>{}.from(parser);
 }
 
 bytes serialize_group_key(raft::group_id group, metadata_key key_type) {
@@ -379,9 +237,9 @@ bytes serialize_group_key(raft::group_id group, metadata_key key_type) {
     return iobuf_to_bytes(buf);
 }
 
-ss::future<> move_persistent_state(
+ss::future<> copy_persistent_state(
   raft::group_id group,
-  ss::shard_id source_shard,
+  storage::kvstore& source_kvs,
   ss::shard_id target_shard,
   ss::sharded<storage::api>& api) {
     struct persistent_state {
@@ -392,98 +250,87 @@ ss::future<> move_persistent_state(
         std::optional<iobuf> highest_known_offset;
         std::optional<iobuf> next_cfg_idx;
     };
-    using state_ptr = std::unique_ptr<persistent_state>;
-    using state_fptr = ss::foreign_ptr<std::unique_ptr<persistent_state>>;
-
-    state_fptr state = co_await api.invoke_on(
-      source_shard, [gr = group](storage::api& api) {
-          const auto ks = storage::kvstore::key_space::consensus;
-          persistent_state state{
-            .voted_for = api.kvs().get(
-              ks, serialize_group_key(gr, metadata_key::voted_for)),
-            .last_applied = api.kvs().get(
-              ks, serialize_group_key(gr, metadata_key::last_applied_offset)),
-            .unique_run_id = api.kvs().get(
-              ks, serialize_group_key(gr, metadata_key::unique_local_id)),
-            .configuration_map = api.kvs().get(
-              ks, serialize_group_key(gr, metadata_key::config_map)),
-            .highest_known_offset = api.kvs().get(
-              ks,
-              serialize_group_key(
-                gr, metadata_key::config_latest_known_offset)),
-            .next_cfg_idx = api.kvs().get(
-              ks, serialize_group_key(gr, metadata_key::config_next_cfg_idx))};
-          return ss::make_foreign<state_ptr>(
-            std::make_unique<persistent_state>(std::move(state)));
-      });
+    const auto ks = storage::kvstore::key_space::consensus;
+    const persistent_state state{
+      .voted_for = source_kvs.get(
+        ks, serialize_group_key(group, metadata_key::voted_for)),
+      .last_applied = source_kvs.get(
+        ks, serialize_group_key(group, metadata_key::last_applied_offset)),
+      .unique_run_id = source_kvs.get(
+        ks, serialize_group_key(group, metadata_key::unique_local_id)),
+      .configuration_map = source_kvs.get(
+        ks, serialize_group_key(group, metadata_key::config_map)),
+      .highest_known_offset = source_kvs.get(
+        ks,
+        serialize_group_key(group, metadata_key::config_latest_known_offset)),
+      .next_cfg_idx = source_kvs.get(
+        ks, serialize_group_key(group, metadata_key::config_next_cfg_idx))};
 
     co_await api.invoke_on(
-      target_shard, [gr = group, state = std::move(state)](storage::api& api) {
+      target_shard, [gr = group, &state](storage::api& api) {
           const auto ks = storage::kvstore::key_space::consensus;
           std::vector<ss::future<>> write_futures;
           write_futures.reserve(6);
-          if (state->voted_for) {
+          if (state.voted_for) {
               write_futures.push_back(api.kvs().put(
                 ks,
                 serialize_group_key(gr, metadata_key::voted_for),
-                state->voted_for->copy()));
+                state.voted_for->copy()));
           }
-          if (state->last_applied) {
+          if (state.last_applied) {
               write_futures.push_back(api.kvs().put(
                 ks,
                 serialize_group_key(gr, metadata_key::last_applied_offset),
-                state->last_applied->copy()));
+                state.last_applied->copy()));
           }
-          if (state->unique_run_id) {
+          if (state.unique_run_id) {
               write_futures.push_back(api.kvs().put(
                 ks,
                 serialize_group_key(gr, metadata_key::unique_local_id),
-                state->unique_run_id->copy()));
+                state.unique_run_id->copy()));
           }
-          if (state->configuration_map) {
+          if (state.configuration_map) {
               write_futures.push_back(api.kvs().put(
                 ks,
                 serialize_group_key(gr, metadata_key::config_map),
-                state->configuration_map->copy()));
+                state.configuration_map->copy()));
           }
-          if (state->highest_known_offset) {
+          if (state.highest_known_offset) {
               write_futures.push_back(api.kvs().put(
                 ks,
                 serialize_group_key(
                   gr, metadata_key::config_latest_known_offset),
-                state->highest_known_offset->copy()));
+                state.highest_known_offset->copy()));
           }
-          if (state->next_cfg_idx) {
+          if (state.next_cfg_idx) {
               write_futures.push_back(api.kvs().put(
                 ks,
                 serialize_group_key(gr, metadata_key::config_next_cfg_idx),
-                state->next_cfg_idx->copy()));
+                state.next_cfg_idx->copy()));
           }
-          return ss::when_all_succeed(
-            write_futures.begin(), write_futures.end());
+          return ss::when_all_succeed(std::move(write_futures));
       });
+}
 
-    // remove on source shard
-    co_await api.invoke_on(source_shard, [gr = group](storage::api& api) {
-        const auto ks = storage::kvstore::key_space::consensus;
-        std::vector<ss::future<>> remove_futures;
-        remove_futures.reserve(6);
-        remove_futures.push_back(api.kvs().remove(
-          ks, serialize_group_key(gr, metadata_key::voted_for)));
-        remove_futures.push_back(api.kvs().remove(
-          ks, serialize_group_key(gr, metadata_key::last_applied_offset)));
-        remove_futures.push_back(api.kvs().remove(
-          ks, serialize_group_key(gr, metadata_key::unique_local_id)));
-        remove_futures.push_back(api.kvs().remove(
-          ks, serialize_group_key(gr, metadata_key::config_map)));
-        remove_futures.push_back(api.kvs().remove(
-          ks,
-          serialize_group_key(gr, metadata_key::config_latest_known_offset)));
-        remove_futures.push_back(api.kvs().remove(
-          ks, serialize_group_key(gr, metadata_key::config_next_cfg_idx)));
-        return ss::when_all_succeed(
-          remove_futures.begin(), remove_futures.end());
-    });
+ss::future<>
+remove_persistent_state(raft::group_id group, storage::kvstore& kvs) {
+    const auto ks = storage::kvstore::key_space::consensus;
+    std::vector<ss::future<>> remove_futures;
+    remove_futures.reserve(6);
+    remove_futures.push_back(
+      kvs.remove(ks, serialize_group_key(group, metadata_key::voted_for)));
+    remove_futures.push_back(kvs.remove(
+      ks, serialize_group_key(group, metadata_key::last_applied_offset)));
+    remove_futures.push_back(kvs.remove(
+      ks, serialize_group_key(group, metadata_key::unique_local_id)));
+    remove_futures.push_back(
+      kvs.remove(ks, serialize_group_key(group, metadata_key::config_map)));
+    remove_futures.push_back(kvs.remove(
+      ks,
+      serialize_group_key(group, metadata_key::config_latest_known_offset)));
+    remove_futures.push_back(kvs.remove(
+      ks, serialize_group_key(group, metadata_key::config_next_cfg_idx)));
+    co_await ss::when_all_succeed(std::move(remove_futures));
 }
 
 // Return previous offset. This is different from
@@ -499,7 +346,7 @@ ss::future<> create_offset_translator_state_for_pre_existing_partition(
   storage::api& api,
   const storage::ntp_config& ntp_cfg,
   raft::group_id group,
-  model::offset min_rp_offset,
+  model::offset,
   model::offset max_rp_offset,
   ss::lw_shared_ptr<storage::offset_translator_state> ot_state) {
     // Prepare offset_translator state in kvstore
@@ -510,7 +357,7 @@ ss::future<> create_offset_translator_state_for_pre_existing_partition(
       max_rp_offset);
     co_await api.kvs().put(
       storage::kvstore::key_space::offset_translator,
-      raft::offset_translator::kvstore_offsetmap_key(group),
+      storage::offset_translator::kvstore_offsetmap_key(group),
       ot_state->serialize_map());
     vlog(
       raftlog.debug,
@@ -519,7 +366,7 @@ ss::future<> create_offset_translator_state_for_pre_existing_partition(
       max_rp_offset);
     co_await api.kvs().put(
       storage::kvstore::key_space::offset_translator,
-      raft::offset_translator::kvstore_highest_known_offset_key(group),
+      storage::offset_translator::kvstore_highest_known_offset_key(group),
       reflection::to_iobuf(max_rp_offset));
 }
 
@@ -530,7 +377,8 @@ ss::future<> create_raft_state_for_pre_existing_partition(
   model::offset min_rp_offset,
   model::offset max_rp_offset,
   model::term_id last_included_term,
-  std::vector<model::broker> initial_nodes) {
+  std::vector<raft::vnode> initial_nodes,
+  model::offset_delta log_start_delta) {
     // Prepare Raft state in kvstore
     vlog(
       raftlog.debug,
@@ -546,7 +394,7 @@ ss::future<> create_raft_state_for_pre_existing_partition(
 
     // Prepare Raft snapshot
     raft::group_configuration group_config(
-      initial_nodes, ntp_cfg.get_revision());
+      std::move(initial_nodes), ntp_cfg.get_revision());
     raft::snapshot_metadata meta = {
       // `last_included_index` should be the last offset included in
       // this fake snapshot. That's why we set it to be the first offest
@@ -556,7 +404,7 @@ ss::future<> create_raft_state_for_pre_existing_partition(
       .version = raft::snapshot_metadata::current_version,
       .latest_configuration = std::move(group_config),
       .cluster_time = ss::lowres_clock::now(),
-      .log_start_delta = raft::offset_translator_delta{0},
+      .log_start_delta = offset_translator_delta{log_start_delta},
     };
 
     vlog(
@@ -598,7 +446,7 @@ ss::future<> bootstrap_pre_existing_partition(
   model::offset min_rp_offset,
   model::offset max_rp_offset,
   model::term_id last_included_term,
-  std::vector<model::broker> initial_nodes,
+  std::vector<raft::vnode> initial_nodes,
   ss::lw_shared_ptr<storage::offset_translator_state> ot_state) {
     co_await create_offset_translator_state_for_pre_existing_partition(
       api, ntp_cfg, group, min_rp_offset, max_rp_offset, ot_state);
@@ -611,7 +459,8 @@ ss::future<> bootstrap_pre_existing_partition(
       min_rp_offset,
       max_rp_offset,
       last_included_term,
-      initial_nodes);
+      initial_nodes,
+      model::offset_delta{ot_state->delta(min_rp_offset)});
 }
 
 } // namespace raft::details

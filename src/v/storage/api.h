@@ -11,14 +11,15 @@
 
 #pragma once
 
+#include "base/seastarx.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
-#include "seastarx.h"
 #include "storage/kvstore.h"
 #include "storage/log_manager.h"
-#include "storage/probe.h"
 #include "storage/storage_resources.h"
 #include "utils/notification_list.h"
+
+#include <seastar/core/condition-variable.hh>
 
 namespace storage {
 
@@ -35,7 +36,7 @@ public:
 
     ss::future<> start() {
         _kvstore = std::make_unique<kvstore>(
-          _kv_conf_cb(), _resources, _feature_table);
+          _kv_conf_cb(), ss::this_shard_id(), _resources, _feature_table);
         return _kvstore->start().then([this] {
             _log_mgr = std::make_unique<log_manager>(
               _log_conf_cb(), kvs(), _resources, _feature_table);
@@ -43,7 +44,22 @@ public:
         });
     }
 
+    ss::future<std::unique_ptr<storage::kvstore>>
+    make_extra_kvstore(ss::shard_id s) {
+        vassert(
+          s >= ss::smp::count,
+          "can't make extra kvstore for existing shard {}",
+          s);
+        auto kvs = std::make_unique<kvstore>(
+          _kv_conf_cb(), s, _resources, _feature_table);
+        co_await kvs->start();
+        co_return kvs;
+    }
+
+    void stop_cluster_uuid_waiters() { _has_cluster_uuid_cond.broken(); }
+
     ss::future<> stop() {
+        stop_cluster_uuid_waiters();
         auto f = ss::now();
         if (_log_mgr) {
             f = _log_mgr->stop();
@@ -62,10 +78,13 @@ public:
 
     void set_cluster_uuid(const model::cluster_uuid& cluster_uuid) {
         _cluster_uuid = cluster_uuid;
+        _has_cluster_uuid_cond.signal();
     }
     const std::optional<model::cluster_uuid>& get_cluster_uuid() const {
         return _cluster_uuid;
     }
+
+    ss::future<bool> wait_for_cluster_uuid();
 
     kvstore& kvs() { return *_kvstore; }
     log_manager& log_mgr() { return *_log_mgr; }
@@ -106,6 +125,7 @@ private:
     model::node_uuid _node_uuid;
 
     std::optional<model::cluster_uuid> _cluster_uuid;
+    ss::condition_variable _has_cluster_uuid_cond;
 };
 
 } // namespace storage

@@ -10,9 +10,13 @@
  */
 
 #pragma once
+#include "config/configuration.h"
 #include "kafka/protocol/schemata/create_topics_request.h"
 #include "kafka/protocol/schemata/create_topics_response.h"
 #include "kafka/server/handlers/topics/types.h"
+#include "model/fundamental.h"
+#include "model/metadata.h"
+#include "model/namespace.h"
 
 namespace kafka {
 template<typename Request, typename T>
@@ -126,17 +130,28 @@ struct replication_factor_must_be_positive {
     }
 };
 
-struct unsupported_configuration_entries {
-    static constexpr error_code ec = error_code::invalid_config;
+struct replication_factor_must_be_greater_or_equal_to_minimum {
+    static constexpr error_code ec = error_code::invalid_replication_factor;
     static constexpr const char* error_message
-      = "Not supported configuration entry ";
+      = "Replication factor must be greater than or equal to specified minimum "
+        "value";
 
     static bool is_valid(const creatable_topic& c) {
-        auto config_entries = config_map(c.configs);
-        auto end = config_entries.end();
-        return end == config_entries.find("min.insync.replicas")
-               && end == config_entries.find("flush.messages")
-               && end == config_entries.find("flush.ms");
+        // All topics being validated as this level will be created in the kafka
+        // namespace
+        if (model::is_user_topic(
+              model::topic_namespace{model::kafka_namespace, c.name})) {
+            if (!c.assignments.empty()) {
+                return true;
+            } else {
+                return c.replication_factor
+                       >= config::shard_local_cfg()
+                            .minimum_topic_replication.value();
+            }
+        } else {
+            // Do not apply this validation against internally created topics
+            return true;
+        }
     }
 };
 
@@ -224,21 +239,21 @@ struct subject_name_strategy_validator {
         return std::all_of(
           c.configs.begin(),
           c.configs.end(),
-          [](createable_topic_config const& v) {
+          [](const createable_topic_config& v) {
               return !is_sns_config(v) || !v.value.has_value()
                      || is_valid_sns(v.value.value());
           });
     }
 
 private:
-    static bool is_sns_config(createable_topic_config const& c) {
+    static bool is_sns_config(const createable_topic_config& c) {
         static constexpr const auto config_names = {
           topic_property_record_key_subject_name_strategy,
           topic_property_record_key_subject_name_strategy_compat,
           topic_property_record_value_subject_name_strategy,
           topic_property_record_value_subject_name_strategy_compat};
         return std::any_of(
-          config_names.begin(), config_names.end(), [&c](auto const& v) {
+          config_names.begin(), config_names.end(), [&c](const auto& v) {
               return c.name == v;
           });
     }
@@ -251,6 +266,183 @@ private:
         } catch (...) {
             return false;
         }
+    }
+};
+
+struct iceberg_config_validator {
+    static constexpr const char* error_message
+      = "Invalid property value or Iceberg configuration disabled at cluster "
+        "level.";
+    static constexpr error_code ec = error_code::invalid_config;
+
+    static bool is_valid(const creatable_topic& c) {
+        auto it = std::find_if(
+          c.configs.begin(),
+          c.configs.end(),
+          [](const createable_topic_config& cfg) {
+              return cfg.name == topic_property_iceberg_mode;
+          });
+        if (it == c.configs.end() || !it->value.has_value()) {
+            return true;
+        }
+        model::iceberg_mode parsed_mode;
+        try {
+            parsed_mode = boost::lexical_cast<model::iceberg_mode>(
+              it->value.value());
+        } catch (...) {
+            return false;
+        }
+        // If iceberg is enabled at the cluster level, the topic can
+        // be created with any override. If it is disabled
+        // at the cluster level, it cannot be enabled with a topic
+        // override.
+        return config::shard_local_cfg().iceberg_enabled()
+               || parsed_mode == model::iceberg_mode::disabled;
+    }
+};
+
+/*
+ * it's an error to set the cloud topic property if cloud topics development
+ * feature hasn't been enabled.
+ */
+struct cloud_topic_config_validator {
+    static constexpr const char* error_message
+      = "Cloud topics property is invalid, or support for this development "
+        "feature is not enabled.";
+    static constexpr error_code ec = error_code::invalid_config;
+
+    static bool is_valid(const creatable_topic& c) {
+        auto it = std::find_if(
+          c.configs.begin(),
+          c.configs.end(),
+          [](const createable_topic_config& cfg) {
+              return cfg.name == topic_property_cloud_topic_enabled;
+          });
+        if (it == c.configs.end()) {
+            return true;
+        }
+        if (!config::shard_local_cfg().development_enable_cloud_topics()) {
+            return false;
+        }
+        try {
+            std::ignore = string_switch<bool>(it->value.value())
+                            .match("true", true)
+                            .match("false", false);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+};
+
+struct write_caching_configs_validator {
+    static constexpr const char* error_message
+      = "Unsupported write caching configuration.";
+    static constexpr const auto config_name = topic_property_write_caching;
+    static constexpr error_code ec = error_code::invalid_config;
+
+    static bool validate_write_caching(const creatable_topic& c) {
+        auto it = std::find_if(
+          c.configs.begin(),
+          c.configs.end(),
+          [](const createable_topic_config& cfg) {
+              return cfg.name == topic_property_write_caching;
+          });
+        if (it == c.configs.end() || !it->value.has_value()) {
+            return true;
+        }
+        auto mode = model::write_caching_mode_from_string(it->value.value());
+        // Failed to parse the value.
+        if (!mode) {
+            return false;
+        }
+        auto is_user_topic = model::is_user_topic(
+          model::topic_namespace{model::kafka_namespace, c.name});
+        if (is_user_topic) {
+            // disabled mode only allowed globally and cannot be set at topic
+            // level.
+            return mode != model::write_caching_mode::disabled;
+        }
+        // write caching cannot be turned on for internal topics.
+        return mode != model::write_caching_mode::default_true;
+    }
+
+    static bool validate_flush_ms(const creatable_topic& c) {
+        auto it = std::find_if(
+          c.configs.begin(),
+          c.configs.end(),
+          [](const createable_topic_config& cfg) {
+              return cfg.name == topic_property_flush_ms;
+          });
+        if (it == c.configs.end() || it->value.has_value()) {
+            return true;
+        }
+        try {
+            auto val = boost::lexical_cast<std::chrono::milliseconds::rep>(
+              it->value.value());
+            // atleast 1ms, anything less than that is suspiciously small.
+            return val >= 1 && val <= serde::max_serializable_ms.count();
+        } catch (...) {
+        }
+        return false;
+    }
+
+    static bool validate_flush_bytes(const creatable_topic& c) {
+        auto it = std::find_if(
+          c.configs.begin(),
+          c.configs.end(),
+          [](const createable_topic_config& cfg) {
+              return cfg.name == topic_property_flush_bytes;
+          });
+        if (it == c.configs.end() || it->value.has_value()) {
+            return true;
+        }
+        try {
+            auto val = boost::lexical_cast<size_t>(it->value.value());
+            return val > 0;
+        } catch (...) {
+        }
+        return false;
+    }
+
+    static bool is_valid(const creatable_topic& c) {
+        return validate_write_caching(c) && validate_flush_ms(c)
+               && validate_flush_bytes(c);
+    }
+};
+
+struct delete_retention_ms_validator {
+    static constexpr const char* error_message
+      = "Unsupported delete.retention.ms configuration, cannot be enabled "
+        "at the same time as redpanda.remote.read or redpanda.remote.write.";
+    static constexpr const auto config_name
+      = topic_property_delete_retention_ms;
+    static constexpr error_code ec = error_code::invalid_config;
+
+    static bool is_valid(const creatable_topic& c) {
+        const auto config_entries = config_map(c.configs);
+        try {
+            auto delete_retention_ms
+              = get_tristate_value<std::chrono::milliseconds>(
+                config_entries, topic_property_delete_retention_ms);
+
+            auto shadow_indexing_mode = get_shadow_indexing_mode(
+              config_entries);
+            // Cannot set delete_retention_ms at the same time as any tiered
+            // storage properties.
+            if (
+              delete_retention_ms.has_optional_value()
+              && shadow_indexing_mode
+                   != model::shadow_indexing_mode::disabled) {
+                return false;
+            }
+        } catch (const boost::bad_lexical_cast&) {
+            // Caught a bad configuration exception.
+            // Return true for now- this will error out in a later stage.
+            return true;
+        }
+
+        return true;
     }
 };
 
@@ -271,6 +463,30 @@ struct configuration_value_validator {
 
         try {
             boost::lexical_cast<typename T::validated_type>(iter->second);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+};
+struct vcluster_id_validator {
+    static constexpr const char* error_message = "invalid virtual cluster id";
+    static constexpr error_code ec = error_code::invalid_config;
+
+    static bool is_valid(const creatable_topic& c) {
+        if (!config::shard_local_cfg().enable_mpx_extensions()) {
+            return true;
+        }
+        auto config_entries = config_map(c.configs);
+
+        auto it = config_entries.find(topic_property_mpx_virtual_cluster_id);
+
+        if (it == config_entries.end()) {
+            return true;
+        }
+
+        try {
+            model::vcluster_id::type::from_string(it->second);
             return true;
         } catch (...) {
             return false;

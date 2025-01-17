@@ -8,11 +8,11 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
-#include "cloud_roles/aws_sts_refresh_impl.h"
+#include "aws_sts_refresh_impl.h"
 
 #include "bytes/streambuf.h"
 #include "cloud_roles/logger.h"
-#include "cloud_roles/request_response_helpers.h"
+#include "request_response_helpers.h"
 #include "utils/file_io.h"
 
 #include <boost/algorithm/string/trim.hpp>
@@ -93,7 +93,7 @@ aws_sts_refresh_impl::aws_sts_refresh_impl(
   ss::abort_source& as,
   retry_params retry_params)
   : refresh_credentials::impl(
-    std::move(address), std::move(region), as, retry_params)
+      std::move(address), std::move(region), as, retry_params)
   , _role{load_from_env(aws_injected_env_vars::role_arn)}
   , _token_file_path{load_from_env(aws_injected_env_vars::token_file_path)} {}
 
@@ -141,8 +141,8 @@ ss::future<api_response> aws_sts_refresh_impl::fetch_credentials() {
         tls_enabled = refresh_credentials::client_tls_enabled::no;
     }
 
-    co_return co_await post_request(
-      co_await make_api_client(tls_enabled),
+    co_return co_await request_with_payload(
+      co_await make_api_client("aws_sts", tls_enabled),
       std::move(assume_req),
       std::move(body));
 }

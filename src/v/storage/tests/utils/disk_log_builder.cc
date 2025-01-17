@@ -9,6 +9,7 @@
 
 #include "storage/tests/utils/disk_log_builder.h"
 
+#include "model/record_batch_types.h"
 #include "storage/disk_log_appender.h"
 #include "storage/types.h"
 
@@ -21,8 +22,13 @@ using namespace std::chrono_literals; // NOLINT
 // util functions to be moved from storage_fixture
 // make_ntp, make_dir etc
 namespace storage {
-disk_log_builder::disk_log_builder(storage::log_config config)
+disk_log_builder::disk_log_builder(
+  storage::log_config config,
+  std::vector<model::record_batch_type> types,
+  raft::group_id group_id)
   : _log_config(std::move(config))
+  , _translator_batch_types(std::move(types))
+  , _group_id(group_id)
   , _storage(
       [this]() {
           return kvstore_config(
@@ -67,15 +73,16 @@ ss::future<> disk_log_builder::add_random_batches(
   log_append_config config,
   should_flush_after flush,
   std::optional<model::timestamp> base_ts) {
-    auto batches = model::test::make_random_batches(
+    auto batches = co_await model::test::make_random_batches(
       offset, count, bool(comp), base_ts);
     advance_time(batches.back());
-    return write(std::move(batches), config, flush);
+    co_return co_await write(std::move(batches), config, flush);
 }
 
 ss::future<> disk_log_builder::add_random_batches(
   model::offset offset, log_append_config config, should_flush_after flush) {
-    return write(model::test::make_random_batches(offset), config, flush);
+    co_return co_await write(
+      co_await model::test::make_random_batches(offset), config, flush);
 }
 
 ss::future<> disk_log_builder::add_batch(
@@ -100,7 +107,7 @@ ss::future<> disk_log_builder::start(storage::ntp_config cfg) {
     co_return co_await _storage.start().then(
       [this, cfg = std::move(cfg)]() mutable {
           return _storage.log_mgr()
-            .manage(std::move(cfg))
+            .manage(std::move(cfg), _group_id, _translator_batch_types)
             .then([this](ss::shared_ptr<storage::log> log) { _log = log; });
       });
 }
@@ -112,7 +119,8 @@ ss::future<> disk_log_builder::truncate(model::offset o) {
 
 ss::future<> disk_log_builder::gc(
   model::timestamp collection_upper_bound,
-  std::optional<size_t> max_partition_retention_size) {
+  std::optional<size_t> max_partition_retention_size,
+  std::optional<std::chrono::milliseconds> tombstone_retention_ms) {
     ss::abort_source as;
     auto eviction_future = get_log()->monitor_eviction(as);
 
@@ -121,6 +129,7 @@ ss::future<> disk_log_builder::gc(
         collection_upper_bound,
         max_partition_retention_size,
         model::offset::max(),
+        tombstone_retention_ms,
         ss::default_priority_class(),
         _abort_source))
       .get();
@@ -149,9 +158,14 @@ disk_log_builder::apply_retention(gc_config cfg) {
     return get_disk_log_impl().do_gc(cfg);
 }
 
-ss::future<> disk_log_builder::apply_compaction(
+ss::future<> disk_log_builder::apply_adjacent_merge_compaction(
   compaction_config cfg, std::optional<model::offset> new_start_offset) {
-    return get_disk_log_impl().do_compact(cfg, new_start_offset);
+    return get_disk_log_impl().adjacent_merge_compact(cfg, new_start_offset);
+}
+
+ss::future<bool> disk_log_builder::apply_sliding_window_compaction(
+  compaction_config cfg, std::optional<model::offset> new_start_offset) {
+    return get_disk_log_impl().sliding_window_compact(cfg, new_start_offset);
 }
 
 ss::future<bool>

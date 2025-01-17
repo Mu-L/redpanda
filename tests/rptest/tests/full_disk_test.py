@@ -7,44 +7,37 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 import random
-import requests
-from pickletools import long1
-from time import sleep, time, time_ns
-from collections import defaultdict
+from time import sleep, time
 
+import requests
 from ducktape.cluster.cluster import ClusterNode
+from ducktape.mark import matrix
 from ducktape.tests.test import TestContext
 from ducktape.utils.util import wait_until
 from kafka import KafkaProducer
 from kafka.errors import BrokerNotAvailableError, NotLeaderForPartitionError
-from rptest.clients.kafka_cli_tools import KafkaCliTools
+
 from rptest.clients.default import DefaultClient
-from rptest.clients.rpk import RpkTool
-from rptest.services.redpanda import SISettings
-from ducktape.mark import matrix
 from rptest.clients.kafka_cli_tools import KafkaCliTools
+from rptest.clients.rpk import RpkTool
 from rptest.clients.types import TopicSpec
 from rptest.services.admin import Admin
 from rptest.services.cluster import cluster
-from rptest.services.redpanda import LoggingConfig
-from rptest.services.storage import Topic
+from rptest.services.kgo_verifier_services import KgoVerifierProducer, KgoVerifierSeqConsumer
+from rptest.services.redpanda import LoggingConfig, MetricsEndpoint, RedpandaService, SISettings
 from rptest.tests.end_to_end import EndToEndTest
 from rptest.tests.redpanda_test import RedpandaTest
-from rptest.util import search_logs_with_timeout, produce_total_bytes
+from rptest.util import produce_total_bytes, search_logs_with_timeout
+from rptest.utils.expect_rate import ExpectRate, RateTarget
 from rptest.utils.full_disk import FullDiskHelper
 from rptest.utils.partition_metrics import PartitionMetrics
-from rptest.utils.si_utils import BucketView, quiesce_uploads
-from rptest.utils.expect_rate import ExpectRate, RateTarget
-from rptest.services.kgo_verifier_services import KgoVerifierProducer, KgoVerifierSeqConsumer
+from rptest.utils.si_utils import quiesce_uploads
 
 # reduce this?
 MAX_MSG: int = 600
 MAX_MSG_PER_SEC = 10
 FDT_LOG_ALLOW_LIST = [".*cluster - storage space alert: free space.*"]
 LOOP_ITERATIONS = 3
-
-import logging
-import sys
 
 
 # XXX This test really needs a raw protocol client (i.e. not librdkafka # based)
@@ -154,7 +147,7 @@ class WriteRejectTest(RedpandaTest):
             # Looking for a log statement about a change in disk space.
             # This is a check for the health monitor frontend because
             # that structure logs disk space alerts.
-            pattern = f"Update disk health cache {disk_space_change}"
+            pattern = f"Update data disk health cache {disk_space_change}"
             wait_until(
                 lambda: self.redpanda.search_log_any(pattern),
                 timeout_sec=5,
@@ -260,7 +253,10 @@ class FullDiskReclaimTest(RedpandaTest):
     """
     Test that full disk alert triggers eager gc to reclaim space
     """
-    topics = (TopicSpec(partition_count=10,
+    partition_count = 10
+    log_segment_size = 1048576
+
+    topics = (TopicSpec(partition_count=partition_count,
                         retention_bytes=1,
                         retention_ms=1,
                         cleanup_policy=TopicSpec.CLEANUP_DELETE), )
@@ -268,7 +264,8 @@ class FullDiskReclaimTest(RedpandaTest):
     def __init__(self, test_ctx):
         extra_rp_conf = dict(
             log_compaction_interval_ms=24 * 60 * 60 * 1000,
-            log_segment_size=1048576,
+            log_segment_size=self.log_segment_size,
+            log_segment_size_jitter_percent=0,
         )
         super().__init__(test_context=test_ctx, extra_rp_conf=extra_rp_conf)
 
@@ -288,17 +285,23 @@ class FullDiskReclaimTest(RedpandaTest):
         nbytes = lambda mb: mb * 2**20
         node = self.redpanda.nodes[0]
 
+        produce_size = 3 * self.partition_count * self.log_segment_size
+        expected_size_after_gc = self.partition_count * self.log_segment_size + nbytes(
+            1)
+        assert expected_size_after_gc < produce_size
+
         def observed_data_size(pred):
             observed = self.redpanda.data_stat(node)
-            observed_total = sum(s for _, s in observed)
+            observed_total = sum(s for path, s in observed
+                                 if path.parts[0] == 'kafka')
             return pred(observed_total)
 
-        # write around 30 megabytes into the topic
-        produce_total_bytes(self.redpanda, self.topic, nbytes(30))
+        # write into the topic
+        produce_total_bytes(self.redpanda, self.topic, produce_size)
 
         # wait until all that data shows up. add some fuzz factor to avoid
         # timeouts due to placement skew or other such issues.
-        wait_until(lambda: observed_data_size(lambda s: s > nbytes(25)),
+        wait_until(lambda: observed_data_size(lambda s: s >= produce_size),
                    timeout_sec=30,
                    backoff_sec=2)
 
@@ -308,9 +311,20 @@ class FullDiskReclaimTest(RedpandaTest):
 
         # wait until all that data shows up. add some fuzz factor to avoid
         # timeouts due to placement skew or other such issues.
-        wait_until(lambda: observed_data_size(lambda s: s > nbytes(25)),
+        wait_until(lambda: observed_data_size(lambda s: s >= produce_size),
                    timeout_sec=30,
                    backoff_sec=2)
+
+        assert self.redpanda.metric_sum(
+            metric_name=
+            "vectorized_storage_manager_housekeeping_log_processed_total",
+            metrics_endpoint=MetricsEndpoint.METRICS
+        ) == 0, "Housekeeping should not have run yet"
+
+        assert self.redpanda.metric_sum(
+            metric_name="vectorized_storage_manager_urgent_gc_runs_total",
+            metrics_endpoint=MetricsEndpoint.METRICS
+        ) == 0, "GC should not have run yet"
 
         # now trigger the disk space alert on the same node. unlike the 30
         # second delay above, we should almost immediately observe the data
@@ -318,10 +332,25 @@ class FullDiskReclaimTest(RedpandaTest):
         full_disk = FullDiskHelper(self.logger, self.redpanda)
         full_disk.trigger_low_space(node=node)
 
-        # now wait until the data drops below 1 mb
-        wait_until(lambda: observed_data_size(lambda s: s < nbytes(1)),
-                   timeout_sec=10,
-                   backoff_sec=2)
+        # now wait until the data drops
+        # the expected size is at most one segment for each partition and a
+        # bit extra for stm snapshots. although we expect the subsystem to
+        # reclaim all segments there are other internal systems
+        # (e.g.leadership balancer) which can trigger writes to the partitions.
+        wait_until(
+            lambda: observed_data_size(lambda s: s < expected_size_after_gc),
+            timeout_sec=10,
+            backoff_sec=2)
+
+        assert self.redpanda.metric_sum(
+            metric_name=
+            "vectorized_storage_manager_housekeeping_log_processed_total",
+            metrics_endpoint=MetricsEndpoint.METRICS
+        ) > 0, "Housekeeping should have run"
+
+        assert self.redpanda.metric_sum(
+            metric_name="vectorized_storage_manager_urgent_gc_runs_total",
+            metrics_endpoint=MetricsEndpoint.METRICS) > 0, "GC should have run"
 
 
 class LocalDiskReportTimeTest(RedpandaTest):
@@ -339,6 +368,8 @@ class LocalDiskReportTimeTest(RedpandaTest):
     def test_target_min_capacity_wanted_time_based(self):
         admin = Admin(self.redpanda)
         default_segment_size = admin.get_cluster_config()["log_segment_size"]
+        storage_reserve_min_segments = admin.get_cluster_config(
+        )["storage_reserve_min_segments"]
 
         # produce roughly 30mb at 0.5mb/sec
         kafka_tools = KafkaCliTools(self.redpanda)
@@ -346,28 +377,38 @@ class LocalDiskReportTimeTest(RedpandaTest):
                             30 * 1024,
                             1024,
                             throughput=500,
-                            acks=-1)
+                            acks=-1,
+                            linger_ms=50,
+                            enable_idempotence=False)
 
         node = self.redpanda.nodes[0]
         reported = admin.get_local_storage_usage(
             node)["target_min_capacity_wanted"]
 
-        # params. the size is about 900k larger than what was written,
-        # attributable to per record overheads etc... and determined emperically
-        # by looking at trace log stats.
-        size = 32441102
+        # The size is slightly larger than what was written, attributable to
+        # per record overheads, indices, fallocation, etc... The expected size
+        # is determined empirically by looking at trace log stats.
+        size = 32664482
         time = 61
         retention = 3600
         expected = retention * (size / time)
 
-        # factor in the 2 segments worth of space for controller log
-        diff = abs(reported - expected - 2 * default_segment_size)
+        # Factor in the full segments worth of space for controller log.
+        # This mirrors the math in disk_log_impl.cc
+        controller_want_size = storage_reserve_min_segments * default_segment_size
 
-        # there is definitely going to be some fuzz factor needed here and may
-        # need updated, but after many runs 50mb was a good amount of slack.
-        assert diff <= (
-            100 * 2**20
-        ), f"diff {diff} reported {reported} expected {expected} default seg size {default_segment_size}"
+        diff = reported - controller_want_size - expected
+
+        # There is definitely going to be some fuzz factor needed here and may
+        # need updated.
+        diff_threshold = 100 * 2**20
+
+        self.logger.info(
+            f"{diff=} {diff_threshold=} {reported=} {expected=} {controller_want_size=}"
+        )
+        assert abs(
+            diff
+        ) <= diff_threshold, f"abs({diff=}) <= {diff_threshold=} {reported=} {expected=} {controller_want_size=}"
 
 
 class LocalDiskReportTest(RedpandaTest):
@@ -547,8 +588,10 @@ class LogStorageMaxSizeSI(RedpandaTest):
         return total_bytes
 
     @cluster(num_nodes=4)
-    @matrix(log_segment_size=[1024 * 1024])
-    def test_stay_below_target_size(self, log_segment_size):
+    @matrix(
+        log_segment_size=[1024 * 1024],
+        cleanup_policy=[TopicSpec.CLEANUP_COMPACT, TopicSpec.CLEANUP_DELETE])
+    def test_stay_below_target_size(self, log_segment_size, cleanup_policy):
         """
         Tests that when a log storage target size is specified that data
         uploaded into s3 will become eligible for forced GC in order to meet the
@@ -556,10 +599,13 @@ class LogStorageMaxSizeSI(RedpandaTest):
         """
         # start redpanda with specific config like segment size
         si_settings = SISettings(test_context=self.test_context,
-                                 log_segment_size=log_segment_size)
+                                 log_segment_size=log_segment_size,
+                                 fast_uploads=True)
         extra_rp_conf = {
+            'compacted_log_segment_size': log_segment_size,
             'disk_reservation_percent': 0,
             'retention_local_target_capacity_percent': 100,
+            'retention_local_trim_interval': 1000,  # every second
         }
         self.redpanda.set_extra_rp_conf(extra_rp_conf)
         self.redpanda.set_si_settings(si_settings)
@@ -581,9 +627,11 @@ class LogStorageMaxSizeSI(RedpandaTest):
 
         # make the sink topic
         rpk = RpkTool(self.redpanda)
-        rpk.create_topic(topic_name,
-                         partitions=partition_count,
-                         replicas=replica_count)
+        rpk.create_topic(
+            topic_name,
+            partitions=partition_count,
+            replicas=replica_count,
+            config={TopicSpec.PROPERTY_CLEANUP_POLICY: cleanup_policy})
 
         msg_count = data_size // msg_size
 
@@ -630,6 +678,8 @@ class LogStorageMaxSizeSI(RedpandaTest):
         # having infinte retention, at which point we should see the storage
         # usage drop back down. we end up writing 3x * 3x the target size, and
         # add a few segments per node on for fuzz factor
+        #
+        # Exception to this case are topics created with `cleanup.policy=compact`.
         def target_size_reached():
             total = sum(
                 self._kafka_size_on_disk(n) for n in self.redpanda.nodes)
@@ -643,4 +693,45 @@ class LogStorageMaxSizeSI(RedpandaTest):
             return below
 
         # give it plenty of time. on debug it is hella slow
-        wait_until(target_size_reached, timeout_sec=120, backoff_sec=5)
+        wait_until(target_size_reached, timeout_sec=30, backoff_sec=5)
+        assert min_local_start_offset(
+            self.redpanda, topic_name
+        ) > 0, "expecting disk storage to be reduced by advancing local offsets (local log prefix trim)"
+
+        # Verify that all data is accessible. This assertion implies that the data
+        # was successfully uploaded to the cloud prior to local eviction.
+        consumer = KgoVerifierSeqConsumer.oneshot(
+            self.test_context,
+            self.redpanda,
+            topic_name,
+            loop=False,
+        )
+        assert consumer.consumer_status.validator.valid_reads == 2 * msg_count
+        assert consumer.consumer_status.validator.invalid_reads == 0
+        assert consumer.consumer_status.validator.out_of_scope_invalid_reads == 0
+
+
+def min_local_start_offset(redpanda: RedpandaService, topic: str):
+    min_offset = None
+    for node in redpanda.nodes:
+        for p in local_start_offsets(redpanda, node, topic):
+            if min_offset is None:
+                min_offset = p['local_log_start_offset']
+            else:
+                min_offset = max(min_offset, p['local_log_start_offset'])
+    return min_offset
+
+
+def local_start_offsets(redpanda: RedpandaService, node: ClusterNode,
+                        topic: str):
+    admin = Admin(redpanda, default_node=node)
+    partitions = admin.get_partitions(topic)
+
+    for p in partitions:
+        status = admin.get_partition_cloud_storage_status(
+            topic, p["partition_id"])
+
+        yield {
+            "partition": p["partition_id"],
+            "local_log_start_offset": status["local_log_start_offset"]
+        }

@@ -11,12 +11,7 @@
 
 #pragma once
 
-#include "config/configuration.h"
 #include "http/client.h"
-#include "kafka/client/client.h"
-#include "kafka/client/configuration.h"
-#include "kafka/protocol/metadata.h"
-#include "pandaproxy/rest/configuration.h"
 #include "redpanda/tests/fixture.h"
 
 class pandaproxy_test_fixture : public redpanda_thread_fixture {
@@ -24,9 +19,9 @@ public:
     pandaproxy_test_fixture()
       : redpanda_thread_fixture() {}
 
-    pandaproxy_test_fixture(pandaproxy_test_fixture const&) = delete;
+    pandaproxy_test_fixture(const pandaproxy_test_fixture&) = delete;
     pandaproxy_test_fixture(pandaproxy_test_fixture&&) = delete;
-    pandaproxy_test_fixture operator=(pandaproxy_test_fixture const&) = delete;
+    pandaproxy_test_fixture operator=(const pandaproxy_test_fixture&) = delete;
     pandaproxy_test_fixture operator=(pandaproxy_test_fixture&&) = delete;
     ~pandaproxy_test_fixture() = default;
 

@@ -9,15 +9,15 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "base/outcome.h"
+#include "base/seastarx.h"
 #include "cluster/controller_backend.h"
 #include "cluster/fwd.h"
 #include "cluster/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/timeout_clock.h"
-#include "outcome.h"
 #include "rpc/fwd.h"
-#include "seastarx.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/chunked_fifo.hh>
@@ -90,8 +90,8 @@ public:
     std::optional<ss::shard_id> shard_for(const model::ntp& ntp) const;
 
 private:
-    ss::future<ss::chunked_fifo<controller_backend::delta_metadata>>
-      get_remote_core_deltas(model::ntp, ss::shard_id);
+    ss::future<std::optional<backend_operation>>
+      get_current_op(model::ntp, ss::shard_id);
 
     ss::future<result<ss::chunked_fifo<model::ntp>>>
       get_decommission_allocation_failures(model::node_id);

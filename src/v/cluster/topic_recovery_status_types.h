@@ -14,7 +14,6 @@
 #include "cluster/topic_recovery_service.h"
 #include "serde/envelope.h"
 
-#include <compare>
 #include <type_traits>
 
 namespace cluster {
@@ -23,6 +22,8 @@ struct status_request
   : serde::
       envelope<status_request, serde::version<0>, serde::compat_version<0>> {
     using rpc_adl_exempt = std::true_type;
+
+    auto serde_fields() { return std::tie(); }
 };
 
 struct topic_downloads

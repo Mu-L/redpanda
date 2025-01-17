@@ -10,6 +10,7 @@
 
 #include "cluster/partition_balancer_backend.h"
 
+#include "cluster/health_monitor_backend.h"
 #include "cluster/health_monitor_frontend.h"
 #include "cluster/health_monitor_types.h"
 #include "cluster/logger.h"
@@ -17,13 +18,20 @@
 #include "cluster/members_table.h"
 #include "cluster/partition_balancer_planner.h"
 #include "cluster/partition_balancer_state.h"
+#include "cluster/topic_table.h"
 #include "cluster/topics_frontend.h"
+#include "cluster/types.h"
 #include "config/configuration.h"
 #include "config/property.h"
+#include "features/enterprise_feature_messages.h"
+#include "features/enterprise_features.h"
+#include "features/feature_table.h"
+#include "model/metadata.h"
 #include "random/generators.h"
-#include "utils/gate_guard.h"
+#include "utils/stable_iterator_adaptor.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/shared_ptr.hh>
 
 #include <chrono>
 #include <optional>
@@ -36,56 +44,57 @@ namespace cluster {
 static constexpr std::chrono::seconds controller_stm_sync_timeout = 10s;
 static constexpr std::chrono::seconds add_move_cmd_timeout = 10s;
 
-class balancer_tick_aborted_exception final : public std::runtime_error {
-public:
-    explicit balancer_tick_aborted_exception(const std::string& msg)
-      : std::runtime_error(msg) {}
-};
-
 partition_balancer_backend::partition_balancer_backend(
   consensus_ptr raft0,
   ss::sharded<controller_stm>& controller_stm,
+  ss::sharded<features::feature_table>& feature_table,
   ss::sharded<partition_balancer_state>& state,
   ss::sharded<health_monitor_backend>& health_monitor,
   ss::sharded<partition_allocator>& partition_allocator,
   ss::sharded<topics_frontend>& topics_frontend,
   ss::sharded<members_frontend>& members_frontend,
-  config::binding<model::partition_autobalancing_mode>&& mode,
   config::binding<std::chrono::seconds>&& availability_timeout,
   config::binding<unsigned>&& max_disk_usage_percent,
   config::binding<unsigned>&& storage_space_alert_free_threshold_percent,
   config::binding<std::chrono::milliseconds>&& tick_interval,
-  config::binding<size_t>&& movement_batch_size_bytes,
   config::binding<size_t>&& max_concurrent_actions,
   config::binding<double>&& moves_drop_threshold,
   config::binding<size_t>&& segment_fallocation_step,
   config::binding<std::optional<size_t>> min_partition_size_threshold,
   config::binding<std::chrono::milliseconds> node_status_interval,
-  config::binding<size_t> raft_learner_recovery_rate)
+  config::binding<size_t> raft_learner_recovery_rate,
+  config::binding<bool> topic_aware)
   : _raft0(std::move(raft0))
   , _controller_stm(controller_stm.local())
+  , _feature_table(feature_table.local())
   , _state(state.local())
   , _health_monitor(health_monitor.local())
   , _partition_allocator(partition_allocator.local())
   , _topics_frontend(topics_frontend.local())
   , _members_frontend(members_frontend.local())
-  , _mode(std::move(mode))
+  , _mode(features::make_sanctioning_binding<
+          features::license_required_feature::
+            partition_auto_balancing_continuous>())
   , _availability_timeout(std::move(availability_timeout))
   , _max_disk_usage_percent(std::move(max_disk_usage_percent))
   , _storage_space_alert_free_threshold_percent(
       std::move(storage_space_alert_free_threshold_percent))
   , _tick_interval(std::move(tick_interval))
-  , _movement_batch_size_bytes(std::move(movement_batch_size_bytes))
   , _max_concurrent_actions(std::move(max_concurrent_actions))
   , _concurrent_moves_drop_threshold(std::move(moves_drop_threshold))
   , _segment_fallocation_step(std::move(segment_fallocation_step))
   , _min_partition_size_threshold(std::move(min_partition_size_threshold))
   , _node_status_interval(std::move(node_status_interval))
   , _raft_learner_recovery_rate(std::move(raft_learner_recovery_rate))
+  , _topic_aware(std::move(topic_aware))
   , _timer([this] { tick(); }) {}
 
+bool partition_balancer_backend::is_enabled() const {
+    return is_leader() && !config::node().recovery_mode_enabled();
+}
+
 void partition_balancer_backend::start() {
-    _topic_table_updates = _state.topics().register_lw_notification(
+    _topic_table_updates = _state.topics().register_lw_ntp_notification(
       [this]() { on_topic_table_update(); });
     _member_updates = _state.members().register_members_updated_notification(
       [this](model::node_id n, model::membership_state state) {
@@ -100,10 +109,14 @@ void partition_balancer_backend::start() {
 }
 
 ss::future<std::error_code> partition_balancer_backend::request_rebalance() {
-    auto g = gate_guard(_gate);
+    auto g = _gate.hold();
 
     if (!is_leader()) {
         co_return errc::not_leader;
+    }
+
+    if (config::node().recovery_mode_enabled()) {
+        co_return errc::feature_disabled;
     }
 
     auto units = co_await _lock.get_units();
@@ -138,6 +151,9 @@ void partition_balancer_backend::maybe_rearm_timer(bool now) {
     if (_gate.is_closed()) {
         return;
     }
+    if (config::node().recovery_mode_enabled()) {
+        return;
+    }
     auto schedule_at = now ? clock_t::now() : clock_t::now() + _tick_interval();
     auto duration_ms = [](clock_t::time_point time_point) {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -162,7 +178,7 @@ void partition_balancer_backend::maybe_rearm_timer(bool now) {
 
 void partition_balancer_backend::on_members_update(
   model::node_id id, model::membership_state state) {
-    if (!is_leader()) {
+    if (!is_enabled()) {
         return;
     }
 
@@ -184,13 +200,23 @@ void partition_balancer_backend::on_members_update(
 
         maybe_rearm_timer(/*now = */ true);
     }
-    // Don't schedule tick on node addition, because the node health report
-    // won't be ready so we won't be able to do anything. Wait instead for a
-    // health monitor notification.
+    // Only schedule tick on node addition if health report is already
+    // available
+    if (
+      state == model::membership_state::active
+      && _health_monitor.contains_node_health_report(id)) {
+        vlog(
+          clusterlog.debug,
+          "node {} state notification: {}, scheduling tick as health report "
+          "for node is already present",
+          id,
+          state);
+        maybe_rearm_timer(/*now = */ true);
+    }
 }
 
 void partition_balancer_backend::on_topic_table_update() {
-    if (!is_leader()) {
+    if (!is_enabled()) {
         return;
     }
 
@@ -219,8 +245,8 @@ void partition_balancer_backend::on_topic_table_update() {
 }
 
 void partition_balancer_backend::on_health_monitor_update(
-  node_health_report const& report,
-  std::optional<std::reference_wrapper<const node_health_report>> old_report) {
+  const node_health_report& report,
+  std::optional<ss::lw_shared_ptr<const node_health_report>> old_report) {
     if (!old_report) {
         vlog(
           clusterlog.debug,
@@ -245,6 +271,22 @@ void partition_balancer_backend::tick() {
           .handle_exception_type([](balancer_tick_aborted_exception& e) {
               vlog(clusterlog.info, "tick aborted, reason: {}", e.what());
           })
+          .handle_exception_type(
+            [this](topic_table::concurrent_modification_error& e) {
+                vlog(
+                  clusterlog.debug,
+                  "concurrent modification of topics table: {}, rescheduling "
+                  "tick",
+                  e.what());
+                maybe_rearm_timer(true);
+            })
+          .handle_exception_type([this](iterator_stability_violation& e) {
+              vlog(
+                clusterlog.debug,
+                "iterator_stability_violation: {}, rescheduling tick",
+                e.what());
+              maybe_rearm_timer(true);
+          })
           .handle_exception([](const std::exception_ptr& e) {
               vlog(clusterlog.warn, "tick error: {}", e);
           });
@@ -252,7 +294,7 @@ void partition_balancer_backend::tick() {
 
 ss::future<> partition_balancer_backend::stop() {
     vlog(clusterlog.info, "stopping...");
-    _state.topics().unregister_lw_notification(_topic_table_updates);
+    _state.topics().unregister_lw_ntp_notification(_topic_table_updates);
     _state.members().unregister_members_updated_notification(_member_updates);
     _health_monitor.unregister_node_callback(_health_monitor_updates);
     _timer.cancel();
@@ -265,7 +307,7 @@ ss::future<> partition_balancer_backend::stop() {
 }
 
 ss::future<> partition_balancer_backend::do_tick() {
-    if (!_raft0->is_leader()) {
+    if (!is_enabled()) {
         vlog(clusterlog.debug, "not leader, skipping tick");
         co_return;
     }
@@ -321,24 +363,40 @@ ss::future<> partition_balancer_backend::do_tick() {
       = (100 - _storage_space_alert_free_threshold_percent()) / 100.0;
     // claim node unresponsive it doesn't responded to at least 7
     // status requests by default 700ms
-    auto const node_responsiveness_timeout = _node_status_interval() * 7;
-    auto plan_data
-      = co_await partition_balancer_planner(
-          planner_config{
-            .mode = _mode(),
-            .soft_max_disk_usage_ratio = soft_max_disk_usage_ratio,
-            .hard_max_disk_usage_ratio = hard_max_disk_usage_ratio,
-            .movement_disk_size_batch = _movement_batch_size_bytes(),
-            .max_concurrent_actions = _max_concurrent_actions(),
-            .node_availability_timeout_sec = _availability_timeout(),
-            .ondemand_rebalance_requested
-            = _cur_term->_ondemand_rebalance_requested,
-            .segment_fallocation_step = _segment_fallocation_step(),
-            .min_partition_size_threshold = get_min_partition_size_threshold(),
-            .node_responsiveness_timeout = node_responsiveness_timeout},
-          _state,
-          _partition_allocator)
-          .plan_actions(health_report.value(), _tick_in_progress.value());
+    const auto node_responsiveness_timeout = _node_status_interval() * 7;
+
+    const bool should_sanction = _feature_table.should_sanction();
+
+    const auto [mode, is_sanctioned] = _mode(should_sanction);
+    if (is_sanctioned) {
+        vlog(
+          clusterlog.warn,
+          "{}",
+          features::enterprise_error_message::
+            partition_autobalancing_continuous(),
+          _mode(false).first,
+          mode);
+    }
+
+    partition_balancer_planner planner(
+      planner_config{
+        .mode = mode,
+        .soft_max_disk_usage_ratio = soft_max_disk_usage_ratio,
+        .hard_max_disk_usage_ratio = hard_max_disk_usage_ratio,
+        .max_concurrent_actions = _max_concurrent_actions(),
+        .node_availability_timeout_sec = _availability_timeout(),
+        .ondemand_rebalance_requested
+        = _cur_term->_ondemand_rebalance_requested,
+        .segment_fallocation_step = _segment_fallocation_step(),
+        .min_partition_size_threshold = get_min_partition_size_threshold(),
+        .node_responsiveness_timeout = node_responsiveness_timeout,
+        .topic_aware = _topic_aware(),
+      },
+      _state,
+      _partition_allocator);
+
+    auto plan_data = co_await planner.plan_actions(
+      health_report.value(), _tick_in_progress.value());
 
     _cur_term->last_tick_time = clock_t::now();
     _cur_term->last_violations = std::move(plan_data.violations);
@@ -357,9 +415,7 @@ ss::future<> partition_balancer_backend::do_tick() {
         _cur_term->last_status = partition_balancer_status::in_progress;
     } else if (plan_data.status == planner_status::waiting_for_reports) {
         _cur_term->last_status = partition_balancer_status::starting;
-    } else if (
-      plan_data.failed_actions_count > 0
-      || plan_data.status == planner_status::waiting_for_maintenance_end) {
+    } else if (plan_data.failed_actions_count > 0) {
         _cur_term->last_status = partition_balancer_status::stalled;
     } else {
         _cur_term->last_status = partition_balancer_status::ready;
@@ -435,20 +491,39 @@ ss::future<> partition_balancer_backend::do_tick() {
     co_await ss::max_concurrent_for_each(
       plan_data.reassignments, 32, [this](ntp_reassignment& reassignment) {
           _tick_in_progress->check();
-          auto f = _topics_frontend.move_partition_replicas(
-            reassignment.ntp,
-            reassignment.allocated.replicas(),
-            model::timeout_clock::now() + add_move_cmd_timeout,
-            _cur_term->id);
-          return f.then([reassignment = std::move(reassignment)](auto errc) {
-              if (errc) {
-                  vlog(
-                    clusterlog.warn,
-                    "submitting {} reassignment failed, error: {}",
-                    reassignment.ntp,
-                    errc.message());
-              }
-          });
+          auto f = ss::make_ready_future<std::error_code>();
+          switch (reassignment.type) {
+          case regular:
+              f = _topics_frontend.move_partition_replicas(
+                reassignment.ntp,
+                reassignment.allocated.replicas(),
+                reassignment.reconfiguration_policy,
+                model::timeout_clock::now() + add_move_cmd_timeout,
+                _cur_term->id);
+              break;
+          case force:
+              f = _topics_frontend.force_update_partition_replicas(
+                reassignment.ntp,
+                reassignment.allocated.replicas(),
+                model::timeout_clock::now() + add_move_cmd_timeout);
+              break;
+          default:
+              vassert(
+                false,
+                "unexpected ntp reassignment type: {}",
+                reassignment.type);
+              break;
+          }
+          return std::move(f).then(
+            [reassignment = std::move(reassignment)](auto errc) {
+                if (errc) {
+                    vlog(
+                      clusterlog.warn,
+                      "submitting {} reassignment failed, error: {}",
+                      reassignment.ntp,
+                      errc.message());
+                }
+            });
       });
 
     _cur_term->last_tick_in_progress_updates = moves_before
@@ -461,7 +536,7 @@ partition_balancer_overview_reply partition_balancer_backend::overview() const {
 
     partition_balancer_overview_reply ret;
 
-    if (_mode() != model::partition_autobalancing_mode::continuous) {
+    if (config::node().recovery_mode_enabled()) {
         ret.status = partition_balancer_status::off;
         ret.error = errc::feature_disabled;
         return ret;
@@ -475,6 +550,7 @@ partition_balancer_overview_reply partition_balancer_backend::overview() const {
     if (!_cur_term || _raft0->term() != _cur_term->id) {
         // we haven't done a single tick in this term yet, return empty response
         ret.status = partition_balancer_status::starting;
+        ret.partitions_pending_force_recovery_count = -1;
         ret.error = errc::success;
         return ret;
     }
@@ -483,6 +559,24 @@ partition_balancer_overview_reply partition_balancer_backend::overview() const {
     ret.violations = _cur_term->last_violations;
     ret.decommission_realloc_failures
       = _cur_term->last_tick_decommission_realloc_failures;
+    ret.partitions_pending_force_recovery_count
+      = _state.topics().partitions_to_force_recover().size();
+    if (ret.partitions_pending_force_recovery_count > 0) {
+        constexpr size_t max_partitions_to_include = 10;
+        auto sample_size = std::min(
+          ret.partitions_pending_force_recovery_count,
+          max_partitions_to_include);
+        ret.partitions_pending_force_recovery_sample.reserve(sample_size);
+        for (const auto& [ntp, _] :
+             _state.topics().partitions_to_force_recover()) {
+            if (
+              ret.partitions_pending_force_recovery_sample.size()
+              > max_partitions_to_include) {
+                break;
+            }
+            ret.partitions_pending_force_recovery_sample.push_back(ntp);
+        }
+    }
 
     auto now = clock_t::now();
     auto time_since_last_tick = now - _cur_term->last_tick_time;

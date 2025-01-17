@@ -9,15 +9,15 @@
 
 #include "rpc/transport.h"
 
-#include "likely.h"
+#include "base/likely.h"
+#include "base/vassert.h"
+#include "base/vlog.h"
 #include "net/connection.h"
 #include "rpc/logger.h"
 #include "rpc/parse_utils.h"
 #include "rpc/response_handler.h"
 #include "rpc/types.h"
 #include "ssx/future-util.h"
-#include "vassert.h"
-#include "vlog.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
@@ -58,13 +58,17 @@ transport::transport(
   transport_configuration c,
   std::optional<connection_cache_label> label,
   std::optional<model::node_id> node_id)
-  : base_transport(base_transport::configuration{
-    .server_addr = std::move(c.server_addr),
-    .credentials = std::move(c.credentials),
-  })
+  : base_transport(
+      base_transport::configuration{
+        .server_addr = std::move(c.server_addr),
+        .credentials = std::move(c.credentials),
+      },
+      &rpclog)
   , _memory(c.max_queued_bytes, "rpc/transport-mem")
   , _version(c.version)
-  , _default_version(c.version) {
+  , _default_version(c.version)
+  , _probe(std::make_unique<client_probe>()) {
+    set_probe(_probe.get());
     if (!c.disable_metrics) {
         setup_metrics(label, node_id);
     }
@@ -110,12 +114,14 @@ transport::connect(rpc::clock_type::time_point connection_timeout) {
                 } catch (...) {
                     auto e = std::current_exception();
                     if (net::is_disconnect_exception(e)) {
-                        rpc::rpclog.info(
+                        vlog(
+                          rpc::rpclog.info,
                           "Disconnected from server {}: {}",
                           server_address(),
                           e);
                     } else {
-                        rpc::rpclog.error(
+                        vlog(
+                          rpc::rpclog.error,
                           "Error dispatching client reads to {}: {}",
                           server_address(),
                           e);
@@ -249,14 +255,10 @@ transport::do_send(sequence_t seq, netbuf b, rpc::client_opts opts) {
               [this, f = std::move(f), seq, corr](
                 ssx::semaphore_units units,
                 ss::scattered_message<char> scattered_message) mutable {
-                  auto e = entry{
-                    .scattered_message
-                    = std::make_unique<ss::scattered_message<char>>(
-                      std::move(scattered_message)),
-                    .correlation_id = corr};
+                  auto e = std::make_unique<entry>(
+                    std::move(scattered_message), corr);
+                  _requests_queue.emplace(seq, std::move(e));
 
-                  _requests_queue.emplace(
-                    seq, std::make_unique<entry>(std::move(e)));
                   // By this point the request may already have timed out but
                   // we still do dispatch_send where it is handled. This is
                   // needed for two reasons:
@@ -268,7 +270,8 @@ transport::do_send(sequence_t seq, netbuf b, rpc::client_opts opts) {
               })
             .handle_exception([this, seq, corr](std::exception_ptr eptr) {
                 // This is unlikely but may potentially mean dispatch_send()
-                // is not called, stalling the sequence number.
+                // is not called, stalling the sequence number. Shut it down
+                // because in this case it is not usable anymore.
                 vlog(
                   rpclog.error,
                   "Exception {} dispatching rpc with sequence: {}, "
@@ -277,6 +280,8 @@ transport::do_send(sequence_t seq, netbuf b, rpc::client_opts opts) {
                   seq,
                   corr,
                   _last_seq);
+                _probe->request_error();
+                fail_outstanding_futures();
                 return ss::make_exception_future<ret_t>(eptr);
             });
       });
@@ -318,7 +323,7 @@ ss::future<> transport::do_dispatch_send() {
       [this] {
           auto it = _requests_queue.begin();
           _last_seq = it->first;
-          auto v = std::move(*it->second->scattered_message);
+          auto v = std::move(it->second->scattered_message);
           auto corr = it->second->correlation_id;
           _requests_queue.erase(it);
 
@@ -363,14 +368,24 @@ ss::future<> transport::do_dispatch_send() {
 }
 
 void transport::dispatch_send() {
-    ssx::spawn_with_gate(_dispatch_gate, [this]() mutable {
-        return ssx::ignore_shutdown_exceptions(do_dispatch_send())
-          .handle_exception([this](std::exception_ptr e) {
-              vlog(rpclog.info, "Error dispatching socket write:{}", e);
-              _probe->request_error();
-              fail_outstanding_futures();
-          });
-    });
+    // Callers expect this function does not throw, so check if the gate is
+    // closed so we know that `hold()` will never throw.
+    if (_dispatch_gate.is_closed()) {
+        return;
+    }
+    auto holder = _dispatch_gate.hold();
+    ssx::background = ssx::ignore_shutdown_exceptions(do_dispatch_send())
+                        .then_wrapped(
+                          [this, h = std::move(holder)](ss::future<> fut) {
+                              if (fut.failed()) {
+                                  vlog(
+                                    rpclog.info,
+                                    "Error dispatching socket write:{}",
+                                    fut.get_exception());
+                                  _probe->request_error();
+                                  fail_outstanding_futures();
+                              }
+                          });
 }
 
 ss::future<> transport::do_reads() {
@@ -422,7 +437,28 @@ ss::future<> transport::dispatch(header h) {
 void transport::setup_metrics(
   const std::optional<connection_cache_label>& label,
   const std::optional<model::node_id>& node_id) {
-    _probe->setup_metrics(_metrics, label, node_id, server_address());
+    namespace sm = ss::metrics;
+    auto target = sm::label("target");
+    std::vector<sm::label_instance> labels = {target(
+      ssx::sformat("{}:{}", server_address().host(), server_address().port()))};
+    if (label) {
+        labels.push_back(sm::label("connection_cache_label")((*label)()));
+    }
+    std::vector<sm::label> aggregate_labels;
+    // Label the metrics for a given server with the node ID so Seastar can
+    // differentiate between them, in case multiple node IDs start at the same
+    // address (e.g. in an ungraceful decommission). Aggregate on node ID so
+    // the user is presented metrics for each server regardless of node ID.
+    if (node_id) {
+        auto node_id_label = sm::label("node_id");
+        labels.push_back(node_id_label(*node_id));
+        aggregate_labels.push_back(node_id_label);
+    }
+    _probe->setup_metrics(
+      "rpc_client",
+      labels,
+      aggregate_labels,
+      _probe->defs(labels, aggregate_labels));
 }
 
 timing_info* transport::get_timing(uint32_t correlation) {
@@ -431,7 +467,8 @@ timing_info* transport::get_timing(uint32_t correlation) {
 }
 
 transport::~transport() {
-    vlog(rpclog.debug, "RPC Client to {} probes: {}", server_address(), _probe);
+    vlog(
+      rpclog.debug, "RPC Client to {} probes: {}", server_address(), *_probe);
     vassert(
       !is_valid(),
       "connection '{}' is still valid. must call stop() before "
@@ -448,4 +485,115 @@ std::ostream& operator<<(std::ostream& o, const transport& t) {
       t._correlation_idx);
     return o;
 }
+
+std::vector<ss::metrics::metric_definition> client_probe::defs(
+  const std::vector<ss::metrics::label_instance>& labels,
+  const std::vector<ss::metrics::label>& aggregate_labels) {
+    namespace sm = ss::metrics;
+    std::vector<sm::metric_definition> ret;
+
+    ret.emplace_back(sm::make_counter(
+                       "requests",
+                       [this] { return _requests; },
+                       sm::description("Number of requests"),
+                       labels)
+                       .aggregate(aggregate_labels));
+
+    ret.emplace_back(sm::make_gauge(
+                       "requests_pending",
+                       [this] { return _requests_pending; },
+                       sm::description("Number of requests pending"),
+                       labels)
+                       .aggregate(aggregate_labels));
+
+    ret.emplace_back(sm::make_counter(
+                       "request_errors",
+                       [this] { return _request_errors; },
+                       sm::description("Number or requests errors"),
+                       labels)
+                       .aggregate(aggregate_labels));
+
+    ret.emplace_back(sm::make_counter(
+                       "request_timeouts",
+                       [this] { return _request_timeouts; },
+                       sm::description("Number or requests timeouts"),
+                       labels)
+                       .aggregate(aggregate_labels));
+
+    ret.emplace_back(
+      sm::make_total_bytes(
+        "out_bytes",
+        [this] { return _out_bytes; },
+        sm::description("Total number of bytes sent (including headers)"),
+        labels)
+        .aggregate(aggregate_labels));
+
+    ret.emplace_back(sm::make_total_bytes(
+                       "in_bytes",
+                       [this] { return _in_bytes; },
+                       sm::description("Total number of bytes received"),
+                       labels)
+                       .aggregate(aggregate_labels));
+    ret.emplace_back(
+      sm::make_counter(
+        "read_dispatch_errors",
+        [this] { return _read_dispatch_errors; },
+        sm::description("Number of errors while dispatching responses"),
+        labels)
+        .aggregate(aggregate_labels));
+
+    ret.emplace_back(
+      sm::make_counter(
+        "corrupted_headers",
+        [this] { return _corrupted_headers; },
+        sm::description("Number of responses with corrupted headers"),
+        labels)
+        .aggregate(aggregate_labels));
+
+    ret.emplace_back(
+      sm::make_counter(
+        "server_correlation_errors",
+        [this] { return _server_correlation_errors; },
+        sm::description("Number of responses with wrong correlation id"),
+        labels)
+        .aggregate(aggregate_labels));
+
+    ret.emplace_back(
+      sm::make_counter(
+        "client_correlation_errors",
+        [this] { return _client_correlation_errors; },
+        sm::description("Number of errors in client correlation id"),
+        labels)
+        .aggregate(aggregate_labels));
+
+    ret.emplace_back(
+      sm::make_counter(
+        "requests_blocked_memory",
+        [this] { return _requests_blocked_memory; },
+        sm::description("Number of requests that are blocked because"
+                        " of insufficient memory"),
+        labels)
+        .aggregate(aggregate_labels));
+
+    return ret;
+}
+
+std::ostream& operator<<(std::ostream& o, const client_probe& p) {
+    o << "{"
+      << " requests_sent: " << p._requests
+      << ", requests_pending: " << p._requests_pending
+      << ", requests_completed: " << p._requests_completed
+      << ", request_errors: " << p._request_errors
+      << ", request_timeouts: " << p._request_timeouts
+      << ", in_bytes: " << p._in_bytes << ", out_bytes: " << p._out_bytes
+      << ", connects: " << p._connects << ", connections: " << p._connections
+      << ", connection_errors: " << p._connection_errors
+      << ", read_dispatch_errors: " << p._read_dispatch_errors
+      << ", corrupted_headers: " << p._corrupted_headers
+      << ", server_correlation_errors: " << p._server_correlation_errors
+      << ", client_correlation_errors: " << p._client_correlation_errors
+      << ", requests_blocked_memory: " << p._requests_blocked_memory << " }";
+    return o;
+}
+
 } // namespace rpc

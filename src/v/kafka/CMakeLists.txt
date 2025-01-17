@@ -1,4 +1,5 @@
 add_subdirectory(protocol)
+add_subdirectory(data)
 
 set(handlers_srcs
   server/handlers/api_versions.cc
@@ -20,12 +21,14 @@ set(handlers_srcs
   server/handlers/alter_partition_reassignments.cc
   server/handlers/list_partition_reassignments.cc
   server/handlers/handler_interface.cc
+  server/handlers/configs/config_response_utils.cc
   server/handlers/topics/types.cc
   server/handlers/topics/topic_utils.cc
   server/handlers/delete_records.cc
   server/handlers/describe_producers.cc
   server/handlers/describe_transactions.cc
   server/handlers/handler_probe.cc
+  server/handlers/client_quotas.cc
 )
 
 v_cc_library(
@@ -45,26 +48,33 @@ v_cc_library(
     server/server.cc
     server/protocol_utils.cc
     server/quota_manager.cc
+    server/client_quota_translator.cc
     server/snc_quota_manager.cc
+    server/fetch_pid_controller.cc
     server/fetch_session_cache.cc
-    server/replicated_partition.cc
-    server/partition_proxy.cc
     server/group_recovery_consumer.cc
     server/group_metadata.cc
+    server/group_tx_tracker_stm.cc
+    server/logger.cc
+    server/app.cc
  DEPS
     Seastar::seastar
     v::bytes
     v::rpc
     v::cluster
+    v::kafka_partition_proxy
     v::kafka_protocol
     v::security
+    v::security_audit
     v::pandaproxy_schema_registry
+    v::kafka_client
     absl::flat_hash_map
     absl::flat_hash_set
 )
 
 add_subdirectory(client)
 add_subdirectory(server/tests)
+add_subdirectory(utils)
 
 set_source_files_properties(
     server/group.cc # too big => negative impact on minimal rebuilds for unity

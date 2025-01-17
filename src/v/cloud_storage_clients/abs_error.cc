@@ -10,7 +10,7 @@
 
 #include "cloud_storage_clients/abs_error.h"
 
-#include "utils/string_switch.h"
+#include "strings/string_switch.h"
 
 #include <boost/lexical_cast.hpp>
 
@@ -32,7 +32,6 @@ std::istream& operator>>(std::istream& i, abs_error_code& code) {
           .match("InternalError", abs_error_code::internal_error)
           .match("OperationTimedOut", abs_error_code::operation_timed_out)
           .match("SystemInUse", abs_error_code::system_in_use)
-          .match("BlobNotFound", abs_error_code::blob_not_found)
           .match("AccountBeingCreated", abs_error_code::account_being_created)
           .match(
             "ResourceAlreadyExists", abs_error_code::resource_already_exists)
@@ -45,6 +44,11 @@ std::istream& operator>>(std::istream& i, abs_error_code& code) {
           .match(
             "ContainerBeingDeleted", abs_error_code::container_being_deleted)
           .match("ContainerNotFound", abs_error_code::container_not_found)
+          .match("DirectoryNotEmpty", abs_error_code::directory_not_empty)
+          .match("PathNotFound", abs_error_code::path_not_found)
+          .match(
+            "OperationNotSupportedOnDirectory",
+            abs_error_code::operation_not_supported_on_directory)
           .default_match(abs_error_code::_unknown);
 
     return i;

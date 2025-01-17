@@ -10,6 +10,7 @@
 
 #include "cluster/config_frontend.h"
 #include "cluster/types.h"
+#include "config/configuration.h"
 #include "config/node_config.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/incremental_alter_configs.h"
@@ -19,10 +20,10 @@
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/request_context.h"
 #include "kafka/server/response.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "utils/string_switch.h"
+#include "storage/ntp_config.h"
+#include "strings/string_switch.h"
 
 #include <seastar/core/do_with.hh>
 #include <seastar/core/smp.hh>
@@ -37,10 +38,11 @@ namespace kafka {
 using req_resource_t = incremental_alter_configs_resource;
 using resp_resource_t = incremental_alter_configs_resource_response;
 
-/**
- * We pass returned value as a paramter to allow template to be automatically
- * resolved.
- */
+// Legacy function, bug prone for multiple property updates, i.e
+// alter-config --set redpanda.remote.read=true --set
+// redpanda.remote.write=false.
+// Used if feature flag shadow_indexing_split_topic_property_update (v24.3) is
+// not active.
 static void parse_and_set_shadow_indexing_mode(
   cluster::property_update<std::optional<model::shadow_indexing_mode>>& simode,
   const std::optional<ss::sstring>& value,
@@ -123,13 +125,21 @@ bool valid_config_resource_operation(uint8_t v) {
 
 checked<cluster::topic_properties_update, resp_resource_t>
 create_topic_properties_update(
-  request_context&, incremental_alter_configs_resource& resource) {
+  const request_context& ctx, incremental_alter_configs_resource& resource) {
     model::topic_namespace tp_ns(
       model::kafka_namespace, model::topic(resource.resource_name));
     cluster::topic_properties_update update(tp_ns);
 
     schema_id_validation_config_parser schema_id_validation_config_parser{
       update.properties};
+
+    /*
+      As of v24.3, a new update path for shadow indexing properties should be
+      used.
+    */
+    const auto shadow_indexing_split_update
+      = ctx.feature_table().local().is_active(
+        features::feature::shadow_indexing_split_topic_property_update);
 
     for (auto& cfg : resource.configs) {
         // Validate int8_t is within range of config_resource_operation
@@ -189,14 +199,6 @@ create_topic_properties_update(
                   update.properties.retention_duration, cfg.value, op);
                 continue;
             }
-            if (cfg.name == topic_property_remote_write) {
-                parse_and_set_shadow_indexing_mode(
-                  update.properties.shadow_indexing,
-                  cfg.value,
-                  op,
-                  model::shadow_indexing_mode::archival);
-                continue;
-            }
             if (cfg.name == topic_property_retention_local_target_bytes) {
                 parse_and_set_tristate(
                   update.properties.retention_local_target_bytes,
@@ -210,20 +212,53 @@ create_topic_properties_update(
                 continue;
             }
             if (cfg.name == topic_property_remote_read) {
-                parse_and_set_shadow_indexing_mode(
-                  update.properties.shadow_indexing,
-                  cfg.value,
-                  op,
-                  model::shadow_indexing_mode::fetch);
+                if (shadow_indexing_split_update) {
+                    parse_and_set_bool(
+                      tp_ns,
+                      update.properties.remote_read,
+                      cfg.value,
+                      op,
+                      config::shard_local_cfg()
+                        .cloud_storage_enable_remote_read());
+                } else {
+                    // Legacy update for shadow indexing field
+                    parse_and_set_shadow_indexing_mode(
+                      update.properties.get_shadow_indexing(),
+                      cfg.value,
+                      op,
+                      model::shadow_indexing_mode::fetch);
+                }
+
+                continue;
+            }
+            if (cfg.name == topic_property_remote_write) {
+                if (shadow_indexing_split_update) {
+                    parse_and_set_bool(
+                      tp_ns,
+                      update.properties.remote_write,
+                      cfg.value,
+                      op,
+                      config::shard_local_cfg()
+                        .cloud_storage_enable_remote_write());
+                } else {
+                    // Legacy update for shadow indexing field
+                    parse_and_set_shadow_indexing_mode(
+                      update.properties.get_shadow_indexing(),
+                      cfg.value,
+                      op,
+                      model::shadow_indexing_mode::archival);
+                }
+
                 continue;
             }
             if (cfg.name == topic_property_remote_delete) {
                 parse_and_set_bool(
+                  tp_ns,
                   update.properties.remote_delete,
                   cfg.value,
                   op,
                   // Topic deletion is enabled by default
-                  true);
+                  storage::ntp_config::default_remote_delete);
                 continue;
             }
             if (cfg.name == topic_property_max_message_bytes) {
@@ -233,12 +268,31 @@ create_topic_properties_update(
             }
             if (cfg.name == topic_property_replication_factor) {
                 parse_and_set_topic_replication_factor(
-                  update.custom_properties.replication_factor, cfg.value, op);
+                  tp_ns,
+                  update.custom_properties.replication_factor,
+                  cfg.value,
+                  op,
+                  replication_factor_validator{});
                 continue;
             }
             if (cfg.name == topic_property_segment_ms) {
                 parse_and_set_tristate(
                   update.properties.segment_ms, cfg.value, op);
+                continue;
+            }
+            if (
+              cfg.name == topic_property_initial_retention_local_target_bytes) {
+                parse_and_set_tristate(
+                  update.properties.initial_retention_local_target_bytes,
+                  cfg.value,
+                  op);
+                continue;
+            }
+            if (cfg.name == topic_property_initial_retention_local_target_ms) {
+                parse_and_set_tristate(
+                  update.properties.initial_retention_local_target_ms,
+                  cfg.value,
+                  op);
                 continue;
             }
             if (
@@ -257,12 +311,85 @@ create_topic_properties_update(
                 // Skip unsupported Kafka config
                 continue;
             }
+            if (cfg.name == topic_property_write_caching) {
+                parse_and_set_optional(
+                  update.properties.write_caching,
+                  cfg.value,
+                  op,
+                  write_caching_config_validator{});
+                continue;
+            }
+            if (cfg.name == topic_property_flush_ms) {
+                parse_and_set_optional_duration(
+                  update.properties.flush_ms,
+                  cfg.value,
+                  op,
+                  flush_ms_validator{});
+                continue;
+            }
+            if (cfg.name == topic_property_flush_bytes) {
+                parse_and_set_optional(
+                  update.properties.flush_bytes,
+                  cfg.value,
+                  op,
+                  flush_bytes_validator{});
+                continue;
+            }
+            if (cfg.name == topic_property_iceberg_mode) {
+                parse_and_set_property(
+                  tp_ns,
+                  update.properties.iceberg_mode,
+                  cfg.value,
+                  op,
+                  iceberg_config_validator{});
+                continue;
+            }
+            if (cfg.name == topic_property_leaders_preference) {
+                parse_and_set_optional(
+                  update.properties.leaders_preference,
+                  cfg.value,
+                  op,
+                  noop_validator<config::leaders_preference>{},
+                  config::leaders_preference::parse);
+                continue;
+            }
+            if (cfg.name == topic_property_cloud_topic_enabled) {
+                if (config::shard_local_cfg()
+                      .development_enable_cloud_topics()) {
+                    throw validation_error(
+                      "Cloud topics property cannot be changed");
+                }
+                throw validation_error("Cloud topics is not enabled");
+            }
+            if (cfg.name == topic_property_delete_retention_ms) {
+                parse_and_set_tristate(
+                  update.properties.delete_retention_ms,
+                  cfg.value,
+                  op,
+                  delete_retention_ms_validator{});
+                continue;
+            }
+            if (cfg.name == topic_property_iceberg_delete) {
+                parse_and_set_optional_bool_alpha(
+                  update.properties.iceberg_delete, cfg.value, op);
+                continue;
+            }
 
         } catch (const validation_error& e) {
+            vlog(
+              klog.debug,
+              "Validation error during request: {} for config: {}",
+              e.what(),
+              cfg.name);
             return make_error_alter_config_resource_response<
               incremental_alter_configs_resource_response>(
               resource, error_code::invalid_config, e.what());
         } catch (const boost::bad_lexical_cast& e) {
+            vlog(
+              klog.debug,
+              "Parsing error during request: {} for config: {}",
+              e.what(),
+              cfg.name);
             return make_error_alter_config_resource_response<
               incremental_alter_configs_resource_response>(
               resource,
@@ -270,6 +397,7 @@ create_topic_properties_update(
               fmt::format(
                 "unable to parse property {} value {}", cfg.name, cfg.value));
         }
+        vlog(klog.debug, "Unsupported property: {}", cfg.name);
         // Unsupported property, return error
         return make_error_alter_config_resource_response<resp_resource_t>(
           resource,
@@ -280,9 +408,9 @@ create_topic_properties_update(
     return update;
 }
 
-static ss::future<std::vector<resp_resource_t>> alter_topic_configuration(
+static ss::future<chunked_vector<resp_resource_t>> alter_topic_configuration(
   request_context& ctx,
-  std::vector<req_resource_t> resources,
+  chunked_vector<req_resource_t> resources,
   bool validate_only) {
     return do_alter_topics_configuration<req_resource_t, resp_resource_t>(
       ctx, std::move(resources), validate_only, [&ctx](req_resource_t& r) {
@@ -301,12 +429,13 @@ inline std::string_view map_config_name(std::string_view input) {
       .match("log.message.timestamp.type", "log_message_timestamp_type")
       .match("log.compression.type", "log_compression_type")
       .match("log.roll.ms", "log_segment_ms")
+      .match("log.cleaner.delete.retention.ms", "tombstone_retention_ms")
       .default_match(input);
 }
 
-static ss::future<std::vector<resp_resource_t>> alter_broker_configuartion(
-  request_context& ctx, std::vector<req_resource_t> resources) {
-    std::vector<resp_resource_t> responses;
+static ss::future<chunked_vector<resp_resource_t>> alter_broker_configuration(
+  request_context& ctx, chunked_vector<req_resource_t> resources) {
+    chunked_vector<resp_resource_t> responses;
     responses.reserve(resources.size());
     for (const auto& resource : resources) {
         cluster::config_update_request req;
@@ -322,6 +451,15 @@ static ss::future<std::vector<resp_resource_t>> alter_broker_configuartion(
 
         bool errored = false;
         for (const auto& c : resource.configs) {
+            // mapping looks sane for kafka's properties
+            //   compression.type=producer sensitive=false
+            //   synonyms={DEFAULT_CONFIG:log_compression_type=producer}
+            // (configuration.cc doesn't know `compression.type` but known
+            // `log_compression_type`) but for redpanda's properties it returns
+            //   redpanda.remote.read=false sensitive=false
+            //   synonyms={DEFAULT_CONFIG:redpanda.remote.read=false}
+            // which looks wrong because configuration.cc doesn't know
+            // `redpanda.remote.read`
             auto mapped_name = map_config_name(c.name);
 
             // Validate int8_t is within range of config_resource_operation
@@ -398,18 +536,22 @@ static ss::future<std::vector<resp_resource_t>> alter_broker_configuartion(
             continue;
         }
 
+        req_resource_t resource_c{
+          .resource_type = resource.resource_type,
+          .resource_name = resource.resource_name,
+          .configs = resource.configs.copy(),
+          .unknown_tags = resource.unknown_tags,
+        };
+
         auto resp
           = co_await ctx.config_frontend()
-              .invoke_on(
-                cluster::config_frontend::version_shard,
-                [req = std::move(req)](cluster::config_frontend& fe) mutable {
-                    return fe.patch(
-                      std::move(req),
-                      model::timeout_clock::now()
-                        + config::shard_local_cfg()
-                            .alter_topic_cfg_timeout_ms());
-                })
-              .then([resource](cluster::config_frontend::patch_result pr) {
+              .local()
+              .patch(
+                std::move(req),
+                model::timeout_clock::now()
+                  + config::shard_local_cfg().alter_topic_cfg_timeout_ms())
+              .then([resource = std::move(resource_c)](
+                      cluster::config_frontend::patch_result pr) {
                   std::error_code& ec = pr.errc;
                   error_code kec = error_code::none;
 
@@ -446,12 +588,23 @@ ss::future<response_ptr> incremental_alter_configs_handler::handle(
       incremental_alter_configs_resource,
       resp_resource_t>(ctx, groupped);
 
-    std::vector<ss::future<std::vector<resp_resource_t>>> futures;
+    if (!ctx.audit()) {
+        auto responses = make_audit_failure_response<
+          resp_resource_t,
+          incremental_alter_configs_resource>(
+          std::move(groupped), std::move(unauthorized_responsens));
+
+        co_return co_await ctx.respond(assemble_alter_config_response<
+                                       incremental_alter_configs_response,
+                                       resp_resource_t>(std::move(responses)));
+    }
+
+    std::vector<ss::future<chunked_vector<resp_resource_t>>> futures;
     futures.reserve(2);
     futures.push_back(alter_topic_configuration(
       ctx, std::move(groupped.topic_changes), request.data.validate_only));
     futures.push_back(
-      alter_broker_configuartion(ctx, std::move(groupped.broker_changes)));
+      alter_broker_configuration(ctx, std::move(groupped.broker_changes)));
 
     auto ret = co_await ss::when_all_succeed(futures.begin(), futures.end());
     // include authorization errors

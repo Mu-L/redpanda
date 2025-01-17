@@ -11,12 +11,13 @@
 
 #pragma once
 
-#include "likely.h"
+#include "base/likely.h"
+#include "base/seastarx.h"
+#include "container/fragmented_vector.h"
 #include "model/record.h"
 #include "model/timeout_clock.h"
-#include "seastarx.h"
-#include "utils/fragmented_vector.h"
 
+#include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future.hh>
@@ -52,6 +53,8 @@ public:
     };
     using storage_t = std::variant<data_t, foreign_data_t>;
 
+    struct private_flags;
+
     class impl {
     public:
         impl() noexcept = default;
@@ -61,12 +64,16 @@ public:
         impl& operator=(const impl& o) = delete;
         virtual ~impl() noexcept = default;
 
+        using private_flags = record_batch_reader::private_flags;
+
         virtual bool is_end_of_stream() const = 0;
 
         virtual ss::future<storage_t>
           do_load_slice(timeout_clock::time_point) = 0;
 
         virtual void print(std::ostream&) = 0;
+
+        virtual std::optional<private_flags> get_flags() const { return {}; }
 
         bool is_slice_empty() const {
             return ss::visit(
@@ -96,6 +103,12 @@ public:
               std::move(consumer), [this, timeout](Consumer& consumer) {
                   return do_consume(consumer, timeout);
               });
+        }
+        template<typename ReferenceConsumer>
+        auto peek_each_ref(ReferenceConsumer c, timeout_clock::time_point tm) {
+            return ss::do_with(std::move(c), [this, tm](ReferenceConsumer& c) {
+                return do_peek_each_ref(c, tm);
+            });
         }
 
     private:
@@ -139,6 +152,31 @@ public:
         auto do_consume(Consumer& consumer, timeout_clock::time_point timeout) {
             return do_action(consumer, timeout, [this](Consumer& c) {
                 return c(pop_batch());
+            });
+        }
+        template<typename ReferenceConsumer>
+        auto do_peek_each_ref(
+          ReferenceConsumer& refc, timeout_clock::time_point timeout) {
+            return do_action(refc, timeout, [this](ReferenceConsumer& c) {
+                return ss::visit(
+                  _slice,
+                  [&c](data_t& d) {
+                      return c(d.front()).then([&](ss::stop_iteration stop) {
+                          if (!stop) {
+                              d.pop_front();
+                          }
+                          return stop;
+                      });
+                  },
+                  [&c](foreign_data_t& d) {
+                      return c((*d.buffer)[d.index])
+                        .then([&](ss::stop_iteration stop) {
+                            if (!stop) {
+                                ++d.index;
+                            }
+                            return stop;
+                        });
+                  });
             });
         }
         template<typename ConsumerType, typename ActionFn>
@@ -248,7 +286,30 @@ public:
           });
     }
 
+    /// Similar to for_each_ref, but advances only if the consumer returns
+    /// ss::stop_iteration::no. I.e. the batch where the consumer stopped
+    /// remains available for reading by subsequent consumers.
+    template<typename ReferenceConsumer>
+    requires ReferenceBatchReaderConsumer<ReferenceConsumer>
+    auto peek_each_ref(
+      ReferenceConsumer consumer, timeout_clock::time_point timeout) & {
+        return _impl->peek_each_ref(std::move(consumer), timeout);
+    }
+
     std::unique_ptr<impl> release() && { return std::move(_impl); }
+
+    // record batch readers may expose these private flags for testing
+    // purposes
+    struct private_flags {
+        // if the reader is reusable, i.e., would it be eligible for caching
+        // note that if the reader wasn't obtained through the cache, this can
+        // still return true even though the reader will ultimately not be
+        // cached
+        bool is_reusable : 1;
+        // True iff this reader was obtained via a cache hit from the readers
+        // cache.
+        bool was_cached : 1;
+    };
 
 private:
     std::unique_ptr<impl> _impl;
@@ -259,6 +320,13 @@ private:
 
     friend std::ostream&
     operator<<(std::ostream& os, const record_batch_reader& r);
+
+    std::optional<private_flags> get_flags() const {
+        return _impl->get_flags();
+    }
+
+    // get at our guts in a test
+    friend struct record_batch_reader_accessor;
 };
 
 template<typename Impl, typename... Args>
@@ -272,6 +340,9 @@ record_batch_reader
 
 record_batch_reader make_fragmented_memory_record_batch_reader(
   fragmented_vector<model::record_batch>);
+
+record_batch_reader make_fragmented_memory_record_batch_reader(
+  chunked_vector<model::record_batch>);
 
 inline record_batch_reader
 make_memory_record_batch_reader(model::record_batch b) {
@@ -317,6 +388,15 @@ record_batch_reader
 record_batch_reader make_foreign_fragmented_memory_record_batch_reader(
   fragmented_vector<model::record_batch>);
 
+record_batch_reader make_foreign_fragmented_memory_record_batch_reader(
+  chunked_vector<model::record_batch>);
+
+record_batch_reader make_foreign_fragmented_memory_record_batch_reader(
+  ss::chunked_fifo<model::record_batch>);
+
+record_batch_reader make_fragmented_memory_record_batch_reader(
+  ss::chunked_fifo<model::record_batch>);
+
 record_batch_reader make_generating_record_batch_reader(
   ss::noncopyable_function<ss::future<record_batch_reader::data_t>()>);
 
@@ -327,7 +407,13 @@ ss::future<fragmented_vector<model::record_batch>>
 consume_reader_to_fragmented_memory(
   record_batch_reader, timeout_clock::time_point timeout);
 
+ss::future<chunked_vector<model::record_batch>>
+consume_reader_to_chunked_vector(
+  record_batch_reader reader, timeout_clock::time_point timeout);
+
 /// \brief wraps a reader into a foreign_ptr<unique_ptr>
 record_batch_reader make_foreign_record_batch_reader(record_batch_reader&&);
+
+record_batch_reader make_empty_record_batch_reader();
 
 } // namespace model

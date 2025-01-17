@@ -9,16 +9,22 @@
 
 #include "cluster/partition_probe.h"
 
+#include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/partition.h"
 #include "config/configuration.h"
+#include "metrics/metrics.h"
+#include "metrics/prometheus_sanitize.h"
 #include "model/metadata.h"
 #include "pandaproxy/schema_registry/schema_id_validation.h"
-#include "prometheus/prometheus_sanitize.h"
-#include "ssx/metrics.h"
 
 #include <seastar/core/metrics.hh>
 
 namespace cluster {
+
+static const ss::sstring cluster_metrics_name
+  = prometheus_sanitize::metrics_name("cluster:partition");
+
+static constexpr int64_t follower_iceberg_lag_metric = 0;
 
 replicated_partition_probe::replicated_partition_probe(
   const partition& p) noexcept
@@ -28,14 +34,28 @@ replicated_partition_probe::replicated_partition_probe(
 }
 
 void replicated_partition_probe::reconfigure_metrics() {
+    clear_metrics();
+    setup_metrics(_partition.ntp());
+}
+
+void replicated_partition_probe::clear_metrics() {
     _metrics.clear();
     _public_metrics.clear();
-    setup_metrics(_partition.ntp());
 }
 
 void replicated_partition_probe::setup_metrics(const model::ntp& ntp) {
     setup_internal_metrics(ntp);
     setup_public_metrics(ntp);
+}
+
+int64_t replicated_partition_probe::iceberg_translation_offset_lag() const {
+    return _partition.is_leader() ? _iceberg_translation_offset_lag
+                                  : follower_iceberg_lag_metric;
+}
+
+int64_t replicated_partition_probe::iceberg_commit_offset_lag() const {
+    return _partition.is_leader() ? _iceberg_commit_offset_lag
+                                  : follower_iceberg_lag_metric;
 }
 
 void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
@@ -48,9 +68,6 @@ void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
     auto ns_label = sm::label("namespace");
     auto topic_label = sm::label("topic");
     auto partition_label = sm::label("partition");
-    auto aggregate_labels = config::shard_local_cfg().aggregate_metrics()
-                              ? std::vector<sm::label>{sm::shard_label}
-                              : std::vector<sm::label>{};
 
     const std::vector<sm::label_instance> labels = {
       ns_label(ntp.ns()),
@@ -58,90 +75,94 @@ void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
       partition_label(ntp.tp.partition()),
     };
 
+    // The following few metrics uses a separate add_group call which doesn't
+    // aggregate any labels since aggregation does not make sense for "leader
+    // ID" values.
     _metrics.add_group(
-      prometheus_sanitize::metrics_name("cluster:partition"),
+      cluster_metrics_name,
+      {sm::make_gauge(
+         "leader_id",
+         [this] {
+             return _partition.raft()->get_leader_id().value_or(
+               model::node_id(-1));
+         },
+         sm::description("Id of current partition leader"),
+         labels),
+       sm::make_gauge(
+         "under_replicated_replicas",
+         [this] {
+             return _partition.raft()->get_under_replicated().value_or(0);
+         },
+         sm::description("Number of under replicated replicas"),
+         labels)},
+      {},
+      {sm::shard_label});
+
+    _metrics.add_group(
+      cluster_metrics_name,
       {
         sm::make_gauge(
           "leader",
           [this] { return _partition.is_elected_leader() ? 1 : 0; },
           sm::description(
             "Flag indicating if this partition instance is a leader"),
-          labels)
-          .aggregate(aggregate_labels),
+          labels),
         sm::make_gauge(
           "start_offset",
           [this] { return _partition.raft_start_offset(); },
           sm::description("start offset"),
-          labels)
-          .aggregate(aggregate_labels),
+          labels),
         sm::make_gauge(
           "last_stable_offset",
           [this] { return _partition.last_stable_offset(); },
           sm::description("Last stable offset"),
-          labels)
-          .aggregate(aggregate_labels),
+          labels),
         sm::make_gauge(
           "committed_offset",
           [this] { return _partition.committed_offset(); },
           sm::description("Partition commited offset. i.e. safely persisted on "
                           "majority of replicas"),
-          labels)
-          .aggregate(aggregate_labels),
+          labels),
         sm::make_gauge(
           "end_offset",
           [this] { return _partition.dirty_offset(); },
           sm::description(
             "Last offset stored by current partition on this node"),
-          labels)
-          .aggregate(aggregate_labels),
+          labels),
         sm::make_gauge(
           "high_watermark",
           [this] { return _partition.high_watermark(); },
           sm::description(
             "Partion high watermark i.e. highest consumable offset"),
-          labels)
-          .aggregate(aggregate_labels),
-        sm::make_gauge(
-          "leader_id",
-          [this] {
-              return _partition.raft()->get_leader_id().value_or(
-                model::node_id(-1));
-          },
-          sm::description("Id of current partition leader"),
-          labels)
-          .aggregate(aggregate_labels),
-        sm::make_gauge(
-          "under_replicated_replicas",
-          [this] {
-              return _partition.raft()->get_under_replicated().value_or(0);
-          },
-          sm::description("Number of under replicated replicas"),
-          labels)
-          .aggregate(aggregate_labels),
+          labels),
         sm::make_counter(
           "records_produced",
           [this] { return _records_produced; },
           sm::description("Total number of records produced"),
-          labels)
-          .aggregate(aggregate_labels),
+          labels),
         sm::make_counter(
           "records_fetched",
           [this] { return _records_fetched; },
           sm::description("Total number of records fetched"),
-          labels)
-          .aggregate(aggregate_labels),
+          labels),
         sm::make_total_bytes(
           "bytes_produced_total",
           [this] { return _bytes_produced; },
           sm::description("Total number of bytes produced"),
-          labels)
-          .aggregate(aggregate_labels),
+          labels),
         sm::make_total_bytes(
           "bytes_fetched_total",
           [this] { return _bytes_fetched; },
-          sm::description("Total number of bytes fetched"),
-          labels)
-          .aggregate(aggregate_labels),
+          sm::description("Total number of bytes fetched (not all might be "
+                          "returned to the client)"),
+          labels),
+        sm::make_total_bytes(
+          "bytes_fetched_from_follower_total",
+          [this] { return _bytes_fetched_from_follower; },
+          sm::description(
+            "Total number of bytes fetched from follower (not all might be "
+            "returned to the client)"),
+          labels),
         sm::make_total_bytes(
           "cloud_storage_segments_metadata_bytes",
           [this] {
@@ -153,15 +174,57 @@ void replicated_partition_probe::setup_internal_metrics(const model::ntp& ntp) {
           },
           sm::description("Current number of bytes consumed by remote segments "
                           "managed for this partition"),
-          labels)
-          .aggregate(aggregate_labels),
-      });
+          labels),
+      },
+      {},
+      {sm::shard_label, partition_label});
+
+    if (model::is_user_topic(_partition.ntp())) {
+        // Metrics are reported as follows
+        // -2 (default initialized state)
+        // -1 (iceberg disabled state)
+        //  0 (iceberg enabled but follower replicas)
+        // <actual lag> leader replicas
+        _metrics.add_group(
+          cluster_metrics_name,
+          {
+            sm::make_gauge(
+              "iceberg_offsets_pending_translation",
+              [this] {
+                  return _partition.log()->config().iceberg_enabled()
+                           ? iceberg_translation_offset_lag()
+                           : metric_feature_disabled_state;
+              },
+              sm::description(
+                "Total number of offsets that are pending "
+                "translation to iceberg. Lag is reported only on leader "
+                "replicas while followers report 0. -1 is reported if iceberg "
+                "is disabled while -2 indicates the lag is "
+                "not yet computed."),
+              labels),
+            sm::make_gauge(
+              "iceberg_offsets_pending_commit",
+              [this] {
+                  return _partition.log()->config().iceberg_enabled()
+                           ? iceberg_commit_offset_lag()
+                           : metric_feature_disabled_state;
+              },
+              sm::description(
+                "Total number of offsets that are pending "
+                "commit to iceberg catalog.  Lag is reported only on leader "
+                "while followers report 0. -1 is reported if iceberg is "
+                "disabled while -2 indicates the lag is not yet computed."),
+              labels),
+          },
+          {},
+          {sm::shard_label, partition_label});
+    }
 
     if (
       config::shard_local_cfg().enable_schema_id_validation()
       != pandaproxy::schema_registry::schema_id_validation_mode::none) {
         _metrics.add_group(
-          prometheus_sanitize::metrics_name("cluster:partition"),
+          cluster_metrics_name,
           {
             sm::make_counter(
               "schema_id_validation_records_failed",
@@ -181,10 +244,10 @@ void replicated_partition_probe::setup_public_metrics(const model::ntp& ntp) {
         return;
     }
 
-    auto request_label = ssx::metrics::make_namespaced_label("request");
-    auto ns_label = ssx::metrics::make_namespaced_label("namespace");
-    auto topic_label = ssx::metrics::make_namespaced_label("topic");
-    auto partition_label = ssx::metrics::make_namespaced_label("partition");
+    auto request_label = metrics::make_namespaced_label("request");
+    auto ns_label = metrics::make_namespaced_label("namespace");
+    auto topic_label = metrics::make_namespaced_label("topic");
+    auto partition_label = metrics::make_namespaced_label("partition");
 
     const std::vector<sm::label_instance> labels = {
       ns_label(ntp.ns()),
@@ -199,12 +262,19 @@ void replicated_partition_probe::setup_public_metrics(const model::ntp& ntp) {
         sm::make_gauge(
           "max_offset",
           [this] {
+              // TODO: merge code with replicated_partition.h?
+              if (_partition.is_read_replica_mode_enabled()) {
+                  if (_partition.cloud_data_available()) {
+                      return _partition.next_cloud_offset();
+                  }
+                  // This is a read replica and there's no data in the cloud.
+                  return model::offset(0);
+              }
               auto log_offset = _partition.high_watermark();
-              auto translator = _partition.get_offset_translator_state();
 
               try {
-                  return translator->from_log_offset(log_offset);
-              } catch (std::runtime_error& e) {
+                  return _partition.log()->from_log_offset(log_offset);
+              } catch (const std::runtime_error& e) {
                   // Offset translation will throw if nothing was committed
                   // to the partition or if the offset is outside the
                   // translation range for any other reason.
@@ -243,7 +313,8 @@ void replicated_partition_probe::setup_public_metrics(const model::ntp& ntp) {
         sm::make_total_bytes(
           "request_bytes_total",
           [this] { return _bytes_fetched; },
-          sm::description("Total number of bytes consumed per topic"),
+          sm::description("Total number of bytes fetched (not all "
+                          "might be returned to the client)"),
           {request_label("consume"),
            ns_label(ntp.ns()),
            topic_label(ntp.tp.topic()),
@@ -261,12 +332,23 @@ void replicated_partition_probe::setup_public_metrics(const model::ntp& ntp) {
           sm::description("Total number of records fetched"),
           labels)
           .aggregate({sm::shard_label, partition_label}),
+        sm::make_counter(
+          "request_bytes_total",
+          [this] { return _bytes_fetched_from_follower; },
+          sm::description(
+            "Total number of bytes fetched from follower (not all "
+            "might be returned to the client)"),
+          {request_label("follower_consume"),
+           ns_label(ntp.ns()),
+           topic_label(ntp.tp.topic()),
+           partition_label(ntp.tp.partition())})
+          .aggregate({sm::shard_label, partition_label}),
       });
     if (
       config::shard_local_cfg().enable_schema_id_validation()
       != pandaproxy::schema_registry::schema_id_validation_mode::none) {
         _public_metrics.add_group(
-          prometheus_sanitize::metrics_name("cluster:partition"),
+          cluster_metrics_name,
           {
             sm::make_counter(
               "schema_id_validation_records_failed",
@@ -277,6 +359,142 @@ void replicated_partition_probe::setup_public_metrics(const model::ntp& ntp) {
               .aggregate({sm::shard_label, partition_label}),
           });
     }
+
+    setup_public_scrubber_metric(ntp);
+}
+
+void replicated_partition_probe::setup_public_scrubber_metric(
+  const model::ntp& ntp) {
+    namespace sm = ss::metrics;
+
+    // No point in setting up the scrubber metrics if there's no
+    // archival metadata STM to pull values from.
+    if (!_partition.archival_meta_stm()) {
+        return;
+    }
+
+    auto ns_label = metrics::make_namespaced_label("namespace");
+    auto topic_label = metrics::make_namespaced_label("topic");
+    auto partition_label = metrics::make_namespaced_label("partition");
+
+    const std::vector<sm::label_instance> common_labels{
+      ns_label(ntp.ns()),
+      topic_label(ntp.tp.topic()),
+      partition_label(ntp.tp.partition()),
+    };
+
+    auto anomaly_type_label = metrics::make_namespaced_label("type");
+    auto severity_type_label = metrics::make_namespaced_label("severity");
+
+    auto generate = [&, this](
+                      ss::sstring name,
+                      ss::sstring description,
+                      ss::sstring severity,
+                      auto extractor) -> ss::metrics::metric_definition {
+        auto labels = common_labels;
+        labels.push_back(anomaly_type_label(std::move(name)));
+        labels.push_back(severity_type_label(std::move(severity)));
+
+        return sm::make_gauge(
+                 "anomalies",
+                 [this, extractor = std::move(extractor)] {
+                     if (
+                       !_partition.is_elected_leader()
+                       || !_partition.archival_meta_stm()) {
+                         return size_t{0};
+                     }
+
+                     const auto& anomalies = _partition.archival_meta_stm()
+                                               ->manifest()
+                                               .detected_anomalies();
+
+                     return extractor(anomalies);
+                 },
+                 sm::description(std::move(description)),
+                 labels)
+          .aggregate({sm::shard_label, partition_label});
+    };
+
+    _public_metrics.add_group(
+      prometheus_sanitize::metrics_name("cloud_storage"),
+      {
+        generate(
+          "missing_partition_manifest",
+          "Count of missing partition manifest anomalies for the topic",
+          "high",
+          [](const cloud_storage::anomalies& anomalies) {
+              return anomalies.missing_partition_manifest ? size_t{1}
+                                                          : size_t{0};
+          }),
+        generate(
+          "missing_segments",
+          "Count of segments referenced by metadata which are not present in "
+          "cloud storage",
+          "high",
+          [](const cloud_storage::anomalies& anomalies) {
+              return anomalies.missing_segments.size();
+          }),
+        generate(
+          "missing_spillover_manifests",
+          "Count of spillover manifests referenced by metadata which are not "
+          "present in cloud storage",
+          "high",
+          [](const cloud_storage::anomalies& anomalies) {
+              return anomalies.missing_spillover_manifests.size();
+          }),
+        generate(
+          "offset_gaps",
+          "Count of offset gaps in the cloud storage metadata",
+          "high",
+          [](const cloud_storage::anomalies& anomalies) {
+              return anomalies.count_segment_meta_anomaly_type(
+                cloud_storage::anomaly_type::offset_gap);
+          }),
+        generate(
+          "missing_deltas",
+          "Count of segment metadata where the delta offset is not present",
+          "low",
+          [](const cloud_storage::anomalies& anomalies) {
+              return anomalies.count_segment_meta_anomaly_type(
+                cloud_storage::anomaly_type::missing_delta);
+          }),
+        generate(
+          "non_monotonic_deltas",
+          "Count of segment metadata where the delta offset are not "
+          "monotonic",
+          "low",
+          [](const cloud_storage::anomalies& anomalies) {
+              return anomalies.count_segment_meta_anomaly_type(
+                cloud_storage::anomaly_type::non_monotonical_delta);
+          }),
+        generate(
+          "end_deltas_smaller",
+          "Count of segment metadata where the end delta offset is smaller "
+          "than the base delta",
+          "low",
+          [](const cloud_storage::anomalies& anomalies) {
+              return anomalies.count_segment_meta_anomaly_type(
+                cloud_storage::anomaly_type::end_delta_smaller);
+          }),
+        generate(
+          "commited_smaller",
+          "Count of segment metadata where the end committed offset is smaller "
+          "than the base offset",
+          "low",
+          [](const cloud_storage::anomalies& anomalies) {
+              return anomalies.count_segment_meta_anomaly_type(
+                cloud_storage::anomaly_type::committed_smaller);
+          }),
+        generate(
+          "offset_overlap",
+          "Count of segments metadata where offsets overlap with the previous "
+          "segment",
+          "low",
+          [](const cloud_storage::anomalies& anomalies) {
+              return anomalies.count_segment_meta_anomaly_type(
+                cloud_storage::anomaly_type::offset_overlap);
+          }),
+      });
 }
 
 } // namespace cluster

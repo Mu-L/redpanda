@@ -1,3 +1,12 @@
+// Copyright 2023 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
 package generate
 
 import (
@@ -77,9 +86,10 @@ func newAppCmd(fs afero.Fs, p *config.Params) *cobra.Command {
 		Use:   "app",
 		Short: "Generate a sample application to connect with Redpanda",
 		Long:  appHelpText,
-		Run: func(cmd *cobra.Command, args []string) {
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, _ []string) {
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
 
 			isInteractive := langFlag == "" // The rest of the flags are optional.
 			if !isInteractive {
@@ -225,7 +235,7 @@ func runWithFlags(ctx context.Context, fs afero.Fs, p *config.RpkProfile, langFl
 }
 
 func createUser(ctx context.Context, fs afero.Fs, p *config.RpkProfile, user, pass string) error {
-	cl, err := adminapi.NewClient(fs, p)
+	cl, err := adminapi.NewClient(ctx, fs, p)
 	if err != nil {
 		return fmt.Errorf("unable to initialize admin client: %v", err)
 	}
@@ -362,7 +372,7 @@ the user.
 If you are having trouble connecting to your cluster, you can use -X
 admin.hosts=comma,delimited,host:ports to pass a specific admin api address.
 
-Examples:
+EXAMPLES
 
 Generate an app with interactive prompts:
   rpk generate app

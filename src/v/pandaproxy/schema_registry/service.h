@@ -11,22 +11,21 @@
 
 #pragma once
 
+#include "base/seastarx.h"
 #include "kafka/client/client.h"
 #include "pandaproxy/schema_registry/configuration.h"
 #include "pandaproxy/schema_registry/seq_writer.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
 #include "pandaproxy/server.h"
 #include "pandaproxy/util.h"
-#include "seastarx.h"
-#include "utils/request_auth.h"
+#include "security/fwd.h"
+#include "security/request_auth.h"
+#include "utils/adjustable_semaphore.h"
 
-#include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/net/socket_defs.hh>
-
-#include <vector>
 
 namespace cluster {
 class controller;
@@ -43,7 +42,8 @@ public:
       ss::sharded<kafka::client::client>& client,
       sharded_store& store,
       ss::sharded<seq_writer>& sequencer,
-      std::unique_ptr<cluster::controller>&);
+      std::unique_ptr<cluster::controller>&,
+      ss::sharded<security::audit::audit_log_manager>& audit_mgr);
 
     ss::future<> start();
     ss::future<> stop();
@@ -55,6 +55,10 @@ public:
     sharded_store& schema_store() { return _store; }
     request_authenticator& authenticator() { return _auth; }
     ss::future<> mitigate_error(std::exception_ptr);
+    ss::future<> ensure_started() { return _ensure_started(); }
+    security::audit::audit_log_manager& audit_mgr() {
+        return _audit_mgr.local();
+    }
 
 private:
     ss::future<> do_start();
@@ -65,6 +69,8 @@ private:
     ss::future<> fetch_internal_topic();
     configuration _config;
     ssx::semaphore _mem_sem;
+    adjustable_semaphore _inflight_sem;
+    config::binding<size_t> _inflight_config_binding;
     ss::gate _gate;
     ss::sharded<kafka::client::client>& _client;
     ctx_server<service>::context_t _ctx;
@@ -72,7 +78,7 @@ private:
     sharded_store& _store;
     ss::sharded<seq_writer>& _writer;
     std::unique_ptr<cluster::controller>& _controller;
-    ss::abort_source _as;
+    ss::sharded<security::audit::audit_log_manager>& _audit_mgr;
 
     one_shot _ensure_started;
     request_authenticator _auth;

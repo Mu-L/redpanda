@@ -8,10 +8,10 @@
 // by the Apache License, Version 2.0
 
 #include "bytes/bytes.h"
+#include "bytes/random.h"
 #include "kafka/protocol/wire.h"
 #include "kafka/server/group_metadata.h"
 #include "kafka/server/server.h"
-#include "kafka/types.h"
 #include "model/adl_serde.h"
 #include "model/fundamental.h"
 #include "model/record.h"

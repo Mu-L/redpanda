@@ -9,19 +9,26 @@
 
 #include "pandaproxy/server.h"
 
-#include "cluster/cluster_utils.h"
 #include "model/metadata.h"
+#include "net/dns.h"
+#include "net/tls_certificate_probe.h"
 #include "pandaproxy/json/types.h"
 #include "pandaproxy/logger.h"
 #include "pandaproxy/probe.h"
 #include "pandaproxy/reply.h"
+#include "rpc/rpc_utils.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/reply.hh>
+#include <seastar/net/tls.hh>
+
+#include <fmt/chrono.h>
+#include <fmt/ranges.h>
 
 #include <charconv>
 #include <exception>
+#include <memory>
 
 namespace pandaproxy {
 
@@ -85,22 +92,47 @@ struct handler_adaptor : ss::httpd::handler_base {
         auto guard = ss::gate::holder(_pending_requests);
         server::request_t rq{std::move(req), this->_ctx};
         server::reply_t rp{std::move(rep)};
+        const auto set_and_measure_response =
+          [&measure](const server::reply_t& rp) {
+              set_mime_type(*rp.rep, rp.mime_type);
+              measure.set_status(rp.rep->_status);
+          };
+        auto inflight_units = _ctx.inflight_sem.try_get_units(1);
+        if (!inflight_units) {
+            set_reply_too_many_requests(*rp.rep);
+            rp.mime_type = _exceptional_mime_type;
+            set_and_measure_response(rp);
+            co_return std::move(rp.rep);
+        }
         auto req_size = get_request_size(*rq.req);
+        if (req_size > _ctx.max_memory) {
+            set_reply_payload_too_large(*rp.rep);
+            rp.mime_type = _exceptional_mime_type;
+            set_and_measure_response(rp);
+            co_return std::move(rp.rep);
+        }
         auto sem_units = co_await ss::get_units(_ctx.mem_sem, req_size);
         if (_ctx.as.abort_requested()) {
             set_reply_unavailable(*rp.rep);
             rp.mime_type = _exceptional_mime_type;
-        } else {
-            try {
-                rp = co_await _handler(std::move(rq), std::move(rp));
-            } catch (...) {
-                rp = server::reply_t{
-                  exception_reply(std::current_exception()),
-                  _exceptional_mime_type};
-            }
+            set_and_measure_response(rp);
+            co_return std::move(rp.rep);
         }
-        set_mime_type(*rp.rep, rp.mime_type);
-        measure.set_status(rp.rep->_status);
+        auto method = rq.req->_method;
+        auto url = rq.req->_url;
+        try {
+            rp = co_await _handler(std::move(rq), std::move(rp));
+        } catch (...) {
+            auto ex = std::current_exception();
+            vlog(
+              plog.warn,
+              "Request: {} {} failed: {}",
+              method,
+              url,
+              std::current_exception());
+            rp = server::reply_t{exception_reply(ex), _exceptional_mime_type};
+        }
+        set_and_measure_response(rp);
         co_return std::move(rp.rep);
     }
 
@@ -125,10 +157,12 @@ server::server(
   , _api20(std::move(api20))
   , _has_routes(false)
   , _ctx(ctx)
-  , _exceptional_mime_type(exceptional_mime_type) {
+  , _exceptional_mime_type(exceptional_mime_type)
+  , _probe{} {
     _api20.set_api_doc(_server._routes);
     _api20.register_api_file(_server._routes, header);
     _api20.add_definitions_file(_server._routes, definitions);
+    _server.set_content_streaming(true);
 }
 
 /*
@@ -169,6 +203,9 @@ ss::future<> server::start(
   const std::vector<model::broker_endpoint>& advertised) {
     _server._routes.register_exeption_handler(
       exception_replier{ss::sstring{name(_exceptional_mime_type)}});
+
+    _probe = std::make_unique<server_probe>(_ctx, _public_metrics_group_name);
+
     _ctx.advertised_listeners.reserve(endpoints.size());
     for (auto& server_endpoint : endpoints) {
         auto addr = co_await net::resolve_dns(server_endpoint.address);
@@ -195,26 +232,31 @@ ss::future<> server::start(
 
         ss::shared_ptr<ss::tls::server_credentials> cred;
         if (it != endpoints_tls.end()) {
-            auto builder = co_await it->config.get_credentials_builder();
-            if (builder) {
-                cred = co_await builder->build_reloadable_server_credentials(
-                  [](
-                    const std::unordered_set<ss::sstring>& updated,
-                    const std::exception_ptr& eptr) {
-                      cluster::log_certificate_reload_event(
-                        plog, "API TLS", updated, eptr);
-                  });
-            }
+            cred = co_await net::build_reloadable_server_credentials_with_probe(
+              it->config,
+              _public_metrics_group_name,
+              it->name,
+              [](
+                const std::unordered_set<ss::sstring>& updated,
+                const std::exception_ptr& eptr) {
+                  rpc::log_certificate_reload_event(
+                    plog, "API TLS", updated, eptr);
+              });
         }
         co_await _server.listen(addr, cred);
     }
+
     co_return;
 }
 
 ss::future<> server::stop() {
-    return _pending_reqs.close()
-      .finally([this]() { return _ctx.as.request_abort(); })
-      .finally([this]() mutable { return _server.stop(); });
+    return _pending_reqs.close().finally([this]() {
+        _ctx.as.request_abort();
+        _probe.reset(nullptr);
+        return _server.stop();
+    });
 }
+
+server::~server() noexcept = default;
 
 } // namespace pandaproxy

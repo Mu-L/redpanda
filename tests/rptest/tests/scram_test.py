@@ -6,35 +6,53 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
+from enum import IntEnum
+import json
 import random
 import socket
 import string
 import requests
 from requests.exceptions import HTTPError
+import socket
 import time
+import urllib.parse
+import re
 
-from ducktape.mark import parametrize
+from confluent_kafka import KafkaException, KafkaError
+
+from ducktape.cluster.cluster import ClusterNode
+from ducktape.mark import parametrize, matrix
 from ducktape.utils.util import wait_until
+from ducktape.errors import TimeoutError
+from ducktape.services.service import Service
 
 from rptest.services.cluster import cluster
 from rptest.tests.redpanda_test import RedpandaTest
+from rptest.clients.kcl import RawKCL
+from rptest.clients.kafka_cli_tools import KafkaCliTools, KafkaCliToolsError
 from rptest.clients.types import TopicSpec
+from rptest.clients.rpk import RpkTool, RpkException
 from rptest.clients.python_librdkafka import PythonLibrdkafka
 from rptest.services.admin import Admin
-from rptest.services.redpanda import SecurityConfig, SaslCredentials, SecurityConfig
+from rptest.services.redpanda import SecurityConfig, SaslCredentials, SecurityConfig, TLSProvider
+from rptest.services.tls import Certificate, CertificateAuthority, TLSCertManager
+from rptest.tests.sasl_reauth_test import get_sasl_metrics, REAUTH_METRIC, EXPIRATION_METRIC
 from rptest.util import expect_http_error
-from rptest.utils.utf8 import CONTROL_CHARS, CONTROL_CHARS_MAP
+from rptest.utils.log_utils import wait_until_nag_is_set
+from rptest.utils.utf8 import CONTROL_CHARS, CONTROL_CHARS_MAP, generate_string_with_control_character
 
 
 class BaseScramTest(RedpandaTest):
     def __init__(self, test_context, **kwargs):
         super(BaseScramTest, self).__init__(test_context, **kwargs)
 
-    def update_user(self, username):
+    def update_user(self, username, quote: bool = True):
         def gen(length):
             return "".join(
                 random.choice(string.ascii_letters) for _ in range(length))
 
+        if quote:
+            username = urllib.parse.quote(username, safe='')
         password = gen(20)
 
         controller = self.redpanda.nodes[0]
@@ -49,11 +67,13 @@ class BaseScramTest(RedpandaTest):
         assert res.status_code == 200
         return password
 
-    def delete_user(self, username):
+    def delete_user(self, username, quote: bool = True):
+        if quote:
+            username = urllib.parse.quote(username, safe='')
         controller = self.redpanda.nodes[0]
         url = f"http://{controller.account.hostname}:9644/v1/security/users/{username}"
         res = requests.delete(url)
-        assert res.status_code == 200
+        assert res.status_code == 200, f"Status code: {res.status_code} for DELETE user {username}"
 
     def list_users(self):
         controller = self.redpanda.nodes[0]
@@ -85,16 +105,20 @@ class BaseScramTest(RedpandaTest):
         self.logger.debug(f"User Creation Arguments: {data}")
         res = requests.post(url, json=data)
 
-        assert res.status_code == expected_status_code
+        assert res.status_code == expected_status_code, f"Expected {expected_status_code}, got {res.status_code}: {res.content}"
 
         if err_msg is not None:
-            assert res.json()['message'] == err_msg
+            assert res.json(
+            )['message'] == err_msg, f"{res.json()['message']} != {err_msg}"
 
         return password
 
-    def make_superuser_client(self, password_override=None):
+    def make_superuser_client(self,
+                              password_override=None,
+                              algorithm_override=None):
         username, password, algorithm = self.redpanda.SUPERUSER_CREDENTIALS
         password = password_override or password
+        algorithm = algorithm_override or algorithm
         return PythonLibrdkafka(self.redpanda,
                                 username=username,
                                 password=password,
@@ -284,6 +308,262 @@ class ScramTest(BaseScramTest):
         assert username in users
 
 
+class SaslPlainTest(BaseScramTest):
+    """
+    These tests validate the functionality of the SASL/PLAIN
+    authentication mechanism.
+    """
+    class ClientType(IntEnum):
+        KCL = 1
+        RPK = 2
+        PYTHON_RDKAFKA = 3
+        KCLI = 4
+
+    class ScramType(IntEnum):
+        SCRAM_SHA_256 = 1
+        SCRAM_SHA_512 = 2
+
+        def __str__(self):
+            return self.name.replace("_", "-")
+
+    def __init__(self, test_context):
+        security = SecurityConfig()
+        security.enable_sasl = True
+        super(SaslPlainTest,
+              self).__init__(test_context,
+                             num_brokers=3,
+                             security=security,
+                             extra_node_conf={'developer_mode': True})
+
+    def _enable_plain_authn(self):
+        self.logger.debug("Enabling SASL PLAIN and disabling SCRAM")
+        admin = Admin(self.redpanda)
+        # PLAIN cannot be on by itself, so we will enable OAUTHBEARER as well
+        # but keep SCRAM disabled to ensure we are validating the PLAIN authentication
+        # mechanism
+        admin.patch_cluster_config(
+            upsert={'sasl_mechanisms': ['PLAIN', 'OAUTHBEARER']})
+
+    def _make_client(
+        self,
+        client_type: ClientType,
+        username_override: str | None = None,
+        password_override: str | None = None,
+        algorithm_override: str | None = None
+    ) -> PythonLibrdkafka | RawKCL | RpkTool | KafkaCliTools:
+        username, password, algorithm = self.redpanda.SUPERUSER_CREDENTIALS
+        username = username_override or username
+        password = password_override or password
+        algorithm = algorithm_override or algorithm
+
+        if client_type == self.ClientType.PYTHON_RDKAFKA:
+            return PythonLibrdkafka(self.redpanda,
+                                    username=username,
+                                    password=password,
+                                    algorithm=algorithm)
+        elif client_type == self.ClientType.KCL:
+            return RawKCL(self.redpanda,
+                          username=username,
+                          password=password,
+                          sasl_mechanism=algorithm)
+        elif client_type == self.ClientType.RPK:
+            return RpkTool(self.redpanda,
+                           username=username,
+                           password=password,
+                           sasl_mechanism=algorithm)
+        elif client_type == self.ClientType.KCLI:
+            return KafkaCliTools(self.redpanda,
+                                 user=username,
+                                 passwd=password,
+                                 algorithm=algorithm)
+        else:
+            assert False, f'Unknown client type: {client_type}'
+
+    def _make_topic(self, client: PythonLibrdkafka | RawKCL | RpkTool
+                    | KafkaCliTools, expect_success: bool) -> TopicSpec:
+        topic_name = "test-topic"
+        topic = TopicSpec(name=topic_name)
+        try:
+            if isinstance(client, PythonLibrdkafka):
+                client.create_topic(topic)
+            elif isinstance(client, RawKCL):
+                resp = client.create_topics(6, [{"name": topic_name}])
+                self.logger.info(f"RESP: {resp}")
+                if expect_success:
+                    assert len(
+                        resp
+                    ) != 0, "Should have received response with SASL/PLAIN enabled"
+                    assert resp[0][
+                        'ErrorCode'] == 0, f"Expected error code 0, got {resp[0]['ErrorCode']}"
+                    return
+                else:
+                    assert len(
+                        resp
+                    ) == 0, "Should not have received response with SASL/PLAIN disabled"
+                    return
+            elif isinstance(client, RpkTool):
+                client.create_topic(topic=topic_name)
+            elif isinstance(client, KafkaCliTools):
+                client.create_topic(topic)
+            else:
+                assert False, f'Unknown client type: {client} ({type(client)})'
+            assert expect_success, "Should have failed with SASL/PLAIN disabled"
+        except RpkException as e:
+            assert isinstance(
+                client, RpkTool
+            ), f"Should not have received an RPK exception from {client} ({type(client)})"
+            assert not expect_success, f"Should not have failed with SASL/PLAIN enabled: {e}"
+            assert "UNSUPPORTED_SASL_MECHANISM" in str(
+                e), f"Expected UNSUPPORTED_SASL_MECHANISM, got {e}"
+        except KafkaException as e:
+            assert isinstance(
+                client, PythonLibrdkafka
+            ), f"Should not have received a KafkaException from {client} ({type(client)})"
+            assert not expect_success, f"Should not have failed with SASL/PLAIN enabled: {e}"
+            assert e.args[0].code(
+            ) == KafkaError._TIMED_OUT, f"Expected KafkaError._TIMED_OUT, got {e.args[0].code()}"
+        except KafkaCliToolsError as e:
+            assert isinstance(
+                client, KafkaCliTools
+            ), f"Should not have received a KafkaCliToolsError from {client} ({type(client)})"
+            assert not expect_success, f"Should not have failed with SASL/PLAIN enabled: {e}"
+            assert "UnsupportedSaslMechanismException" in str(
+                e
+            ), f"Expected to see UnsupportedSaslMechanismException, got {e}"
+
+    @cluster(num_nodes=3)
+    @matrix(client_type=list(ClientType),
+            scram_type=list(ScramType),
+            sasl_plain_enabled=[True, False])
+    def test_plain_authn(self, client_type, scram_type, sasl_plain_enabled):
+        """
+        This test validates that SASL/PLAIN works with common kafka client
+        libraries:
+        - Python librdkafka
+        - Raw KCL
+        - RPK
+        - Kafka CLI tools
+
+        This test will validate that SASL/PLAIN works with both SCRAM-SHA-256
+        and SCRAM-SHA-512 users.
+        """
+        username = "test-user"
+        password = "test-password"
+        RpkTool(self.redpanda,
+                username=self.redpanda.SUPERUSER_CREDENTIALS.username,
+                password=self.redpanda.SUPERUSER_CREDENTIALS.password,
+                sasl_mechanism=self.redpanda.SUPERUSER_CREDENTIALS.algorithm
+                ).sasl_allow_principal(principal=username,
+                                       operations=["all"],
+                                       resource="topic",
+                                       resource_name="*")
+        self.create_user(username=username,
+                         algorithm=str(scram_type),
+                         password=password)
+
+        if sasl_plain_enabled:
+            self._enable_plain_authn()
+
+        client = self._make_client(client_type,
+                                   username_override=username,
+                                   password_override=password,
+                                   algorithm_override="PLAIN")
+        self._make_topic(client, sasl_plain_enabled)
+
+
+class SaslPlainTLSProvider(TLSProvider):
+    def __init__(self, tls: TLSCertManager):
+        self._tls = tls
+
+    @property
+    def ca(self) -> CertificateAuthority:
+        return self._tls.ca
+
+    def create_broker_cert(self, service: Service,
+                           node: ClusterNode) -> Certificate:
+        assert node in service.nodes
+        return self._tls.create_cert(node.name)
+
+    def create_service_client_cert(self, _: Service, name: str) -> Certificate:
+        return self._tls.create_cert(socket.gethostname(), name=name)
+
+
+class SaslPlainConfigTest(BaseScramTest):
+    """
+    These tests verify the behavior of Redpanda in different
+    configurations with SASL/PLAIN enabled
+    """
+
+    LICENSE_CHECK_INTERVAL_SEC = 1
+
+    def __init__(self, test_context):
+        self.security = SecurityConfig()
+        self.security.enable_sasl = True
+        super(SaslPlainConfigTest, self).__init__(test_context,
+                                                  num_brokers=3,
+                                                  security=self.security)
+        self.redpanda.set_environment({
+            '__REDPANDA_PERIODIC_REMINDER_INTERVAL_SEC':
+            f'{self.LICENSE_CHECK_INTERVAL_SEC}'
+        })
+        self.tls = TLSCertManager(self.logger)
+
+    def setUp(self):
+        pass
+
+    def _start_cluster(self, enable_tls: bool):
+        if enable_tls:
+            self.security.tls_provider = SaslPlainTLSProvider(tls=self.tls)
+            self.redpanda.set_security_settings(self.security)
+        super().setUp()
+
+    @cluster(num_nodes=3)
+    def test_cannot_enable_only_plain(self):
+        """
+        This test verifies that a user cannot select PLAIN as the only
+        sasl_mechanism
+        """
+        self._start_cluster(enable_tls=False)
+        admin = Admin(self.redpanda)
+        try:
+            admin.patch_cluster_config(upsert={'sasl_mechanisms': ['PLAIN']})
+            assert False, "Should not be able to enable only PLAIN"
+        except HTTPError as e:
+            assert e.response.status_code == 400, f"Expected 400, got {e.response.status_code}"
+            response = json.loads(e.response.text)
+            assert 'sasl_mechanisms' in response, f'Response missing "sasl_mechanisms": {response}'
+            assert "When PLAIN is enabled, at least one other mechanism must be enabled" == response[
+                'sasl_mechanisms'], f"Invalid message in response: {response['sasl_mechanisms']}"
+
+    @cluster(num_nodes=3, log_allow_list=[re.compile('SASL/PLAIN is enabled')])
+    @parametrize(enable_tls=True)
+    @parametrize(enable_tls=False)
+    def test_sasl_plain_log(self, enable_tls: bool):
+        """
+        This test verifies that a log message is emitted when SASL/PLAIN is enabled
+        """
+        self._start_cluster(enable_tls=enable_tls)
+        wait_until_nag_is_set(
+            redpanda=self.redpanda,
+            check_interval_sec=self.LICENSE_CHECK_INTERVAL_SEC)
+        admin = Admin(self.redpanda)
+        admin.patch_cluster_config(
+            upsert={'sasl_mechanisms': ['SCRAM', 'PLAIN']})
+
+        self.logger.debug("Waiting for SASL/PLAIN message")
+
+        def has_sasl_plain_log():
+            # There is always at least one Kafka API with TLS disabled meaning
+            # this will always log at the error level
+            return self.redpanda.search_log_all(
+                r"^ERROR.*SASL/PLAIN is enabled\. This is insecure and not recommended for production\.$"
+            )
+
+        wait_until(has_sasl_plain_log,
+                   timeout_sec=self.LICENSE_CHECK_INTERVAL_SEC * 2,
+                   err_msg="Failed to find SASL/PLAIN log message")
+
+
 class ScramLiveUpdateTest(RedpandaTest):
     def __init__(self, test_context):
         super(ScramLiveUpdateTest, self).__init__(test_context, num_brokers=1)
@@ -325,18 +605,24 @@ class ScramBootstrapUserTest(RedpandaTest):
     BOOTSTRAP_USERNAME = 'bob'
     BOOTSTRAP_PASSWORD = 'sekrit'
 
-    def __init__(self, *args, **kwargs):
+    # BOOTSTRAP_MECHANISM = 'SCRAM-SHA-512'
+
+    def __init__(self, test_context, *args, **kwargs):
         # Configure the cluster as a user might configure it for secure
         # bootstrap: i.e. all auth turned on from moment of creation.
+
+        self.mechanism = test_context.injected_args["mechanism"]
+        self.expect_fail = test_context.injected_args.get("expect_fail", False)
 
         security_config = SecurityConfig()
         security_config.enable_sasl = True
 
         super().__init__(
+            test_context,
             *args,
             environment={
                 'RP_BOOTSTRAP_USER':
-                f'{self.BOOTSTRAP_USERNAME}:{self.BOOTSTRAP_PASSWORD}'
+                f'{self.BOOTSTRAP_USERNAME}:{self.BOOTSTRAP_PASSWORD}:{self.mechanism}'
             },
             extra_rp_conf={
                 'enable_sasl': True,
@@ -345,9 +631,13 @@ class ScramBootstrapUserTest(RedpandaTest):
             },
             security=security_config,
             superuser=SaslCredentials(self.BOOTSTRAP_USERNAME,
-                                      self.BOOTSTRAP_PASSWORD,
-                                      "SCRAM-SHA-256"),
+                                      self.BOOTSTRAP_PASSWORD, self.mechanism),
             **kwargs)
+
+    def setUp(self):
+        self.redpanda.start(expect_fail=self.expect_fail)
+        if not self.expect_fail:
+            self._create_initial_topics()
 
     def _check_http_status_everywhere(self, expect_status, callable):
         """
@@ -370,7 +660,9 @@ class ScramBootstrapUserTest(RedpandaTest):
         return True
 
     @cluster(num_nodes=3)
-    def test_bootstrap_user(self):
+    @parametrize(mechanism='SCRAM-SHA-512')
+    @parametrize(mechanism='SCRAM-SHA-256')
+    def test_bootstrap_user(self, mechanism):
         # Anonymous access should be refused
         admin = Admin(self.redpanda)
         with expect_http_error(403):
@@ -407,6 +699,16 @@ class ScramBootstrapUserTest(RedpandaTest):
         self.redpanda.restart_nodes(self.redpanda.nodes)
         admin.list_users()
 
+    @cluster(num_nodes=1,
+             log_allow_list=[
+                 re.compile(r'std::invalid_argument.*Invalid SCRAM mechanism')
+             ])
+    @parametrize(mechanism='sCrAm-ShA-512', expect_fail=True)
+    def test_invalid_scram_mechanism(self, mechanism, expect_fail):
+        assert expect_fail
+        assert self.redpanda.count_log_node(self.redpanda.nodes[0],
+                                            "Invalid SCRAM mechanism")
+
 
 class InvalidNewUserStrings(BaseScramTest):
     """
@@ -422,21 +724,13 @@ class InvalidNewUserStrings(BaseScramTest):
                              security=security,
                              extra_node_conf={'developer_mode': True})
 
-    @staticmethod
-    def generate_string_with_control_character(length: int):
-        rv = ''.join(
-            random.choices(string.ascii_letters + CONTROL_CHARS, k=length))
-        while not any(char in rv for char in CONTROL_CHARS):
-            rv = ''.join(
-                random.choices(string.ascii_letters + CONTROL_CHARS, k=length))
-        return rv
-
     @cluster(num_nodes=3)
     def test_invalid_user_name(self):
         """
-        Validates that usernames that contain control characters are properly rejected
+        Validates that usernames that contain control characters and usernames which
+        do not match the SCRAM regex are properly rejected
         """
-        username = self.generate_string_with_control_character(15)
+        username = generate_string_with_control_character(15)
 
         self.create_user(
             username=username,
@@ -446,12 +740,21 @@ class InvalidNewUserStrings(BaseScramTest):
             f'Parameter contained invalid control characters: {username.translate(CONTROL_CHARS_MAP)}'
         )
 
+        # Two ordinals (corresponding to ',' and '=') are explicitly excluded from SASL usernames
+        for ordinal in [0x2c, 0x3d]:
+            username = f"john{chr(ordinal)}doe"
+            self.create_user(
+                username=username,
+                algorithm='SCRAM-SHA-256',
+                expected_status_code=400,
+                err_msg=f'Invalid SCRAM username {"{" + username + "}"}')
+
     @cluster(num_nodes=3)
     def test_invalid_alg(self):
         """
         Validates that algorithms that contain control characters are properly rejected
         """
-        algorithm = self.generate_string_with_control_character(10)
+        algorithm = generate_string_with_control_character(10)
 
         self.create_user(
             username="test",
@@ -466,10 +769,145 @@ class InvalidNewUserStrings(BaseScramTest):
         """
         Validates that passwords that contain control characters are properly rejected
         """
-        password = self.generate_string_with_control_character(15)
+        password = generate_string_with_control_character(15)
         self.create_user(
             username="test",
             algorithm="SCRAM-SHA-256",
             password=password,
             expected_status_code=400,
             err_msg='Parameter contained invalid control characters: PASSWORD')
+
+
+class EscapedNewUserStrings(BaseScramTest):
+
+    # All of the non-control characters that need escaping
+    NEED_ESCAPE = [
+        '!',
+        '"',
+        '#',
+        '$',
+        '%',
+        '&',
+        '\'',
+        '(',
+        ')',
+        '+',
+        # ',', Excluded by SASLNAME regex
+        '/',
+        ':',
+        ';',
+        '<',
+        # '=', Excluded by SASLNAME regex
+        '>',
+        '?',
+        '[',
+        '\\',
+        ']',
+        '^',
+        '`',
+        '{',
+        '}',
+        '~',
+    ]
+
+    @cluster(num_nodes=3)
+    def test_update_delete_user(self):
+        """
+        Verifies that users whose names contain characters which require URL escaping can be subsequently deleted.
+        i.e. that the username included with a delete request is properly unescaped by the admin server.
+        """
+
+        su_username = self.redpanda.SUPERUSER_CREDENTIALS.username
+
+        users = []
+
+        self.logger.debug(
+            "Create some users with names that will require URL escaping")
+
+        for ch in self.NEED_ESCAPE:
+            username = f"john{ch}doe"
+            self.create_user(username=username,
+                             algorithm="SCRAM-SHA-256",
+                             password="passwd",
+                             expected_status_code=200)
+            users.append(username)
+
+        admin = Admin(self.redpanda)
+
+        def _users_match(expected: list[str]):
+            live_users = admin.list_users()
+            live_users.remove(su_username)
+            return len(expected) == len(live_users) and set(expected) == set(
+                live_users)
+
+        wait_until(lambda: _users_match(users), timeout_sec=5, backoff_sec=0.5)
+
+        self.logger.debug(
+            "We should be able to update and delete these users without issue")
+        for username in users:
+            self.update_user(username=username)
+            self.delete_user(username=username)
+
+        try:
+            wait_until(lambda: _users_match([]),
+                       timeout_sec=5,
+                       backoff_sec=0.5)
+        except TimeoutError:
+            live_users = admin.list_users()
+            live_users.remove(su_username)
+            assert len(
+                live_users
+            ) == 0, f"Expected no users, got {len(live_users)}: {live_users}"
+
+
+class SCRAMReauthTest(BaseScramTest):
+    EXAMPLE_TOPIC = 'foo'
+
+    MAX_REAUTH_MS = 2000
+    PRODUCE_DURATION_S = MAX_REAUTH_MS * 2 / 1000
+    PRODUCE_INTERVAL_S = 0.1
+    PRODUCE_ITER = int(PRODUCE_DURATION_S / PRODUCE_INTERVAL_S)
+
+    def __init__(self, test_context, **kwargs):
+        security = SecurityConfig()
+        security.enable_sasl = True
+        super().__init__(
+            test_context=test_context,
+            num_brokers=3,
+            security=security,
+            extra_rp_conf={'kafka_sasl_max_reauth_ms': self.MAX_REAUTH_MS},
+            **kwargs)
+
+        username, password, algorithm = self.redpanda.SUPERUSER_CREDENTIALS
+        self.rpk = RpkTool(self.redpanda,
+                           username=username,
+                           password=password,
+                           sasl_mechanism=algorithm)
+
+    @cluster(num_nodes=3)
+    def test_scram_reauth(self):
+        self.rpk.create_topic(self.EXAMPLE_TOPIC)
+        su_client = self.make_superuser_client()
+        producer = su_client.get_producer()
+        producer.poll(1.0)
+
+        expected_topics = set([self.EXAMPLE_TOPIC])
+        wait_until(lambda: set(producer.list_topics(timeout=5).topics.keys())
+                   == expected_topics,
+                   timeout_sec=5)
+
+        for i in range(0, self.PRODUCE_ITER):
+            producer.poll(0.0)
+            producer.produce(topic=self.EXAMPLE_TOPIC, key='bar', value=str(i))
+            time.sleep(self.PRODUCE_INTERVAL_S)
+
+        producer.flush(timeout=2)
+
+        metrics = get_sasl_metrics(self.redpanda)
+        self.redpanda.logger.debug(f"SASL metrics: {metrics}")
+        assert (EXPIRATION_METRIC in metrics.keys())
+        assert (metrics[EXPIRATION_METRIC] == 0
+                ), "Client should reauth before session expiry"
+        assert (REAUTH_METRIC in metrics.keys())
+        assert (metrics[REAUTH_METRIC]
+                > 0), "Expected client reauth on some broker..."

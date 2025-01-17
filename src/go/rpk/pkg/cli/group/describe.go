@@ -13,18 +13,18 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"time"
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/kafka"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/utils"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 	"github.com/twmb/franz-go/pkg/kadm"
 )
 
 func NewDescribeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
-	var summary, commits, lagPerTopic bool
+	var summary, commitsOnly, lagPerTopic, re bool
 	cmd := &cobra.Command{
 		Use:   "describe [GROUPS...]",
 		Short: "Describe group offset status & lag",
@@ -32,17 +32,41 @@ func NewDescribeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 
 This command describes group members, calculates their lag, and prints detailed
 information about the members.
+
+The --regex flag (-r) parses arguments as regular expressions
+and describes groups that match any of the expressions.
+`,
+		Example: `
+Describe groups foo and bar:
+  rpk group describe foo bar
+
+Describe any group starting with f and ending in r:
+  rpk group describe -r '^f.*' '.*r$'
+
+Describe all groups:
+  rpk group describe -r '*'
+
+Describe any one-character group:
+  rpk group describe -r .
 `,
 		Args: cobra.MinimumNArgs(1),
 		Run: func(cmd *cobra.Command, groups []string) {
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
 
 			adm, err := kafka.NewAdmin(fs, p)
 			out.MaybeDie(err, "unable to initialize kafka client: %v", err)
 			defer adm.Close()
 
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if re {
+				groups, err = regexGroups(adm, groups)
+				out.MaybeDie(err, "unable to filter groups by regex: %v", err)
+			}
+			if len(groups) == 0 {
+				out.Exit("did not match any groups, exiting.")
+			}
+
+			ctx, cancel := context.WithTimeout(cmd.Context(), p.Defaults().GetCommandTimeout())
 			defer cancel()
 
 			lags, err := adm.Lag(ctx, groups...)
@@ -57,12 +81,13 @@ information about the members.
 				printDescribedSummary(lags)
 				return
 			}
-			printDescribed(commits, lags)
+			printDescribed(commitsOnly, lags)
 		},
 	}
 	cmd.Flags().BoolVarP(&lagPerTopic, "print-lag-per-topic", "t", false, "Print the aggregated lag per topic")
 	cmd.Flags().BoolVarP(&summary, "print-summary", "s", false, "Print only the group summary section")
-	cmd.Flags().BoolVarP(&commits, "print-commits", "c", false, "Print only the group commits section")
+	cmd.Flags().BoolVarP(&commitsOnly, "print-commits", "c", false, "Print only the group commits section")
+	cmd.Flags().BoolVarP(&re, "regex", "r", false, "Parse arguments as regex; describe any group that matches any input group expression")
 	cmd.MarkFlagsMutuallyExclusive("print-summary", "print-commits")
 	cmd.MarkFlagsMutuallyExclusive("print-lag-per-topic", "print-commits")
 	return cmd
@@ -75,32 +100,35 @@ information about the members.
 // columns if any member in the group has an instance id / error.
 
 type describeRow struct {
-	topic         string
-	partition     int32
-	currentOffset string
-	logEndOffset  int64
-	lag           string
-	memberID      string
-	instanceID    *string
-	clientID      string
-	host          string
-	err           error
+	topic          string
+	partition      int32
+	currentOffset  string
+	logStartOffset int64
+	logEndOffset   int64
+	lag            string
+	memberID       string
+	instanceID     *string
+	clientID       string
+	host           string
+	err            string
 }
 
-func printDescribed(commits bool, lags kadm.DescribedGroupLags) {
-	for _, group := range lags.Sorted() {
+func printDescribed(commitsOnly bool, lags kadm.DescribedGroupLags) {
+	for i, group := range lags.Sorted() {
 		var rows []describeRow
 		var useInstanceID, useErr bool
 		for _, l := range group.Lag.Sorted() {
 			row := describeRow{
-				topic:     l.End.Topic,
-				partition: l.End.Partition,
+				topic:     l.Topic,
+				partition: l.Partition,
 
-				currentOffset: strconv.FormatInt(l.Commit.At, 10),
-				logEndOffset:  l.End.Offset,
-				lag:           strconv.FormatInt(l.Lag, 10),
-
-				err: l.Err,
+				currentOffset:  strconv.FormatInt(l.Commit.At, 10),
+				logStartOffset: l.Start.Offset,
+				logEndOffset:   l.End.Offset,
+				lag:            strconv.FormatInt(l.Lag, 10),
+			}
+			if l.Err != nil {
+				row.err = l.Err.Error()
 			}
 
 			if !l.IsEmpty() {
@@ -118,25 +146,29 @@ func printDescribed(commits bool, lags kadm.DescribedGroupLags) {
 			}
 
 			useInstanceID = useInstanceID || row.instanceID != nil
-			useErr = useErr || row.err != nil
+			useErr = useErr || row.err != ""
 
 			rows = append(rows, row)
 		}
 
-		printDescribedGroup(commits, group, rows, useInstanceID, useErr)
-		fmt.Println()
+		printDescribedGroup(commitsOnly, group, rows, useInstanceID, useErr)
+		if i != len(lags)-1 {
+			fmt.Println()
+		}
 	}
 }
 
 func printDescribedSummary(groups kadm.DescribedGroupLags) {
-	for _, group := range groups.Sorted() {
+	for i, group := range groups.Sorted() {
 		printDescribedGroupSummary(group)
+		if i != len(groups)-1 {
+			fmt.Println()
+		}
 	}
 }
 
 func printDescribedGroupSummary(group kadm.DescribedGroupLag) {
 	tw := out.NewTabWriter()
-	defer fmt.Println()
 	defer tw.Flush()
 	fmt.Fprintf(tw, "GROUP\t%s\n", group.Group)
 	fmt.Fprintf(tw, "COORDINATOR\t%d\n", group.Coordinator.NodeID)
@@ -150,23 +182,27 @@ func printDescribedGroupSummary(group kadm.DescribedGroupLag) {
 }
 
 func printDescribedGroup(
-	commits bool,
+	commitsOnly bool,
 	group kadm.DescribedGroupLag,
 	rows []describeRow,
 	useInstanceID bool,
 	useErr bool,
 ) {
-	if !commits {
+	if !commitsOnly {
 		printDescribedGroupSummary(group)
 	}
 	if len(rows) == 0 {
 		return
+	}
+	if !commitsOnly {
+		fmt.Println()
 	}
 
 	headers := []string{
 		"TOPIC",
 		"PARTITION",
 		"CURRENT-OFFSET",
+		"LOG-START-OFFSET",
 		"LOG-END-OFFSET",
 		"LAG",
 		"MEMBER-ID",
@@ -176,6 +212,7 @@ func printDescribedGroup(
 			r.topic,
 			r.partition,
 			r.currentOffset,
+			r.logStartOffset,
 			r.logEndOffset,
 			r.lag,
 			r.memberID,
@@ -218,6 +255,7 @@ func printDescribedGroup(
 
 func printLagPerTopic(groups kadm.DescribedGroupLags) {
 	printDescribedSummary(groups)
+	fmt.Println()
 	tw := out.NewTable("TOPIC", "LAG")
 	defer tw.Flush()
 	for _, group := range groups.Sorted() {
@@ -225,4 +263,14 @@ func printLagPerTopic(groups kadm.DescribedGroupLags) {
 			tw.Print(topicLag.Topic, topicLag.Lag)
 		}
 	}
+}
+
+func regexGroups(adm *kadm.Client, expressions []string) ([]string, error) {
+	// Now we list all groups to match against our expressions.
+	groups, err := adm.ListGroups(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("unable to list groups: 	%w", err)
+	}
+
+	return utils.RegexListedItems(groups.Groups(), expressions)
 }

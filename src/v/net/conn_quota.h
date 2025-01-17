@@ -9,19 +9,18 @@
 
 #pragma once
 
+#include "base/oncore.h"
+#include "base/seastarx.h"
+#include "base/vassert.h"
 #include "config/property.h"
-#include "oncore.h"
-#include "seastar/core/gate.hh"
-#include "seastar/core/sharded.hh"
-#include "seastar/net/inet_address.hh"
-#include "seastarx.h"
 #include "utils/mutex.h"
-#include "vassert.h"
+
+#include <seastar/core/gate.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/net/inet_address.hh>
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/hash/hash.h>
-
-#include <stdint.h>
 
 namespace net {
 
@@ -55,12 +54,12 @@ public:
     public:
         units() = default;
 
-        units(conn_quota& quotas, ss::net::inet_address const& addr)
+        units(conn_quota& quotas, const ss::net::inet_address& addr)
           : _quotas(std::ref(quotas))
           , _addr(addr) {}
 
-        units(units const&) = delete;
-        units& operator=(units const&) = delete;
+        units(const units&) = delete;
+        units& operator=(const units&) = delete;
         units(units&& rhs) noexcept
           : _addr(rhs._addr)
           , _verify_shard(rhs._verify_shard) {
@@ -90,7 +89,7 @@ public:
     };
 
     using config_fn = std::function<conn_quota_config()>;
-    conn_quota(config_fn) noexcept;
+    conn_quota(config_fn, ss::logger*) noexcept;
 
     ss::future<units> get(ss::net::inet_address);
     void put(ss::net::inet_address);
@@ -126,7 +125,7 @@ private:
         // Lock to prevent multiple fibers trying to concurrently
         // do reclaims (would happen if multiple incoming connections
         // on the same shard when available==0)
-        mutex reclaim_lock;
+        mutex reclaim_lock{"conn_quota::reclaim_lock"};
     };
 
     friend std::ostream& operator<<(std::ostream& o, const home_allowance& ha) {
@@ -170,7 +169,7 @@ private:
     ss::shard_id addr_to_shard(ss::net::inet_address) const;
 
     void
-    assert_on_home([[maybe_unused]] ss::net::inet_address const& addr) const {
+    assert_on_home([[maybe_unused]] const ss::net::inet_address& addr) const {
 #ifndef NDEBUG
         vassert(
           conn_quota::addr_to_shard(addr) == ss::this_shard_id(),
@@ -237,6 +236,7 @@ private:
     conn_quota_config _cfg;
 
     ss::gate _gate;
+    ss::logger* _log;
 };
 
 } // namespace net

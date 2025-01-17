@@ -9,11 +9,12 @@
  */
 #pragma once
 
+#include "base/outcome.h"
+#include "base/seastarx.h"
 #include "cloud_storage/base_manifest.h"
 #include "cluster/cloud_metadata/error_outcome.h"
 #include "cluster/cloud_metadata/types.h"
 #include "model/fundamental.h"
-#include "seastarx.h"
 #include "serde/envelope.h"
 #include "utils/named_type.h"
 
@@ -26,9 +27,6 @@
 namespace cluster::cloud_metadata {
 
 // Manifest containing information about cluster metadata.
-//
-// NOTE: while it's not a requirement to be serialized with serde, we'll use
-// serde-style versioning to simplify reasoning about compatibility.
 struct cluster_metadata_manifest
   : public serde::envelope<
       cluster_metadata_manifest,
@@ -36,6 +34,16 @@ struct cluster_metadata_manifest
       serde::compat_version<0>>
   , public cloud_storage::base_manifest {
     using duration = std::chrono::milliseconds;
+
+    auto serde_fields() {
+        return std::tie(
+          upload_time_since_epoch,
+          cluster_uuid,
+          metadata_id,
+          controller_snapshot_offset,
+          controller_snapshot_path,
+          offsets_snapshots_by_partition);
+    }
 
     // Upload time in milliseconds since the epoch. Informational only.
     duration upload_time_since_epoch{0};
@@ -62,10 +70,11 @@ struct cluster_metadata_manifest
     // changed since the last snapshot.
     ss::sstring controller_snapshot_path;
 
+    std::vector<std::vector<ss::sstring>> offsets_snapshots_by_partition;
+
     ss::future<> update(ss::input_stream<char> is) override;
-    ss::future<cloud_storage::serialized_data_stream>
-    serialize() const override;
-    cloud_storage::remote_manifest_path get_manifest_path() const override;
+    ss::future<iobuf> serialize_buf() const override;
+    cloud_storage::remote_manifest_path get_manifest_path() const;
     cloud_storage::manifest_type get_manifest_type() const override {
         return cloud_storage::manifest_type::cluster_metadata;
     }
@@ -76,13 +85,15 @@ struct cluster_metadata_manifest
                  cluster_uuid,
                  metadata_id,
                  controller_snapshot_offset,
-                 controller_snapshot_path)
+                 controller_snapshot_path,
+                 offsets_snapshots_by_partition)
                == std::tie(
                  other.upload_time_since_epoch,
                  other.cluster_uuid,
                  other.metadata_id,
                  other.controller_snapshot_offset,
-                 other.controller_snapshot_path);
+                 other.controller_snapshot_path,
+                 other.offsets_snapshots_by_partition);
     }
 
 private:

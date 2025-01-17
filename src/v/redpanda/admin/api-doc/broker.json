@@ -41,6 +41,24 @@
             ]
         },
         {
+            "path": "/v1/broker_uuids",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get a list of node id to UUID mappings",
+                    "type": "array",
+                    "items": {
+                        "type": "broker_uuid_mapping"
+                    },
+                    "nickname": "get_broker_uuids",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
             "path": "/v1/brokers/{id}",
             "operations": [
                 {
@@ -217,6 +235,20 @@
                     "parameters": []
                 }
             ]
+        },
+        {
+            "path": "/v1/reset_crash_tracking",
+            "operations": [
+                {
+                    "method": "PUT",
+                    "summary": "Reset the crash tracking of queried broker.",
+                    "type": "void",
+                    "nickname": "reset_crash_tracking",
+                    "produces": [
+                        "application/json"
+                    ]
+                }
+            ]
         }
     ],
     "models": {
@@ -268,6 +300,10 @@
                     "type": "boolean",
                     "description": "is node seen as alive by the cluster"
                 },
+                "recovery_mode_enabled": {
+                    "type": "boolean",
+                    "description": "was node booted up in recovery mode"
+                },
                 "disk_space": {
                     "type": "array",
                     "items": {
@@ -282,6 +318,10 @@
                 "maintenance_status": {
                     "type": "maintenance_status",
                     "description": "Node maintenance status"
+                },
+                "in_fips_mode": {
+                    "type": "string",
+                    "description": "indicates if node is operating in FIPS Mode"
                 }
             }
         },
@@ -304,15 +344,15 @@
         },
         "maintenance_status": {
             "id": "maintenance_status",
-            "description": "Drain status",
+            "description": "Status of maintenance mode",
             "properties": {
                 "draining": {
                     "type": "boolean",
-                    "description": "in maintenance state"
+                    "description": "Flag indicating if maintenance mode is enabled."
                 },
                 "finished": {
                     "type": "boolean",
-                    "description": "drain finished"
+                    "description": "Indicates that draining is finished. Note that the draining flag will always be true if maintenance mode is enable and draining has finished."
                 },
                 "errors": {
                     "type": "boolean",
@@ -349,7 +389,7 @@
                     "description": "number of replicas left on a node"
                 },
                 "allocation_failures": {
-                    "type" : "array",
+                    "type": "array",
                     "items": {
                         "type": "string",
                         "description": "ntp"
@@ -396,6 +436,10 @@
                 "partition_size": {
                     "type": "long",
                     "description": "current size of partition"
+                },
+                "reconfiguration_policy": {
+                    "type": "string",
+                    "description": "Policy used to reconfigure partition replica set"
                 }
             }
         },
@@ -410,6 +454,20 @@
                 "core": {
                     "type": "int",
                     "description": "id of a core on a given node"
+                }
+            }
+        },
+        "broker_uuid_mapping": {
+            "id": "broker_uuid_mapping",
+            "description": "Mapping between UUID and node id",
+            "properties": {
+                "node_id": {
+                    "type": "int",
+                    "description": "Broker assigned id"
+                },
+                "uuid": {
+                    "type": "string",
+                    "description": "Broker unique identifier. UUID is generated when Redpanda starts with empty data folder"
                 }
             }
         }

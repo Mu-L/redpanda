@@ -25,10 +25,15 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/kafka"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/schemaregistry"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/serde"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/sr"
+	"go.uber.org/zap"
 )
 
 type consumer struct {
@@ -39,10 +44,11 @@ type consumer struct {
 	group    string
 	balancer string
 
-	fetchMaxBytes int32
-	fetchMaxWait  time.Duration
-	readCommitted bool
-	printControl  bool
+	fetchMaxBytes          int32
+	fetchMaxWait           time.Duration
+	fetchMaxPartitionBytes int32
+	readCommitted          bool
+	printControl           bool
 
 	f        *kgo.RecordFormatter // if not json
 	num      int
@@ -51,12 +57,17 @@ type consumer struct {
 
 	resetOffset kgo.Offset // defaults to NoResetOffset, can be start or end
 
+	useSchemaRegistry []string // schema registry options
+	decodeKey         bool
+	decodeVal         bool
+
 	// If an end offset is specified, we immediately look up where we will
 	// end and quit rpk when we hit the end.
 	partEnds   map[string]map[int32]int64
 	partStarts map[string]map[int32]int64
 
-	cl *kgo.Client
+	cl   *kgo.Client
+	srCl *sr.Client
 }
 
 func newConsumeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
@@ -73,10 +84,21 @@ func newConsumeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 		Args:  cobra.MinimumNArgs(1),
 		Run: func(cmd *cobra.Command, topics []string) {
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
 
 			adm, err := kafka.NewAdmin(fs, p)
 			out.MaybeDie(err, "unable to initialize admin kafka client: %v", err)
+
+			// We fail if the topic does not exist.
+			if !c.regex {
+				listed, err := adm.ListTopics(cmd.Context(), topics...)
+				out.MaybeDie(err, "unable to check topic existence: %v", err)
+				listed.EachError(func(d kadm.TopicDetail) {
+					if errors.Is(d.Err, kerr.UnknownTopicOrPartition) {
+						out.Die("unable to consume topic %q: %v", d.Topic, d.Err.Error())
+					}
+				})
+			}
 
 			err = c.parseOffset(offset, topics, adm)
 			out.MaybeDie(err, "invalid --offset %q: %v", offset, err)
@@ -98,10 +120,17 @@ func newConsumeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 			c.cl, err = kafka.NewFranzClient(fs, p, opts...)
 			out.MaybeDie(err, "unable to initialize kafka client: %v", err)
 
+			if len(c.useSchemaRegistry) > 0 {
+				err = c.formatSchemaRegistryFlag()
+				out.MaybeDie(err, "unable to parse --use-schema-registry flag: %v", err)
+				c.srCl, err = schemaregistry.NewClient(fs, p)
+				out.MaybeDie(err, "unable to initialize schema registry client: %v", err)
+			}
+
 			doneConsume := make(chan struct{})
 			go func() {
 				defer close(doneConsume)
-				c.consume()
+				c.consume(cmd.Context())
 				c.cl.LeaveGroup()
 			}()
 
@@ -132,6 +161,7 @@ func newConsumeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 
 	cmd.Flags().Int32Var(&c.fetchMaxBytes, "fetch-max-bytes", 1<<20, "Maximum amount of bytes per fetch request per broker")
 	cmd.Flags().DurationVar(&c.fetchMaxWait, "fetch-max-wait", 5*time.Second, "Maximum amount of time to wait when fetching from a broker before the broker replies")
+	cmd.Flags().Int32Var(&c.fetchMaxPartitionBytes, "fetch-max-partition-bytes", 1<<20, "Maximum amount of bytes that will be consumed for a single partition per fetch request")
 	cmd.Flags().BoolVar(&c.readCommitted, "read-committed", false, "Opt in to reading only committed offsets")
 	cmd.Flags().BoolVar(&c.printControl, "print-control-records", false, "Opt in to printing control records")
 
@@ -142,22 +172,26 @@ func newConsumeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 
 	cmd.Flags().StringVar(&c.rack, "rack", "", "Rack to use for consuming, which opts into follower fetching")
 
+	cmd.Flags().StringSliceVar(&c.useSchemaRegistry, "use-schema-registry", []string{}, "If present, rpk will decode the key and the value with the schema registry. Also accepts use-schema-registry=key or use-schema-registry=value")
 	// Deprecated.
 	cmd.Flags().BoolVar(new(bool), "commit", false, "")
 	cmd.Flags().MarkDeprecated("commit", "Group consuming always commits")
 
+	cmd.Flags().Lookup("use-schema-registry").NoOptDefVal = "key,value"
+
 	return cmd
 }
 
-func (c *consumer) consume() {
+func (c *consumer) consume(ctx context.Context) {
 	var (
 		buf   []byte
 		n     int
 		marks []*kgo.Record
 		done  bool
 	)
+	serdeCache := make(map[int]*serde.Serde)
 	for !done {
-		fs := c.cl.PollFetches(context.Background())
+		fs := c.cl.PollFetches(ctx)
 		if fs.IsClientClosed() {
 			return
 		}
@@ -173,19 +207,41 @@ func (c *consumer) consume() {
 			if done {
 				return
 			}
-
 			pend, hasEnd := c.getPartitionEnd(p.Topic, p.Partition)
 			if hasEnd && pend < 0 {
 				return // reached end, still draining client
 			}
 
 			for _, r := range p.Records {
+				var toStdErr bool
+				if r.Key != nil && c.decodeKey {
+					decKey, err := handleDecode(ctx, c.srCl, r.Key, serdeCache)
+					if err != nil {
+						zap.L().Sugar().Warnf("unable to decode record key %v with schema registry: %v\n", r.Key, err)
+						toStdErr = true
+					} else {
+						r.Key = decKey
+					}
+				}
+				if r.Value != nil && c.decodeVal {
+					decVal, err := handleDecode(ctx, c.srCl, r.Value, serdeCache)
+					if err != nil {
+						zap.L().Sugar().Warnf("unable to decode record value %v with schema registry: %v\n", r.Value, err)
+						toStdErr = true
+					} else {
+						r.Value = decVal
+					}
+				}
 				if !r.Attrs.IsControl() || c.printControl {
 					if c.f == nil {
-						c.writeRecordJSON(r)
+						c.writeRecordJSON(r, toStdErr)
 					} else {
 						buf = c.f.AppendPartitionRecord(buf[:0], &p.FetchPartition, r)
-						os.Stdout.Write(buf)
+						if toStdErr {
+							os.Stderr.Write(buf)
+						} else {
+							os.Stdout.Write(buf)
+						}
 					}
 				}
 
@@ -211,16 +267,22 @@ func (c *consumer) consume() {
 	}
 }
 
-func (c *consumer) writeRecordJSON(r *kgo.Record) {
+func (c *consumer) writeRecordJSON(r *kgo.Record, toStdErr bool) {
 	type Header struct {
 		Key   string `json:"key"`
 		Value string `json:"value"`
 	}
 
+	var valuePtr *string
+	if r.Value != nil {
+		valueStr := string(r.Value)
+		valuePtr = &valueStr
+	}
+
 	m := struct {
 		Topic     string   `json:"topic"`
 		Key       string   `json:"key,omitempty"`
-		Value     string   `json:"value,omitempty"`
+		Value     *string  `json:"value,omitempty"`
 		ValueSize *int     `json:"value_size,omitempty"` // non-nil if --meta-only
 		Headers   []Header `json:"headers,omitempty"`
 		Timestamp int64    `json:"timestamp"` // millis
@@ -230,7 +292,7 @@ func (c *consumer) writeRecordJSON(r *kgo.Record) {
 	}{
 		Topic:     r.Topic,
 		Key:       string(r.Key),
-		Value:     string(r.Value),
+		Value:     valuePtr,
 		Headers:   make([]Header, 0, len(r.Headers)),
 		Timestamp: r.Timestamp.UnixNano() / 1e6,
 
@@ -239,8 +301,8 @@ func (c *consumer) writeRecordJSON(r *kgo.Record) {
 	}
 
 	if c.metaOnly {
-		size := len(m.Value)
-		m.Value = ""
+		size := len(r.Value)
+		m.Value = nil
 		m.ValueSize = &size
 	}
 
@@ -259,8 +321,13 @@ func (c *consumer) writeRecordJSON(r *kgo.Record) {
 	} else {
 		out, _ = json.Marshal(m)
 	}
-	os.Stdout.Write(out)
-	os.Stdout.Write(newline)
+	if toStdErr {
+		os.Stderr.Write(out)
+		os.Stderr.Write(newline)
+	} else {
+		os.Stdout.Write(out)
+		os.Stdout.Write(newline)
+	}
 }
 
 var newline = []byte("\n")
@@ -745,12 +812,55 @@ func (c *consumer) intoOptions(topics []string) ([]kgo.Opt, error) {
 	opts = append(opts,
 		kgo.FetchMaxBytes(c.fetchMaxBytes),
 		kgo.FetchMaxWait(c.fetchMaxWait),
+		kgo.FetchMaxPartitionBytes(c.fetchMaxPartitionBytes),
 	)
 	if c.readCommitted {
 		opts = append(opts, kgo.FetchIsolationLevel(kgo.ReadCommitted()))
 	}
 
 	return opts, nil
+}
+
+func (c *consumer) formatSchemaRegistryFlag() error {
+	if len(c.useSchemaRegistry) == 0 {
+		// We don't expect to hit this, but better be safe.
+		return errors.New("schema registry flag is empty")
+	}
+	for _, f := range c.useSchemaRegistry {
+		switch {
+		case strings.HasPrefix("value", f):
+			c.decodeVal = true
+		case strings.HasPrefix("key", f):
+			c.decodeKey = true
+		default:
+			return fmt.Errorf("unsupported decode type %q", f)
+		}
+	}
+	return nil
+}
+
+func handleDecode(ctx context.Context, cl *sr.Client, record []byte, serdeCache map[int]*serde.Serde) ([]byte, error) {
+	var serdeHeader sr.ConfluentHeader
+	id, toDecode, err := serdeHeader.DecodeID(record)
+	if err != nil {
+		return nil, errors.New("unable to decode the ID")
+	}
+	var rpkSerde *serde.Serde
+	if cachedSerde, ok := serdeCache[id]; ok {
+		rpkSerde = cachedSerde
+	} else {
+		schema, err := cl.SchemaByID(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("unable to get schema with index %v from the schema registry: %v", id, err)
+		}
+		rpkSerde, err = serde.NewSerde(ctx, cl, &schema, id, "")
+		if err != nil {
+			return nil, err
+		}
+		serdeCache[id] = rpkSerde
+	}
+
+	return rpkSerde.DecodeRecord(toDecode)
 }
 
 const helpConsume = `Consume records from topics.
@@ -943,6 +1053,13 @@ will print all headers with a space before the key and after the value, an
 equals sign between the key and value, and with the value hex encoded. Header
 formatting actually just parses the internal format as a record format, so all
 of the above rules about %K, %V, text, and numbers apply.
+
+VALUES
+
+Values for consumed records can be omitted by using the '--meta-only' flag.
+Tombstone records (records with a 'null' value) have their value omitted
+from the JSON output by default. All other records, including those with
+an empty-string value (""), will have their values printed.
 
 EXAMPLES
 

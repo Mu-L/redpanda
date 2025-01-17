@@ -11,22 +11,15 @@
 #pragma once
 
 #include "cloud_storage/fwd.h"
-#include "cloud_storage/logger.h"
-#include "cloud_storage/offset_translation_layer.h"
 #include "cloud_storage/partition_manifest.h"
-#include "cloud_storage/partition_probe.h"
+#include "cloud_storage/read_path_probes.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage/remote_segment.h"
 #include "cloud_storage/segment_state.h"
 #include "cloud_storage/types.h"
-#include "cloud_storage_clients/types.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
-#include "raft/types.h"
-#include "storage/ntp_config.h"
 #include "storage/translating_reader.h"
 #include "storage/types.h"
-#include "utils/intrusive_list_helpers.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/lowres_clock.hh>
@@ -37,9 +30,6 @@
 
 #include <boost/iterator/iterator_categories.hpp>
 #include <boost/iterator/iterator_facade.hpp>
-
-#include <chrono>
-#include <functional>
 
 namespace cloud_storage {
 
@@ -91,6 +81,8 @@ public:
       storage::log_reader_config config,
       std::optional<model::timeout_clock::time_point> deadline = std::nullopt);
 
+    static size_t reader_mem_use_estimate() noexcept;
+
     /// Look up offset from timestamp
     ss::future<std::optional<storage::timequery_result>>
     timequery(storage::timequery_config cfg);
@@ -140,6 +132,7 @@ public:
     static ss::future<erase_result> erase(
       cloud_storage::remote&,
       cloud_storage_clients::bucket_name,
+      const remote_path_provider& path_provider,
       partition_manifest,
       remote_manifest_path,
       retry_chain_node&);
@@ -205,14 +198,17 @@ private:
     borrow_result_t borrow_next_segment_reader(
       const partition_manifest& manifest,
       storage::log_reader_config config,
+      segment_units segment_unit,
+      segment_reader_units segment_reader_unit,
       model::offset hint = {});
 
-    /// Materialize new segment
-    /// @return iterator that points to newly added segment (always valid
+    /// Materialize a new segment or grab one if it already exists
+    /// @return iterator that points a materialized segment (always valid
     /// iterator)
-    iterator
-    materialize_segment(const remote_segment_path& path, const segment_meta&);
+    iterator get_or_materialize_segment(
+      const remote_segment_path& path, const segment_meta&, segment_units);
 
+    model::ntp _ntp;
     retry_chain_node _rtc;
     retry_chain_logger _ctxlog;
     ss::gate _gate;
@@ -252,6 +248,7 @@ private:
     eviction_list_t _eviction_pending;
     segment_map_t _segments;
     partition_probe& _probe;
+    ts_read_path_probe& _ts_probe;
 };
 
 } // namespace cloud_storage

@@ -52,8 +52,8 @@ class FeaturesTestBase(RedpandaTest):
         assert (features['node_latest_version'] ==
                 features['original_cluster_version'])
         assert (features['node_latest_version'] == features['cluster_version'])
-        assert (features['node_earliest_version'] <=
-                features['node_latest_version'])
+        assert (features['node_earliest_version']
+                <= features['node_latest_version'])
 
         self.previous_version = self.installer.highest_from_prior_feature_version(
             RedpandaInstaller.HEAD)
@@ -229,11 +229,13 @@ class FeaturesMultiNodeTest(FeaturesTestBase):
 
         assert self.admin.put_license(license).status_code == 200
 
-        def obtain_license():
+        def obtain_configured_license():
             lic = self.admin.get_license()
-            return (lic is not None and lic['loaded'] is True, lic)
+            return (self.admin.is_sample_license(lic), lic)
 
-        resp = wait_until_result(obtain_license, timeout_sec=5, backoff_sec=1)
+        resp = wait_until_result(obtain_configured_license,
+                                 timeout_sec=5,
+                                 backoff_sec=1)
         assert resp['license'] is not None
         assert expected_license_contents == resp['license'], resp['license']
 

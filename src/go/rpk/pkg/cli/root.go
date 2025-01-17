@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -22,13 +23,17 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/acl"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/cloud"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/cluster"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/connect"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/container"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/debug"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/generate"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/group"
 	plugincmd "github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/plugin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/profile"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/registry"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/security"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/topic"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/transform"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cobraext"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
@@ -73,7 +78,14 @@ func Execute() {
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 	}
 	pf := root.PersistentFlags()
-	pf.StringVar(&p.ConfigFlag, "config", "", "Redpanda or rpk config file; default search paths are ~/.config/rpk/rpk.yaml, $PWD, and /etc/redpanda/redpanda.yaml")
+
+	searchLocal, _ := os.UserConfigDir()
+	if searchLocal == "" {
+		searchLocal = "~/.config"
+	}
+	searchLocal = filepath.Join(searchLocal, "rpk", "rpk.yaml")
+
+	pf.StringVar(&p.ConfigFlag, "config", "", fmt.Sprintf("Redpanda or rpk config file; default search paths are %q, $PWD/redpanda.yaml, and /etc/redpanda/redpanda.yaml", searchLocal))
 	pf.StringVar(&p.Profile, "profile", "", "rpk profile to use")
 	pf.StringArrayVarP(&p.FlagOverrides, "config-opt", "X", nil, "Override rpk configuration settings; '-X help' for detail or '-X list' for terser detail")
 	pf.BoolVarP(&p.DebugLogs, "verbose", "v", false, "Enable verbose logging")
@@ -98,13 +110,17 @@ func Execute() {
 		acl.NewCommand(fs, p),
 		cloud.NewCommand(fs, p, osExec),
 		cluster.NewCommand(fs, p),
-		container.NewCommand(),
+		container.NewCommand(fs, p),
+		connect.NewCommand(fs, p, osExec),
 		profile.NewCommand(fs, p),
 		debug.NewCommand(fs, p),
 		generate.NewCommand(fs, p),
 		group.NewCommand(fs, p),
 		plugincmd.NewCommand(fs),
+		registry.NewCommand(fs, p),
+		security.NewCommand(fs, p),
 		topic.NewCommand(fs, p),
+		transform.NewCommand(fs, p, osExec),
 		version.NewCommand(fs, p),
 
 		newStatusCommand(), // deprecated
@@ -118,7 +134,7 @@ func Execute() {
 	// flag. We exec with the flag and then create a bunch of fake cobra
 	// commands within rpk. The plugin now looks like it is a part of rpk.
 	//
-	// We block plugins from overwriting actual rpk commands (rpk acl),
+	// We block plugins from overwriting actual rpk commands (rpk security acl),
 	// unless the plugin is specifically rpk managed.
 	//
 	// Managed plugins are slightly weirder and are documented below.
@@ -148,6 +164,15 @@ func Execute() {
 				runXHelp()
 				cmd.Help()
 			}
+		}
+	})
+
+	// Cobra does not return an 'unknown command' error unless cobra.NoArgs is
+	// specified.
+	// See: https://github.com/spf13/cobra/issues/706
+	cobraext.Walk(root, func(c *cobra.Command) {
+		if c.Args == nil && c.HasSubCommands() {
+			c.Args = cobra.NoArgs
 		}
 	})
 

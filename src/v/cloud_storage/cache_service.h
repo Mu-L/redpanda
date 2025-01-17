@@ -10,96 +10,72 @@
 
 #pragma once
 
+#include "base/seastarx.h"
+#include "base/units.h"
+#include "cloud_io/basic_cache_service_api.h"
 #include "cloud_storage/access_time_tracker.h"
 #include "cloud_storage/cache_probe.h"
 #include "cloud_storage/recursive_directory_walker.h"
+#include "config/configuration.h"
 #include "config/property.h"
 #include "resource_mgmt/io_priority.h"
-#include "resource_mgmt/storage.h"
-#include "seastarx.h"
 #include "ssx/semaphore.h"
-#include "units.h"
+#include "storage/types.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/io_priority_class.hh>
 #include <seastar/core/iostream.hh>
+#include <seastar/core/lowres_clock.hh>
+#include <seastar/core/thread.hh>
 
 #include <filesystem>
+#include <iterator>
+#include <optional>
 #include <set>
 #include <string_view>
 
+struct cloud_storage_fixture;
+
 namespace cloud_storage {
 
-static constexpr size_t default_write_buffer_size = 128_KiB;
-static constexpr unsigned default_writebehind = 10;
+// These timeout/backoff settings are for S3 requests
+using namespace std::chrono_literals;
+inline const ss::lowres_clock::duration cache_hydration_timeout = 60s;
+inline const ss::lowres_clock::duration cache_hydration_backoff = 250ms;
+
+// This backoff is for failure of the local cache to retain recently
+// promoted data (i.e. highly stressed cache)
+inline const ss::lowres_clock::duration cache_thrash_backoff = 5000ms;
 
 class cache_test_fixture;
 
-struct [[nodiscard]] cache_item {
-    ss::file body;
-    size_t size;
-};
+using cache_item = cloud_io::cache_item;
 
-enum class [[nodiscard]] cache_element_status {
-    available,
-    not_available,
-    in_progress
-};
-std::ostream& operator<<(std::ostream& o, cache_element_status);
+using cache_element_status = cloud_io::cache_element_status;
 
 class cache;
 
 /// RAII guard for bytes reserved in the cache: constructed prior to a call
 /// to cache::put, and may be destroyed afterwards.
-class space_reservation_guard {
-public:
-    space_reservation_guard(
-      cache& cache, uint64_t bytes, size_t objects) noexcept
-      : _cache(cache)
-      , _bytes(bytes)
-      , _objects(objects) {}
+using space_reservation_guard
+  = cloud_io::basic_space_reservation_guard<ss::lowres_clock>;
 
-    space_reservation_guard(const space_reservation_guard&) = delete;
-    space_reservation_guard() = delete;
-    space_reservation_guard(space_reservation_guard&& rhs) noexcept
-      : _cache(rhs._cache)
-      , _bytes(rhs._bytes)
-      , _objects(rhs._objects) {
-        rhs._bytes = 0;
-        rhs._objects = 0;
-    }
-
-    ~space_reservation_guard();
-
-    /// After completing the write operation that this space reservation
-    /// protected, indicate how many bytes were really written: this is used to
-    /// atomically update cache usage stats to free the reservation and update
-    /// the bytes used stats together.
-    ///
-    /// May only be called once per reservation.
-    void wrote_data(uint64_t, size_t);
-
-private:
-    cache& _cache;
-
-    // Size acquired at time of reservation
-    uint64_t _bytes{0};
-    size_t _objects{0};
-};
-
-class cache : public ss::peering_sharded_service<cache> {
+class cache
+  : public cloud_io::basic_cache_service_api<ss::lowres_clock>
+  , public ss::peering_sharded_service<cache> {
 public:
     /// C-tor.
     ///
     /// \param cache_dir is a directory where cached data is stored
     cache(
       std::filesystem::path cache_dir,
-      size_t,
-      config::binding<double>,
-      config::binding<uint64_t>,
-      config::binding<std::optional<double>>,
-      config::binding<uint32_t>) noexcept;
+      size_t disk_size,
+      config::binding<double> disk_reservation,
+      config::binding<uint64_t> max_bytes_cfg,
+      config::binding<std::optional<double>> max_percent,
+      config::binding<uint32_t> max_objects,
+      config::binding<uint16_t> walk_concurrency) noexcept;
 
     cache(const cache&) = delete;
     cache(cache&& rhs) = delete;
@@ -111,6 +87,12 @@ public:
     ///
     /// \param key is a cache key
     ss::future<std::optional<cache_item>> get(std::filesystem::path key);
+
+    ss::future<std::optional<cloud_io::cache_item_stream>> get(
+      std::filesystem::path key,
+      ss::io_priority_class io_priority,
+      size_t read_buffer_size = cloud_io::default_read_buffer_size,
+      unsigned int read_ahead = cloud_io::default_read_ahead) override;
 
     /// Add new value to the cache, overwrite if it's already exist
     ///
@@ -127,8 +109,8 @@ public:
       space_reservation_guard& reservation,
       ss::io_priority_class io_priority
       = priority_manager::local().shadow_indexing_priority(),
-      size_t write_buffer_size = default_write_buffer_size,
-      unsigned int write_behind = default_writebehind);
+      size_t write_buffer_size = cloud_io::default_write_buffer_size,
+      unsigned int write_behind = cloud_io::default_write_behind) override;
 
     /// \brief Checks if the value is cached
     ///
@@ -139,7 +121,7 @@ public:
     /// \c cache_element_status::in_progress can be used as a hint since ntp are
     /// stored on the same shard most of the time.
     ss::future<cache_element_status>
-    is_cached(const std::filesystem::path& key);
+    is_cached(const std::filesystem::path& key) override;
 
     /// Remove element from cache by key
     ss::future<> invalidate(const std::filesystem::path& key);
@@ -149,11 +131,12 @@ public:
 
     // Call this before starting a download, to trim the cache if necessary
     // and wait until enough free space is available.
-    ss::future<space_reservation_guard> reserve_space(uint64_t, size_t);
+    ss::future<space_reservation_guard>
+      reserve_space(uint64_t, size_t) override;
 
     // Release capacity acquired via `reserve_space`.  This spawns
     // a background fiber in order to be callable from the guard destructor.
-    void reserve_space_release(uint64_t, size_t, uint64_t, size_t);
+    void reserve_space_release(uint64_t, size_t, uint64_t, size_t) override;
 
     static ss::future<> initialize(std::filesystem::path);
 
@@ -168,12 +151,31 @@ public:
 
     uint64_t get_usage_bytes() { return _current_cache_size; }
 
+    uint64_t get_max_bytes() { return _max_bytes; }
+
+    uint64_t get_max_objects() { return _max_objects(); }
+
     /// Administrative trim, that specifies its own limits instead of using
     /// the configured limits (skips throttling, and can e.g. trim to zero bytes
     /// if they want to)
     ss::future<> trim_manually(
       std::optional<uint64_t> size_limit_override,
       std::optional<size_t> object_limit_override);
+
+    std::filesystem::path
+    get_local_path(const std::filesystem::path& key) const {
+        return _cache_dir / key;
+    }
+
+    // Checks if a cluster configuration is valid for the properties
+    // `cloud_storage_cache_size` and `cloud_storage_cache_size_percent`.
+    // Two cases are invalid: 1. the case in which both are 0, 2. the case in
+    // which `cache_size` is 0 while `cache_size_percent` is `std::nullopt`.
+    //
+    // Returns `std::nullopt` if the passed configuration is valid, or an
+    // `ss::sstring` explaining the misconfiguration otherwise.
+    static std::optional<ss::sstring>
+    validate_cache_config(const config::configuration& conf);
 
 private:
     /// Load access time tracker from file
@@ -195,11 +197,25 @@ private:
     struct trim_result {
         uint64_t deleted_size{0};
         size_t deleted_count{0};
+        bool trim_missed_tmp_files{false};
     };
+
+    ss::future<std::optional<cache_item>> _get(std::filesystem::path key);
+
+    /// Remove object from cache
+    ss::future<> _invalidate(const std::filesystem::path& key);
+
+    ss::future<cache_element_status>
+    _is_cached(const std::filesystem::path& key);
 
     /// Ordinary trim: prioritze trimming data chunks, only delete indices etc
     /// if all their chunks are dropped.
     ss::future<trim_result> trim_fast(
+      const fragmented_vector<file_list_item>& candidates,
+      uint64_t delete_bytes,
+      size_t delete_objects);
+
+    ss::future<trim_result> do_trim(
       const fragmented_vector<file_list_item>& candidates,
       uint64_t delete_bytes,
       size_t delete_objects);
@@ -215,7 +231,16 @@ private:
     std::optional<std::chrono::milliseconds> get_trim_delay() const;
 
     /// Invoke trim, waiting if not enough time passed since the last trim
-    ss::future<> trim_throttled();
+    ss::future<> trim_throttled_unlocked(
+      std::optional<uint64_t> size_limit_override = std::nullopt,
+      std::optional<size_t> object_limit_override = std::nullopt);
+
+    // Take the cleanup semaphore before calling trim_throttled
+    ss::future<> trim_throttled(
+      std::optional<uint64_t> size_limit_override = std::nullopt,
+      std::optional<size_t> object_limit_override = std::nullopt);
+
+    void maybe_background_trim();
 
     /// Whether an objects path makes it impervious to pinning, like
     /// the access time tracker.
@@ -238,6 +263,10 @@ private:
     /// (only runs on shard 0)
     ss::future<> do_reserve_space(uint64_t, size_t);
 
+    /// Trim cache using results from the previous recursive directory walk
+    ss::future<trim_result>
+    trim_carryover(uint64_t delete_bytes, uint64_t delete_objects);
+
     /// Return true if the sum of used space and reserved space is far enough
     /// below max size to accommodate a new reservation of `bytes`
     /// (only runs on shard 0)
@@ -258,6 +287,14 @@ private:
     /// update.
     void set_block_puts(bool);
 
+    /// Remove segment or chunk subdirectory with all its auxilary files (tx,
+    /// index)
+    ss::future<cache::trim_result>
+    remove_segment_full(const file_list_item& file_stat);
+
+    ss::future<> sync_access_time_tracker(
+      access_time_tracker::add_entries_t add_entries
+      = access_time_tracker::add_entries_t::no);
     std::filesystem::path _cache_dir;
     size_t _disk_size;
     config::binding<double> _disk_reservation;
@@ -265,6 +302,7 @@ private:
     config::binding<std::optional<double>> _max_percent;
     uint64_t _max_bytes;
     config::binding<uint32_t> _max_objects;
+    config::binding<uint16_t> _walk_concurrency;
     void update_max_bytes();
 
     ss::abort_source _as;
@@ -297,13 +335,15 @@ private:
     /// and have to decide whether to block writes, or exceed our configured
     /// limit.
     /// (shard 0 only)
-    uint64_t _free_space{0};
+    std::optional<uint64_t> _free_space;
 
     ssx::semaphore _cleanup_sm{1, "cloud/cache"};
     std::set<std::filesystem::path> _files_in_progress;
     cache_probe probe;
     access_time_tracker _access_time_tracker;
     ss::timer<ss::lowres_clock> _tracker_timer;
+    ssx::semaphore _access_tracker_writer_sm{
+      1, "cloud/cache/access_tracker_writer"};
 
     /// Remember when we last finished clean_up_cache, in order to
     /// avoid wastefully running it again soon after.
@@ -322,6 +362,14 @@ private:
     ss::condition_variable _block_puts_cond;
 
     friend class cache_test_fixture;
+    friend struct ::cloud_storage_fixture;
+
+    // List of probable deletion candidates from the last trim.
+    std::optional<fragmented_vector<file_list_item>> _last_trim_carryover;
+
+    ss::timer<ss::lowres_clock> _tracker_sync_timer;
+    ssx::semaphore _tracker_sync_timer_sem{
+      1, "cloud/cache/access_tracker_sync"};
 };
 
 } // namespace cloud_storage

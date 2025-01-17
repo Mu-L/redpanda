@@ -13,6 +13,7 @@
 #include "security/fwd.h"
 #include "security/sasl_authentication.h"
 #include "security/scram_algorithm.h"
+#include "security/types.h"
 
 namespace security {
 
@@ -25,7 +26,8 @@ public:
 
     explicit scram_authenticator(credential_store& credentials)
       : _state{state::client_first_message}
-      , _credentials(credentials) {}
+      , _credentials(credentials)
+      , _audit_user() {}
 
     ss::future<result<bytes>> authenticate(bytes auth_bytes) override;
 
@@ -38,6 +40,10 @@ public:
           "Authentication id is not valid until auth process complete");
         return _principal;
     }
+
+    const audit::user& audit_user() const override { return _audit_user; }
+
+    const char* mechanism_name() const override { return "SASL-SCRAM"; }
 
 private:
     enum class state {
@@ -57,6 +63,7 @@ private:
     state _state;
     credential_store& _credentials;
     acl_principal _principal;
+    security::audit::user _audit_user;
 
     // populated during authentication process
     std::unique_ptr<scram_credential> _credential;
@@ -73,5 +80,8 @@ struct scram_sha512_authenticator {
     using auth = scram_authenticator<scram_sha512>;
     static constexpr const char* name = "SCRAM-SHA-512";
 };
+
+std::optional<std::string_view> validate_scram_credential(
+  const scram_credential& cred, const credential_password& password);
 
 } // namespace security

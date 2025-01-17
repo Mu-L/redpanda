@@ -5,6 +5,8 @@ rp_test(
     cpu_profiler_test.cc
     available_memory_test.cc
   LIBRARIES v::seastar_testing_main v::resource_mgmt v::config
+  # TODO: re-enable when https://github.com/redpanda-data/redpanda/issues/16308 is fixed
+  SKIP_BUILD_TYPES "Debug"
   LABELS resource_mgmt
 )
 
@@ -28,5 +30,15 @@ rp_test(
   BINARY_NAME storage_resource_mgmt
   SOURCES storage_test.cc
   LIBRARIES v::seastar_testing_main v::storage_resource_mgmt v::config
+  LABELS resource_mgmt
+)
+
+rp_test(
+  UNIT_TEST
+  GTEST
+  BINARY_NAME gtest_resource_mgmt
+  SOURCES
+    memory_groups_test.cc
+  LIBRARIES v::resource_mgmt v::gtest_main v::utils
   LABELS resource_mgmt
 )

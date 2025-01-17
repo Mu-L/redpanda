@@ -17,10 +17,10 @@
 #include "model/timeout_clock.h"
 #include "raft/consensus_utils.h"
 #include "raft/group_configuration.h"
+#include "raft/heartbeats.h"
 #include "raft/types.h"
 #include "random/generators.h"
 #include "reflection/adl.h"
-#include "serde/serde.h"
 #include "storage/record_batch_builder.h"
 #include "test_utils/randoms.h"
 #include "test_utils/rpc.h"
@@ -63,14 +63,15 @@ struct checking_consumer {
 };
 
 SEASTAR_THREAD_TEST_CASE(append_entries_requests) {
-    auto batches = model::test::make_random_batches(model::offset(1), 3, false);
+    auto batches
+      = model::test::make_random_batches(model::offset(1), 3, false).get();
 
     for (auto& b : batches) {
         b.set_term(model::term_id(123));
     }
 
     auto rdr = model::make_memory_record_batch_reader(std::move(batches));
-    auto readers = raft::details::share_n(std::move(rdr), 2).get0();
+    auto readers = raft::details::share_n(std::move(rdr), 2).get();
     auto meta = raft::protocol_metadata{
       .group = raft::group_id(1),
       .commit_index = model::offset(100),
@@ -78,12 +79,14 @@ SEASTAR_THREAD_TEST_CASE(append_entries_requests) {
       .prev_log_index = model::offset(99),
       .prev_log_term = model::term_id(-1),
       .last_visible_index = model::offset(200),
+      .dirty_offset = model::offset(99),
     };
     raft::append_entries_request req(
       raft::vnode(model::node_id(1), model::revision_id(10)),
       raft::vnode(model::node_id(10), model::revision_id(101)),
       meta,
-      std::move(readers.back()));
+      std::move(readers.back()),
+      0);
 
     readers.pop_back();
     const auto target_node_id = req.target_node();
@@ -103,14 +106,15 @@ SEASTAR_THREAD_TEST_CASE(append_entries_requests) {
     BOOST_REQUIRE_EQUAL(d.metadata().prev_log_term, meta.prev_log_term);
     BOOST_REQUIRE_EQUAL(
       d.metadata().last_visible_index, meta.last_visible_index);
+    BOOST_REQUIRE_EQUAL(d.metadata().dirty_offset, meta.dirty_offset);
 
     auto batches_result = model::consume_reader_to_memory(
                             std::move(readers.back()), model::no_timeout)
-                            .get0();
+                            .get();
     std::move(d)
       .release_batches()
       .consume(checking_consumer(std::move(batches_result)), model::no_timeout)
-      .get0();
+      .get();
 }
 
 model::broker create_test_broker() {
@@ -140,6 +144,7 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_request_roundtrip) {
         req.heartbeats[i].meta.prev_log_index = model::offset(i);
         req.heartbeats[i].meta.prev_log_term = model::term_id(i);
         req.heartbeats[i].meta.last_visible_index = model::offset(i);
+        req.heartbeats[i].meta.dirty_offset = model::offset(i);
         req.heartbeats[i].target_node_id = raft::vnode(
           model::node_id(0), model::revision_id(i));
     }
@@ -159,6 +164,8 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_request_roundtrip) {
           res.heartbeats[i].meta.prev_log_term, model::term_id(i));
         BOOST_REQUIRE_EQUAL(
           res.heartbeats[i].meta.last_visible_index, model::offset(i));
+        BOOST_REQUIRE_EQUAL(
+          res.heartbeats[i].meta.dirty_offset, model::offset(i));
         BOOST_REQUIRE_EQUAL(
           res.heartbeats[i].target_node_id,
           raft::vnode(model::node_id(0), model::revision_id(i)));
@@ -222,7 +229,7 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_roundtrip) {
           .term = model::term_id(random_generators::get_int(0, 1000)),
           .last_flushed_log_index = commited_idx,
           .last_dirty_log_index = dirty_idx,
-          .result = raft::append_entries_reply::status::success});
+          .result = raft::reply_result::success});
     }
     absl::flat_hash_map<raft::group_id, raft::append_entries_reply> expected;
     expected.reserve(reply.meta.size());
@@ -246,6 +253,8 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_roundtrip) {
           expected[gr].last_dirty_log_index,
           result.meta[i].last_dirty_log_index);
         BOOST_REQUIRE_EQUAL(expected[gr].result, result.meta[i].result);
+        // v1 heartbeats always have default may_recover
+        BOOST_REQUIRE_EQUAL(result.meta[i].may_recover, true);
     }
 }
 
@@ -266,7 +275,7 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_negatives) {
       .last_flushed_log_index = model::offset(-1),
       .last_dirty_log_index = model::offset(-1),
       .last_term_base_offset = model::offset(-1),
-      .result = raft::append_entries_reply::status::success});
+      .result = raft::reply_result::success});
 
     auto buf = serde::to_iobuf(reply);
     auto result = serde::from_iobuf<raft::heartbeat_reply>(std::move(buf));
@@ -290,7 +299,7 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_with_failures) {
       .last_flushed_log_index = model::offset{},
       .last_dirty_log_index = model::offset{},
       .last_term_base_offset = model::offset{},
-      .result = raft::append_entries_reply::status::timeout});
+      .result = raft::reply_result::follower_busy});
 
     /**
      * Two other replies are successful
@@ -303,7 +312,7 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_with_failures) {
       .last_flushed_log_index = model::offset(100),
       .last_dirty_log_index = model::offset(101),
       .last_term_base_offset = model::offset(102),
-      .result = raft::append_entries_reply::status::success});
+      .result = raft::reply_result::success});
 
     reply.meta.push_back(raft::append_entries_reply{
       .target_node_id = raft::vnode(model::node_id(0), model::revision_id{1}),
@@ -313,12 +322,12 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_with_failures) {
       .last_flushed_log_index = model::offset(200),
       .last_dirty_log_index = model::offset(201),
       .last_term_base_offset = model::offset(202),
-      .result = raft::append_entries_reply::status::success});
+      .result = raft::reply_result::success});
 
     auto buf = serde::to_iobuf(reply);
 
     auto result = serde::from_iobuf<raft::heartbeat_reply>(std::move(buf));
-    for (auto i = 0; i < reply.meta.size(); ++i) {
+    for (size_t i = 0; i < reply.meta.size(); ++i) {
         BOOST_REQUIRE_EQUAL(reply.meta[i].group, result.meta[i].group);
         BOOST_REQUIRE_EQUAL(
           reply.meta[i].last_flushed_log_index,
@@ -353,7 +362,7 @@ SEASTAR_THREAD_TEST_CASE(
       .last_flushed_log_index = model::offset{},
       .last_dirty_log_index = model::offset{},
       .last_term_base_offset = model::offset{},
-      .result = raft::append_entries_reply::status::success});
+      .result = raft::reply_result::success});
 
     /**
      * Two other replies are failures
@@ -366,7 +375,7 @@ SEASTAR_THREAD_TEST_CASE(
       .last_flushed_log_index = model::offset{},
       .last_dirty_log_index = model::offset{},
       .last_term_base_offset = model::offset{},
-      .result = raft::append_entries_reply::status::group_unavailable});
+      .result = raft::reply_result::group_unavailable});
 
     reply.meta.push_back(raft::append_entries_reply{
       .target_node_id = raft::vnode(model::node_id{}, model::revision_id{}),
@@ -376,12 +385,12 @@ SEASTAR_THREAD_TEST_CASE(
       .last_flushed_log_index = model::offset{},
       .last_dirty_log_index = model::offset{},
       .last_term_base_offset = model::offset{},
-      .result = raft::append_entries_reply::status::group_unavailable});
+      .result = raft::reply_result::group_unavailable});
 
     auto buf = serde::to_iobuf(reply);
 
     auto result = serde::from_iobuf<raft::heartbeat_reply>(std::move(buf));
-    for (auto i = 0; i < reply.meta.size(); ++i) {
+    for (size_t i = 0; i < reply.meta.size(); ++i) {
         BOOST_REQUIRE_EQUAL(reply.meta[i].group, result.meta[i].group);
         BOOST_REQUIRE_EQUAL(
           reply.meta[i].last_flushed_log_index,
@@ -413,7 +422,7 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_with_only_failures) {
       .last_flushed_log_index = model::offset{},
       .last_dirty_log_index = model::offset{},
       .last_term_base_offset = model::offset{},
-      .result = raft::append_entries_reply::status::group_unavailable});
+      .result = raft::reply_result::group_unavailable});
 
     /**
      * Two other replies are failures
@@ -426,7 +435,7 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_with_only_failures) {
       .last_flushed_log_index = model::offset{},
       .last_dirty_log_index = model::offset{},
       .last_term_base_offset = model::offset{},
-      .result = raft::append_entries_reply::status::group_unavailable});
+      .result = raft::reply_result::group_unavailable});
 
     reply.meta.push_back(raft::append_entries_reply{
       .target_node_id = raft::vnode(model::node_id{}, model::revision_id{}),
@@ -436,12 +445,12 @@ SEASTAR_THREAD_TEST_CASE(heartbeat_response_with_only_failures) {
       .last_flushed_log_index = model::offset{},
       .last_dirty_log_index = model::offset{},
       .last_term_base_offset = model::offset{},
-      .result = raft::append_entries_reply::status::group_unavailable});
+      .result = raft::reply_result::group_unavailable});
 
     auto buf = serde::to_iobuf(reply);
 
     auto result = serde::from_iobuf<raft::heartbeat_reply>(std::move(buf));
-    for (auto i = 0; i < reply.meta.size(); ++i) {
+    for (size_t i = 0; i < reply.meta.size(); ++i) {
         BOOST_REQUIRE_EQUAL(reply.meta[i].group, result.meta[i].group);
         BOOST_REQUIRE_EQUAL(
           reply.meta[i].last_flushed_log_index,
@@ -496,9 +505,21 @@ SEASTAR_THREAD_TEST_CASE(snapshot_metadata_roundtrip) {
 }
 
 SEASTAR_THREAD_TEST_CASE(snapshot_metadata_backward_compatibility) {
-    auto n1 = model::random_broker(0, 100);
-    auto n2 = model::random_broker(0, 100);
-    auto n3 = model::random_broker(0, 100);
+    auto bp1 = model::random_broker_properties();
+    // Zero out the available_memory_bytes field which isn't supported
+    // by adl since the field was added after serde serialization became
+    // the default.
+    bp1.available_memory_bytes = 0;
+    auto n1 = model::random_broker(0, 100, bp1);
+
+    auto bp2 = model::random_broker_properties();
+    bp2.available_memory_bytes = 0;
+    auto n2 = model::random_broker(0, 100, bp2);
+
+    auto bp3 = model::random_broker_properties();
+    bp3.available_memory_bytes = 0;
+    auto n3 = model::random_broker(0, 100, bp3);
+
     std::vector<model::broker> nodes{n1, n2, n3};
     raft::group_nodes current{
       .voters
@@ -537,7 +558,8 @@ SEASTAR_THREAD_TEST_CASE(snapshot_metadata_backward_compatibility) {
 }
 
 SEASTAR_THREAD_TEST_CASE(append_entries_request_serde_wrapper_serde) {
-    auto batches = model::test::make_random_batches(model::offset(1), 3, false);
+    auto batches
+      = model::test::make_random_batches(model::offset(1), 3, false).get();
 
     for (auto& b : batches) {
         b.set_term(model::term_id(123));
@@ -545,7 +567,7 @@ SEASTAR_THREAD_TEST_CASE(append_entries_request_serde_wrapper_serde) {
 
     auto rdr = model::make_memory_record_batch_reader(std::move(batches));
     // share readers to have a copy of data to compare
-    auto readers = raft::details::share_n(std::move(rdr), 2).get0();
+    auto readers = raft::details::share_n(std::move(rdr), 2).get();
 
     auto meta = raft::protocol_metadata{
       .group = raft::group_id(1),
@@ -554,12 +576,14 @@ SEASTAR_THREAD_TEST_CASE(append_entries_request_serde_wrapper_serde) {
       .prev_log_index = model::offset(99),
       .prev_log_term = model::term_id(-1),
       .last_visible_index = model::offset(200),
+      .dirty_offset = model::offset(99),
     };
     raft::append_entries_request req(
       raft::vnode(model::node_id(1), model::revision_id(10)),
       raft::vnode(model::node_id(10), model::revision_id(101)),
       meta,
-      std::move(readers.back()));
+      std::move(readers.back()),
+      0);
 
     readers.pop_back();
 
@@ -587,12 +611,13 @@ SEASTAR_THREAD_TEST_CASE(append_entries_request_serde_wrapper_serde) {
       decoded_req.metadata().prev_log_term, meta.prev_log_term);
     BOOST_REQUIRE_EQUAL(
       decoded_req.metadata().last_visible_index, meta.last_visible_index);
+    BOOST_REQUIRE_EQUAL(decoded_req.metadata().dirty_offset, meta.dirty_offset);
 
     auto batches_result = model::consume_reader_to_memory(
                             std::move(readers.back()), model::no_timeout)
-                            .get0();
+                            .get();
     std::move(decoded_req)
       .release_batches()
       .consume(checking_consumer(std::move(batches_result)), model::no_timeout)
-      .get0();
+      .get();
 }

@@ -36,6 +36,7 @@ import (
 	"github.com/beevik/ntp"
 	"github.com/docker/go-units"
 	"github.com/hashicorp/go-multierror"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/debug/common"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	osutil "github.com/redpanda-data/redpanda/src/go/rpk/pkg/os"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -49,16 +50,22 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const linuxUtilsRoot = "utils"
+
 // determineFilepath will process the given path and sets:
 //   - File Name: If the path is empty, the filename will be <timestamp>-bundle.zip
 //   - File Extension: if no extension is provided we default to .zip
 //   - File Location: we check for write permissions in the pwd (for backcompat);
 //     if permission is denied we default to $HOME unless isFlag is true.
-func determineFilepath(fs afero.Fs, path string, isFlag bool) (finalPath string, err error) {
+func determineFilepath(fs afero.Fs, rp *config.RedpandaYaml, path string, isFlag bool) (finalPath string, err error) {
 	// if it's empty, use ./<timestamp>-bundle.zip
 	if path == "" {
 		timestamp := time.Now().Unix()
-		path = fmt.Sprintf("%d-bundle.zip", timestamp)
+		if rp.Redpanda.AdvertisedRPCAPI != nil {
+			path = fmt.Sprintf("%v-%d-bundle.zip", common.SanitizeName(rp.Redpanda.AdvertisedRPCAPI.Address), timestamp)
+		} else {
+			path = fmt.Sprintf("%d-bundle.zip", timestamp)
+		}
 	} else if isDir, _ := afero.IsDir(fs, path); isDir {
 		return "", fmt.Errorf("output file path is a directory, please specify the name of the file")
 	}
@@ -114,34 +121,47 @@ func executeBundle(ctx context.Context, bp bundleParams) error {
 	defer w.Close()
 
 	ps := &stepParams{
-		fs:      bp.fs,
-		w:       w,
-		timeout: bp.timeout,
+		fs:       bp.fs,
+		w:        w,
+		timeout:  bp.timeout,
+		fileRoot: strings.TrimSuffix(filepath.Base(bp.path), ".zip"),
 	}
 
 	addrs := bp.y.Rpk.AdminAPI.Addresses
 
 	steps := []step{
-		saveKafkaMetadata(ctx, ps, bp.cl),
-		saveDataDirStructure(ps, bp.y),
-		saveConfig(ps, bp.y),
 		saveCPUInfo(ps),
-		saveInterrupts(ps),
-		saveResourceUsageData(ps, bp.y),
-		saveNTPDrift(ps),
-		saveSyslog(ps),
-		saveSingleAdminAPICalls(ctx, ps, bp.fs, bp.p, addrs, bp.metricsInterval),
-		saveClusterAdminAPICalls(ctx, ps, bp.fs, bp.p, addrs),
-		saveDNSData(ctx, ps),
-		saveDiskUsage(ctx, ps, bp.y),
-		saveLogs(ctx, ps, bp.logsSince, bp.logsUntil, bp.logsLimitBytes),
-		saveSocketData(ctx, ps),
-		saveTopOutput(ctx, ps),
-		saveVmstat(ctx, ps),
-		saveIP(ctx, ps),
-		saveLspci(ctx, ps),
-		saveDmidecode(ctx, ps),
+		saveClusterAdminAPICalls(ctx, ps, bp.fs, bp.p, addrs, bp.partitions),
+		saveCmdLine(ps),
+		saveConfig(ps, bp.y),
 		saveControllerLogDir(ps, bp.y, bp.controllerLogLimitBytes),
+		saveCrashReports(ps, bp.y),
+		saveDNSData(ctx, ps),
+		saveDataDirStructure(ps, bp.y),
+		saveDiskUsage(ctx, ps, bp.y),
+		saveDmidecode(ctx, ps),
+		saveFree(ctx, ps),
+		saveIP(ctx, ps),
+		saveInterrupts(ps),
+		saveKafkaMetadata(ctx, ps, bp.cl),
+		saveKernelSymbols(ps),
+		saveLogs(ctx, ps, bp.logsSince, bp.logsUntil, bp.logsLimitBytes),
+		saveLspci(ctx, ps),
+		saveMdstat(ps),
+		saveMountedFilesystems(ps),
+		saveNTPDrift(ps),
+		saveResourceUsageData(ps, bp.y),
+		saveSingleAdminAPICalls(ctx, ps, bp.fs, bp.p, addrs, bp.cpuProfilerWait),
+		saveMetricsAPICalls(ctx, ps, bp.fs, bp.p, addrs, bp.metricsInterval, bp.metricsSampleCount),
+		saveStartupLog(ps, bp.y),
+		saveSlabInfo(ps),
+		saveSocketData(ctx, ps),
+		saveSysctl(ctx, ps),
+		saveSyslog(ps),
+		saveTopOutput(ctx, ps),
+		saveUname(ctx, ps),
+		saveUptime(ctx, ps),
+		saveVmstat(ctx, ps),
 	}
 
 	for _, s := range steps {
@@ -164,20 +184,22 @@ func executeBundle(ctx context.Context, bp bundleParams) error {
 type step func() error
 
 type stepParams struct {
-	fs      afero.Fs
-	m       sync.Mutex
-	w       *zip.Writer
-	timeout time.Duration
+	fs       afero.Fs
+	m        sync.Mutex
+	w        *zip.Writer
+	timeout  time.Duration
+	fileRoot string
 }
 
 type fileInfo struct {
-	Size     string `json:"size"`
-	Mode     string `json:"mode"`
-	Symlink  string `json:"symlink,omitempty"`
-	Error    string `json:"error,omitempty"`
-	Modified string `json:"modified"`
-	User     string `json:"user"`
-	Group    string `json:"group"`
+	Size      string `json:"size"`
+	Mode      string `json:"mode"`
+	Symlink   string `json:"symlink,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Modified  string `json:"modified"`
+	User      string `json:"user"`
+	Group     string `json:"group"`
+	SizeBytes int64  `json:"size_bytes"`
 }
 
 type limitedWriter struct {
@@ -212,7 +234,7 @@ func writeFileToZip(ps *stepParams, filename string, contents []byte) error {
 	defer ps.m.Unlock()
 
 	wr, err := ps.w.CreateHeader(&zip.FileHeader{
-		Name:     filename,
+		Name:     filepath.Join(ps.fileRoot, filename),
 		Method:   zip.Deflate,
 		Modified: time.Now(),
 	})
@@ -272,7 +294,7 @@ func writeCommandOutputToZipLimit(
 	cmd.Env = osutil.SystemLdPathEnv()
 
 	wr, err := ps.w.CreateHeader(&zip.FileHeader{
-		Name:     filename,
+		Name:     filepath.Join(ps.fileRoot, filename),
 		Method:   zip.Deflate,
 		Modified: time.Now(),
 	})
@@ -298,14 +320,9 @@ func writeCommandOutputToZipLimit(
 	err = cmd.Wait()
 	if err != nil {
 		if !strings.Contains(err.Error(), "broken pipe") {
-			return fmt.Errorf("couldn't save '%s': %w", filename, err)
+			return fmt.Errorf("couldn't save '%s': %w; %[1]v contains the full error message", filename, err)
 		}
-		zap.L().Sugar().Debugf(
-			"Got '%v' while running '%s'. This is probably due to the"+
-				" command's output exceeding its limit in bytes.",
-			err,
-			cmd,
-		)
+		zap.L().Sugar().Warnf("%v: got '%v' while running '%s'. This is probably due to the command's output exceeding its limit in bytes.", filename, err, cmd)
 	}
 	return nil
 }
@@ -456,38 +473,42 @@ func saveDataDirStructure(ps *stepParams, y *config.RedpandaYaml) step {
 // Writes the config file to the bundle, redacting SASL credentials.
 func saveConfig(ps *stepParams, y *config.RedpandaYaml) step {
 	return func() error {
+		yCp, err := createRedpandaConfigCopy(y)
+		if err != nil {
+			return err
+		}
 		// Redact SASL credentials
 		redacted := "(REDACTED)"
-		if y.Rpk.KafkaAPI.SASL != nil {
-			y.Rpk.KafkaAPI.SASL.User = redacted
-			y.Rpk.KafkaAPI.SASL.Password = redacted
+		if yCp.Rpk.KafkaAPI.SASL != nil {
+			yCp.Rpk.KafkaAPI.SASL.User = redacted
+			yCp.Rpk.KafkaAPI.SASL.Password = redacted
 		}
 		// We want to redact any blindly decoded parameters.
-		redactOtherMap(y.Other)
-		redactOtherMap(y.Redpanda.Other)
-		redactServerTLSSlice(y.Redpanda.KafkaAPITLS)
-		redactServerTLSSlice(y.Redpanda.AdminAPITLS)
-		if y.SchemaRegistry != nil {
-			for _, server := range y.SchemaRegistry.SchemaRegistryAPITLS {
+		redactOtherMap(yCp.Other)
+		redactOtherMap(yCp.Redpanda.Other)
+		redactServerTLSSlice(yCp.Redpanda.KafkaAPITLS)
+		redactServerTLSSlice(yCp.Redpanda.AdminAPITLS)
+		if yCp.SchemaRegistry != nil {
+			for _, server := range yCp.SchemaRegistry.SchemaRegistryAPITLS {
 				redactOtherMap(server.Other)
 			}
 		}
-		if y.Pandaproxy != nil {
-			redactOtherMap(y.Pandaproxy.Other)
-			redactServerTLSSlice(y.Pandaproxy.PandaproxyAPITLS)
+		if yCp.Pandaproxy != nil {
+			redactOtherMap(yCp.Pandaproxy.Other)
+			redactServerTLSSlice(yCp.Pandaproxy.PandaproxyAPITLS)
 		}
-		if y.PandaproxyClient != nil {
-			redactOtherMap(y.PandaproxyClient.Other)
-			y.PandaproxyClient.SCRAMPassword = &redacted
-			y.PandaproxyClient.SCRAMUsername = &redacted
+		if yCp.PandaproxyClient != nil {
+			redactOtherMap(yCp.PandaproxyClient.Other)
+			yCp.PandaproxyClient.SCRAMPassword = &redacted
+			yCp.PandaproxyClient.SCRAMUsername = &redacted
 		}
-		if y.SchemaRegistryClient != nil {
-			redactOtherMap(y.SchemaRegistryClient.Other)
-			y.SchemaRegistryClient.SCRAMPassword = &redacted
-			y.SchemaRegistryClient.SCRAMUsername = &redacted
+		if yCp.SchemaRegistryClient != nil {
+			redactOtherMap(yCp.SchemaRegistryClient.Other)
+			yCp.SchemaRegistryClient.SCRAMPassword = &redacted
+			yCp.SchemaRegistryClient.SCRAMUsername = &redacted
 		}
 
-		bs, err := yaml.Marshal(y)
+		bs, err := yaml.Marshal(yCp)
 		if err != nil {
 			return fmt.Errorf("couldn't encode the redpanda config as YAML: %w", err)
 		}
@@ -505,6 +526,19 @@ func redactOtherMap(other map[string]interface{}) {
 	for k := range other {
 		other[k] = "(REDACTED)"
 	}
+}
+
+func createRedpandaConfigCopy(y *config.RedpandaYaml) (*config.RedpandaYaml, error) {
+	bs, err := yaml.Marshal(y)
+	if err != nil {
+		return nil, fmt.Errorf("unable to serialize the loaded redpanda config as YAML: %v", err)
+	}
+	var cp config.RedpandaYaml
+	err = yaml.Unmarshal(bs, &cp)
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode the redpanda config: %v", err)
+	}
+	return &cp, nil
 }
 
 // Saves the contents of '/proc/cpuinfo'.
@@ -526,6 +560,64 @@ func saveInterrupts(ps *stepParams) step {
 			return err
 		}
 		return writeFileToZip(ps, "proc/interrupts", bs)
+	}
+}
+
+// Saves the contents of '/proc/mounts'.
+func saveMountedFilesystems(ps *stepParams) step {
+	return func() error {
+		bs, err := afero.ReadFile(ps.fs, "/proc/mounts")
+		if err != nil {
+			return err
+		}
+		return writeFileToZip(ps, "proc/mounts", bs)
+	}
+}
+
+// Saves the contents of '/proc/slabinfo'. Requires Sudo.
+func saveSlabInfo(ps *stepParams) step {
+	return func() error {
+		bs, err := afero.ReadFile(ps.fs, "/proc/slabinfo")
+		if err != nil {
+			if errors.Is(err, fs.ErrPermission) {
+				return fmt.Errorf("%v: you may need to run the command as root to read this file", err)
+			}
+			return err
+		}
+		return writeFileToZip(ps, "proc/slabinfo", bs)
+	}
+}
+
+// Saves the contents of '/proc/cmdline'.
+func saveCmdLine(ps *stepParams) step {
+	return func() error {
+		bs, err := afero.ReadFile(ps.fs, "/proc/cmdline")
+		if err != nil {
+			return err
+		}
+		return writeFileToZip(ps, "proc/cmdline", bs)
+	}
+}
+
+// Saves the contents of '/proc/mdstat'.
+func saveMdstat(ps *stepParams) step {
+	return func() error {
+		bs, err := afero.ReadFile(ps.fs, "/proc/mdstat")
+		if err != nil {
+			return err
+		}
+		return writeFileToZip(ps, "proc/mdstat", bs)
+	}
+}
+
+// Saves the contents of '/proc/kallsyms'.
+func saveKernelSymbols(ps *stepParams) step {
+	return func() error {
+		bs, err := afero.ReadFile(ps.fs, "/proc/kallsyms")
+		if err != nil {
+			return err
+		}
+		return writeFileToZip(ps, "proc/kallsyms", bs)
 	}
 }
 
@@ -579,7 +671,6 @@ func saveNTPDrift(ps *stepParams) step {
 				zap.L().Sugar().Debugf("Retrying (%d retries left)", retries-n)
 			}),
 		)
-
 		if err != nil {
 			return fmt.Errorf("error querying '%s': %w", host, err)
 		}
@@ -607,7 +698,7 @@ func saveNTPDrift(ps *stepParams) step {
 
 		return writeFileToZip(
 			ps,
-			"ntp.txt",
+			filepath.Join(linuxUtilsRoot, "ntp.txt"),
 			marshalled,
 		)
 	}
@@ -619,14 +710,21 @@ func saveSyslog(ps *stepParams) step {
 		if err != nil {
 			return err
 		}
-		return writeFileToZip(ps, "syslog.txt", entries)
+		return writeFileToZip(ps, filepath.Join(linuxUtilsRoot, "syslog.txt"), entries)
 	}
 }
 
 // Saves the output of `dig`.
 func saveDNSData(ctx context.Context, ps *stepParams) step {
 	return func() error {
-		return writeCommandOutputToZip(ctx, ps, "dig.txt", "dig")
+		return writeCommandOutputToZip(ctx, ps, filepath.Join(linuxUtilsRoot, "dig.txt"), "dig")
+	}
+}
+
+// Saves the output of `uname -a`.
+func saveUname(ctx context.Context, ps *stepParams) step {
+	return func() error {
+		return writeCommandOutputToZip(ctx, ps, filepath.Join(linuxUtilsRoot, "uname.txt"), "uname", "-a")
 	}
 }
 
@@ -636,7 +734,7 @@ func saveDiskUsage(ctx context.Context, ps *stepParams, y *config.RedpandaYaml) 
 		return writeCommandOutputToZip(
 			ctx,
 			ps,
-			"du.txt",
+			filepath.Join(linuxUtilsRoot, "du.txt"),
 			"du", "-h", y.Redpanda.Directory,
 		)
 	}
@@ -666,7 +764,7 @@ func saveLogs(ctx context.Context, ps *stepParams, since, until string, logsLimi
 // Saves the output of `ss`.
 func saveSocketData(ctx context.Context, ps *stepParams) step {
 	return func() error {
-		return writeCommandOutputToZip(ctx, ps, "ss.txt", "ss")
+		return writeCommandOutputToZip(ctx, ps, filepath.Join(linuxUtilsRoot, "ss.txt"), "ss")
 	}
 }
 
@@ -676,7 +774,7 @@ func saveTopOutput(ctx context.Context, ps *stepParams) step {
 		return writeCommandOutputToZip(
 			ctx,
 			ps,
-			"top.txt",
+			filepath.Join(linuxUtilsRoot, "top.txt"),
 			"top", "-b", "-n", "10", "-H", "-d", "1",
 		)
 	}
@@ -688,7 +786,7 @@ func saveVmstat(ctx context.Context, ps *stepParams) step {
 		return writeCommandOutputToZip(
 			ctx,
 			ps,
-			"vmstat.txt",
+			filepath.Join(linuxUtilsRoot, "vmstat.txt"),
 			"vmstat", "-w", "1", "10",
 		)
 	}
@@ -700,7 +798,7 @@ func saveIP(ctx context.Context, ps *stepParams) step {
 		return writeCommandOutputToZip(
 			ctx,
 			ps,
-			"ip.txt",
+			filepath.Join(linuxUtilsRoot, "ip.txt"),
 			"ip", "addr",
 		)
 	}
@@ -712,7 +810,7 @@ func saveLspci(ctx context.Context, ps *stepParams) step {
 		return writeCommandOutputToZip(
 			ctx,
 			ps,
-			"lspci.txt",
+			filepath.Join(linuxUtilsRoot, "lspci.txt"),
 			"lspci",
 		)
 	}
@@ -724,9 +822,40 @@ func saveDmidecode(ctx context.Context, ps *stepParams) step {
 		return writeCommandOutputToZip(
 			ctx,
 			ps,
-			"dmidecode.txt",
+			filepath.Join(linuxUtilsRoot, "dmidecode.txt"),
 			"dmidecode",
 		)
+	}
+}
+
+// Saves the output of `sysctl -a`.
+func saveSysctl(ctx context.Context, ps *stepParams) step {
+	return func() error {
+		return writeCommandOutputToZip(
+			ctx,
+			ps,
+			filepath.Join(linuxUtilsRoot, "sysctl.txt"),
+			"sysctl", "-a",
+		)
+	}
+}
+
+// Saves the output of `free`.
+func saveFree(ctx context.Context, ps *stepParams) step {
+	return func() error {
+		return writeCommandOutputToZip(
+			ctx,
+			ps,
+			filepath.Join(linuxUtilsRoot, "free.txt"),
+			"free",
+		)
+	}
+}
+
+// Saves the output of `uptime`.
+func saveUptime(ctx context.Context, ps *stepParams) step {
+	return func() error {
+		return writeCommandOutputToZip(ctx, ps, filepath.Join(linuxUtilsRoot, "uptime.txt"), "uptime")
 	}
 }
 
@@ -849,17 +978,25 @@ func sliceControllerDir(cFiles []fileSize, logLimitBytes int64) (slice []fileSiz
 
 func saveControllerLogDir(ps *stepParams, y *config.RedpandaYaml, logLimitBytes int) step {
 	return func() error {
+		if y.Redpanda.Directory == "" {
+			return fmt.Errorf("failed to save controller logs: 'redpanda.data_directory' is empty on the provided configuration file")
+		}
 		controllerDir := filepath.Join(y.Redpanda.Directory, "redpanda", "controller", "0_0")
 
 		// We don't need the .base_index files to parse out the messages.
 		exclude := regexp.MustCompile(`^*.base_index$`)
 		cFiles, size, err := walkSizeDir(controllerDir, exclude)
 		if err != nil {
-			return err
+			return fmt.Errorf("unable to save controller logs: %v", err)
 		}
 
+		// Our decoding tools look for the base of the data directory, and it
+		// searches for the expected directory: redpanda/controller/0_0. If we
+		// use this folder structure, we will make the life easier to the users
+		// who wish to decode the controller logs using our tools.
+		baseDestDir := filepath.Join("controller-logs", "redpanda", "controller", "0_0")
 		if int(size) < logLimitBytes {
-			return writeDirToZip(ps, controllerDir, "controller", exclude)
+			return writeDirToZip(ps, controllerDir, baseDestDir, exclude)
 		}
 
 		fmt.Printf("WARNING: controller logs directory size is too big (%v). Saving a slice of the logs; you can adjust the limit by changing --controller-logs-size-limit flag\n", units.HumanSize(float64(size)))
@@ -875,12 +1012,58 @@ func saveControllerLogDir(ps *stepParams, y *config.RedpandaYaml, logLimitBytes 
 		for _, cLog := range slice {
 			file, err := os.ReadFile(cLog.path)
 			if err != nil {
-				return err
+				return fmt.Errorf("unable to save controller logs: %v", err)
 			}
-			err = writeFileToZip(ps, filepath.Join("controller", filepath.Base(cLog.path)), file)
+			err = writeFileToZip(ps, filepath.Join(baseDestDir, filepath.Base(cLog.path)), file)
 			if err != nil {
-				return err
+				return fmt.Errorf("unable to save controller logs: %v", err)
 			}
+		}
+		return nil
+	}
+}
+
+func saveStartupLog(ps *stepParams, y *config.RedpandaYaml) step {
+	return func() error {
+		if y.Redpanda.Directory == "" {
+			return fmt.Errorf("failed to save startup_log: 'redpanda.data_directory' is empty on the provided configuration file")
+		}
+		path := filepath.Join(y.Redpanda.Directory, "startup_log")
+		exists, err := afero.Exists(ps.fs, path)
+		if err != nil {
+			return fmt.Errorf("failed to save startup_log: unable to check existence of startup_log: %v", err)
+		}
+		if !exists {
+			return fmt.Errorf("skipping startup_log collection: unable to find file %q", path)
+		}
+		content, err := afero.ReadFile(ps.fs, path)
+		if err != nil {
+			return fmt.Errorf("failed to save startup_log: unable to read startup_log: %v", err)
+		}
+		err = writeFileToZip(ps, "startup_log", content)
+		if err != nil {
+			return fmt.Errorf("failed to save startup_log: %v", err)
+		}
+		return nil
+	}
+}
+
+func saveCrashReports(ps *stepParams, y *config.RedpandaYaml) step {
+	return func() error {
+		if y.Redpanda.Directory == "" {
+			return fmt.Errorf("failed to save crash_reports: 'redpanda.data_directory' is empty on the provided configuration file")
+		}
+		crashReportDir := filepath.Join(y.Redpanda.Directory, "crash_reports")
+		exists, err := afero.Exists(ps.fs, crashReportDir)
+		if err != nil {
+			return fmt.Errorf("failed to save crash_reports: unable to check existence of the crash_reports directory")
+		}
+		if !exists {
+			return fmt.Errorf("skipping crash_reports collection: directory %q does not exists", crashReportDir)
+		}
+		err = writeDirToZip(ps, crashReportDir, "crash_reports", nil)
+		if err != nil {
+			return fmt.Errorf("failed to save crash_reports: %v", err)
 		}
 		return nil
 	}
@@ -916,7 +1099,9 @@ func walkDir(root string, files map[string]*fileInfo) error {
 				return nil
 			}
 
-			i.Size = units.HumanSize(float64(info.Size()))
+			bSize := info.Size()
+			i.SizeBytes = bSize
+			i.Size = units.HumanSize(float64(bSize))
 			i.Mode = info.Mode().String()
 			i.Modified = info.ModTime().String()
 

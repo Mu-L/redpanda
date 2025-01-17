@@ -9,18 +9,29 @@
  */
 #include "kafka/server/tests/produce_consume_utils.h"
 
+#include "base/vlog.h"
 #include "bytes/iobuf.h"
+#include "container/fragmented_vector.h"
 #include "kafka/client/transport.h"
 #include "kafka/protocol/produce.h"
 #include "kafka/protocol/schemata/produce_request.h"
 #include "storage/record_batch_builder.h"
-#include "vlog.h"
+#include "utils/to_string.h"
 
 #include <seastar/util/log.hh>
+
+#include <chrono>
+
+using namespace std::chrono_literals;
 
 namespace tests {
 
 static ss::logger test_log("produce_consume_logger");
+
+std::ostream& operator<<(std::ostream& o, const kv_t& kv) {
+    o << ssx::sformat("{{k=\"{}\", v=\"{}\"}}", kv.key, kv.val);
+    return o;
+}
 
 // Produces the given records per partition to the given topic.
 // NOTE: inputs must remain valid for the duration of the call.
@@ -32,9 +43,9 @@ kafka_produce_transport::produce(
     kafka::produce_request::topic tp;
     tp.name = topic_name;
     tp.partitions = produce_partition_requests(records_per_partition, ts);
-    std::vector<kafka::produce_request::topic> topics;
+    chunked_vector<kafka::produce_request::topic> topics;
     topics.push_back(std::move(tp));
-    kafka::produce_request req(std::nullopt, 1, std::move(topics));
+    kafka::produce_request req(std::nullopt, -1, std::move(topics));
     req.data.timeout_ms = std::chrono::seconds(10);
     req.has_idempotent = false;
     req.has_transactional = false;
@@ -55,21 +66,26 @@ kafka_produce_transport::produce(
     co_return ret;
 }
 
-std::vector<kafka::partition_produce_data>
+chunked_vector<kafka::partition_produce_data>
 kafka_produce_transport::produce_partition_requests(
   const pid_to_kvs_map_t& records_per_partition,
   std::optional<model::timestamp> ts) {
-    std::vector<kafka::partition_produce_data> ret;
+    chunked_vector<kafka::partition_produce_data> ret;
     ret.reserve(records_per_partition.size());
     for (const auto& [pid, records] : records_per_partition) {
         storage::record_batch_builder builder(
           model::record_batch_type::raft_data, model::offset(0));
         kafka::produce_request::partition partition;
-        for (auto& [k, v] : records) {
+        for (auto& kv : records) {
+            const auto& k = kv.key;
+            const auto& v_opt = kv.val;
             iobuf key_buf;
             key_buf.append(k.data(), k.size());
-            iobuf val_buf;
-            val_buf.append(v.data(), v.size());
+            std::optional<iobuf> val_buf;
+            if (v_opt.has_value()) {
+                const auto& v = v_opt.value();
+                val_buf = iobuf::from({v.data(), v.size()});
+            }
             builder.add_raw_kv(std::move(key_buf), std::move(val_buf));
         }
         if (ts.has_value()) {
@@ -158,10 +174,15 @@ ss::future<pid_to_kvs_map_t> kafka_consume_transport::consume(
                 auto& records_for_partition = ret[partition.partition_index];
                 for (auto& r : records) {
                     iobuf_const_parser key_buf(r.key());
-                    iobuf_const_parser val_buf(r.value());
-                    records_for_partition.emplace_back(kv_t{
-                      key_buf.read_string(key_buf.bytes_left()),
-                      val_buf.read_string(val_buf.bytes_left())});
+                    auto key_str = key_buf.read_string(key_buf.bytes_left());
+                    if (r.is_tombstone()) {
+                        records_for_partition.emplace_back(key_str);
+                    } else {
+                        iobuf_const_parser val_buf(r.value());
+                        auto val_str = val_buf.read_string(
+                          val_buf.bytes_left());
+                        records_for_partition.emplace_back(key_str, val_str);
+                    }
                 }
             }
         }

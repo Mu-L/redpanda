@@ -15,6 +15,7 @@ import re
 import typing
 import threading
 from datetime import datetime, timezone, timedelta
+from time import sleep
 
 import requests
 
@@ -24,9 +25,22 @@ from ducktape.utils.util import wait_until
 # released version.
 # E.g. "v22.1.1-rc1-1373-g77f868..."
 VERSION_RE = re.compile(".*v(\\d+)\\.(\\d+)\\.(\\d+).*")
+# strict variant of VERSION_RE that only matches "vX.Y.Z" strings
+STRICT_VERSION_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+RELEASES_CACHE_FILE_PARENT = "/tmp/ducktape_cache"
+RELEASES_CACHE_FILE = f"{RELEASES_CACHE_FILE_PARENT}/redpanda_releases.json"
+RELEASES_CACHE_FILE_TTL = timedelta(minutes=30)
 
-RELEASES_CACHE_FILE = "/tmp/redpanda_releases.json"
-RELEASES_CACHE_FILE_TTL = timedelta(seconds=300)
+# environment variable to pass to ducktape the list of released versions.
+# It's a ":"-separated list of versions, e.g.: v23.2.1:v23.1.12:v23.1.11
+RP_GIT_RELEASED_VERSIONS = "RP_GIT_RELEASED_VERSIONS"
+
+REDPANDA_INSTALLER_HEAD_TAG = "head"
+
+RedpandaVersionTriple = tuple[int, int, int]
+RedpandaVersionLine = tuple[int, int]
+RedpandaVersion = typing.Literal[
+    'head'] | RedpandaVersionLine | RedpandaVersionTriple
 
 
 def wait_for_num_versions(redpanda, num_versions):
@@ -71,6 +85,14 @@ def ver_string(int_tuple):
     return f"v{'.'.join(str(i) for i in int_tuple)}"
 
 
+def ver_triple(version_line: RedpandaVersionLine) -> RedpandaVersionTriple:
+    """
+    Converts "v24.1.0-dev-1940-g8ae241e966 - 8ae241e966bd3d5811951a176fc40a7a77ce2a0c" into (24, 1, 0)
+    """
+    matches = VERSION_RE.findall(version_line)
+    return RedpandaVersionTriple(int_tuple(matches[0]))
+
+
 class InstallOptions:
     """
     Options with which to configure the installation of Redpanda in a cluster.
@@ -91,14 +113,6 @@ class InstallOptions:
         # cluster on an older version, e.g. to simulate a mixed-version
         # environment.
         self.num_to_upgrade = num_to_upgrade
-
-
-REDPANDA_INSTALLER_HEAD_TAG = "head"
-
-RedpandaVersionTriple = tuple[int, int, int]
-RedpandaVersionLine = tuple[int, int]
-RedpandaVersion = typing.Literal[
-    'head'] | RedpandaVersionLine | RedpandaVersionTriple
 
 
 class RedpandaInstaller:
@@ -179,14 +193,17 @@ class RedpandaInstaller:
         # (i.e. root_for_version(), etc).
         self._install_lock_fd = None
 
-        self._installed_version = self.HEAD
+        self._installed_versions = {
+            node: self.HEAD
+            for node in self._redpanda.nodes
+        }
 
         # memoize result of self.arch()
         self._arch = None
 
-    @property
-    def installed_version(self):
-        return self._installed_version
+    def installed_version(self, node) -> RedpandaVersion:
+        assert node in self._installed_versions, f'Node {node} not in installed versions dictionary {self._installed_versions}'
+        return self._installed_versions[node]
 
     def _acquire_install_lock(self, timeout_sec=600):
         """
@@ -253,8 +270,8 @@ class RedpandaInstaller:
             cmd = None
             if self._head_backed_up:
                 cmd = f"mv /opt/redpanda {head_root_path}"
-            elif not node.account.exists(head_root_path):
-                cmd = f"ln -s {rp_install_path_root} {head_root_path}"
+            else:
+                cmd = f"ln -sf {rp_install_path_root} {head_root_path}"
             if cmd:
                 node.account.ssh_output(cmd)
 
@@ -282,6 +299,8 @@ class RedpandaInstaller:
                 f"Mismatch version {node.account.hostname} has {vers}, {nodes[0].account.hostname} has {initial_version}"
             node.account.ssh_output(f"mkdir -p {self.INSTALLER_ROOT}")
 
+        assert initial_version
+
         try:
             self._acquire_install_lock()
             self._setup_head_roots_unlocked()
@@ -302,14 +321,14 @@ class RedpandaInstaller:
         # use it to get older versions relative to the head version.
         # NOTE: installing this version may not yield the same binaries being
         # as 'head', e.g. if an unreleased source is checked out.
-        self._head_version: RedpandaVersionTriple = int_tuple(
-            VERSION_RE.findall(initial_version)[0])
+        self._head_version: RedpandaVersionTriple = ver_triple(initial_version)
 
         self._started = True
 
     def _released_versions_json(self):
         def get_cached_data():
             try:
+                os.makedirs(RELEASES_CACHE_FILE_PARENT, exist_ok=True)
                 st = os.stat(RELEASES_CACHE_FILE)
                 mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
                 if datetime.now(
@@ -364,6 +383,9 @@ class RedpandaInstaller:
                     page += 1
                     self._redpanda.logger.debug(f"Reading next page {page}")
 
+            assert releases, "no releases found, github issue?"
+
+            self._redpanda.logger.debug(f"fetched releases: {releases}")
             open(RELEASES_CACHE_FILE, 'w').write(json.dumps(releases))
 
         finally:
@@ -383,21 +405,37 @@ class RedpandaInstaller:
             if len(self._released_versions) > 0:
                 return self._released_versions
 
-            releases_json = self._released_versions_json()
             versions = []
-            for release in releases_json:
-                match = VERSION_RE.findall(release["tag_name"])
-                if match:
-                    versions.append(int_tuple(match[0]))
-                else:
-                    if release["tag_name"].startswith("release-"):
-                        # Tags like 'release-20.12.4' predate the modern Redpanda versioning scheme
-                        self._redpanda.logger.info(
-                            f"Ignoring legacy release {release['tag_name']}")
+
+            if releases_env := os.getenv(RP_GIT_RELEASED_VERSIONS):
+                # releases provided with an environment variable, parse and save it
+                self._redpanda.logger.debug(
+                    f"getting released_versions from environment variable {RP_GIT_RELEASED_VERSIONS}={releases_env}"
+                )
+                for release in releases_env.split(":"):
+                    if match := STRICT_VERSION_RE.findall(release):
+                        versions.append(int_tuple(match[0]))
                     else:
                         self._redpanda.logger.warn(
-                            f"Malformed release tag in repo: {release['tag_name']}"
+                            f"Malformed release tag in {RP_GIT_RELEASED_VERSIONS}: '{release}'"
                         )
+            else:
+                # fallback to github
+                releases_json = self._released_versions_json()
+                for release in releases_json:
+                    match = VERSION_RE.findall(release["tag_name"])
+                    if match:
+                        versions.append(int_tuple(match[0]))
+                    else:
+                        if release["tag_name"].startswith("release-"):
+                            # Tags like 'release-20.12.4' predate the modern Redpanda versioning scheme
+                            self._redpanda.logger.info(
+                                f"Ignoring legacy release {release['tag_name']}"
+                            )
+                        else:
+                            self._redpanda.logger.warn(
+                                f"Malformed release tag in repo: {release['tag_name']}"
+                            )
 
             self._released_versions = sorted(versions, reverse=True)
 
@@ -410,7 +448,17 @@ class RedpandaInstaller:
         """
         r = requests.head(self._version_package_url(version))
         # allow 403 ClientError, it usually indicates Unauthorized get and can happen on S3 while dealing with old releases
-        if r.status_code not in (200, 403, 404):
+        allowed = (200, 403, 404)
+        if r.status_code not in allowed:
+            num_retries = 3
+            while num_retries > 0:
+                sleep(5.0**(4 - num_retries))
+                r = requests.head(self._version_package_url(version))
+                if r.status_code in allowed:
+                    break
+                num_retries -= 1
+
+        if r.status_code not in allowed:
             r.raise_for_status()
 
         if r.status_code == 403:
@@ -467,8 +515,8 @@ class RedpandaInstaller:
         # NOTE: the released versions are sorted highest first.
         result = None
         for v in self.released_versions:
-            if (v[0] == version[0]
-                    and v[1] < version[1]) or (v[0] < version[0]):
+            if (v[0] == version[0] and v[1] < version[1]) or (v[0]
+                                                              < version[0]):
 
                 # Before selecting version, validate that it is really downloadable: this avoids
                 # tests being upset by ongoing releases which might exist in github but not yet
@@ -572,7 +620,8 @@ class RedpandaInstaller:
         try:
             self._acquire_install_lock()
             self._install_unlocked(nodes, install_target)
-            self._installed_version = install_target
+            for n in nodes:
+                self._installed_versions[n] = install_target
         finally:
             self._release_install_lock()
 
@@ -652,9 +701,16 @@ class RedpandaInstaller:
         """
         version_root = self.root_for_version(version)
 
+        results = []
         tgz = "redpanda.tar.gz"
-        cmd = f"curl -fsSL {self._version_package_url(version)} --create-dir --output-dir {version_root} -o {tgz} && gunzip -c {version_root}/{tgz} | tar -xf - -C {version_root} && rm {version_root}/{tgz}"
-        return node.account.ssh_capture(cmd)
+        cmds = [
+            f"curl -vfsSL {self._version_package_url(version)} --retry 3 --retry-connrefused --retry-delay 2 --create-dir -o {version_root}/{tgz}",
+            f"gunzip -c {version_root}/{tgz} | tar -xf - -C {version_root}",
+            f"rm {version_root}/{tgz}"
+        ]
+        for cmd in cmds:
+            results.extend(node.account.ssh_capture(cmd))
+        return results
 
     def reset_current_install(self, nodes):
         """

@@ -8,257 +8,21 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
+#include "base/seastarx.h"
 #include "cloud_storage/segment_meta_cstore.h"
 #include "model/fundamental.h"
 #include "random/generators.h"
-#include "seastarx.h"
 #include "utils/delta_for.h"
 
 #include <seastar/testing/perf_tests.hh>
+#include <seastar/util/defer.hh>
 
 #include <absl/container/btree_map.h>
 
+#include <ranges>
 #include <vector>
 
 using namespace cloud_storage;
-
-using delta_xor_alg = details::delta_xor;
-using delta_xor_frame = segment_meta_column_frame<int64_t, delta_xor_alg{}>;
-using delta_delta_alg = details::delta_delta<int64_t>;
-using delta_delta_frame = segment_meta_column_frame<int64_t, delta_delta_alg{}>;
-using delta_xor_column = segment_meta_column<int64_t, delta_xor_alg>;
-using delta_delta_column = segment_meta_column<int64_t, delta_delta_alg>;
-
-static const delta_xor_frame xor_frame_4K = []() {
-    delta_xor_frame frame{};
-    int64_t value = random_generators::get_int(1000);
-    for (int64_t i = 0; i < 4096; i++) {
-        value += random_generators::get_int(1, 100);
-        frame.append(value);
-    }
-    return frame;
-}();
-
-static const delta_xor_column xor_column_4K = []() {
-    delta_xor_column column{};
-    int64_t value = random_generators::get_int(1000);
-    for (int64_t i = 0; i < 4096; i++) {
-        value += random_generators::get_int(1, 100);
-        column.append(value);
-    }
-    return column;
-}();
-
-static const delta_xor_column xor_column_4M = []() {
-    delta_xor_column column{};
-    int64_t value = random_generators::get_int(1000);
-    for (int64_t i = 0; i < 4096000; i++) {
-        value += random_generators::get_int(1, 100);
-        column.append(value);
-    }
-    return column;
-}();
-
-static const delta_delta_frame delta_frame_4K = []() {
-    delta_delta_frame frame{};
-    int64_t value = random_generators::get_int(1000);
-    for (int64_t i = 0; i < 4096; i++) {
-        value += random_generators::get_int(1, 100);
-        frame.append(value);
-    }
-    return frame;
-}();
-
-static const delta_delta_column delta_column_4K = []() {
-    delta_delta_column column{};
-    int64_t value = random_generators::get_int(1000);
-    for (int64_t i = 0; i < 4096; i++) {
-        value += random_generators::get_int(1, 100);
-        column.append(value);
-    }
-    return column;
-}();
-
-static const delta_delta_column delta_column_4M = []() {
-    delta_delta_column column{};
-    int64_t value = random_generators::get_int(1000);
-    for (int64_t i = 0; i < 4096000; i++) {
-        value += random_generators::get_int(1, 100);
-        column.append(value);
-    }
-    return column;
-}();
-
-template<class StoreT>
-void append_test(StoreT& store, int test_scale) {
-    std::vector<int64_t> head;
-    int64_t tail;
-    int64_t value = 0;
-    for (int64_t i = 0; i < test_scale - 1; i++) {
-        value += random_generators::get_int(1, 100);
-        head.push_back(value);
-    }
-    tail = value + random_generators::get_int(1, 100);
-    for (auto x : head) {
-        store.append(x);
-    }
-    perf_tests::start_measuring_time();
-    store.append(tail);
-    perf_tests::stop_measuring_time();
-}
-
-template<class StoreT>
-void append_tx_test(StoreT& store, int test_scale) {
-    std::vector<int64_t> head;
-    int64_t tail;
-    int64_t value = 0;
-    for (int64_t i = 0; i < test_scale - 1; i++) {
-        value += random_generators::get_int(1, 100);
-        head.push_back(value);
-    }
-    tail = value + random_generators::get_int(1, 100);
-    for (auto x : head) {
-        store.append(x);
-    }
-    perf_tests::start_measuring_time();
-    auto tx = store.append_tx(tail);
-    if (tx) {
-        std::move(*tx).commit();
-    } else {
-        assert(false);
-    }
-    perf_tests::stop_measuring_time();
-}
-
-template<class StoreT>
-void find_test(StoreT& store) {
-    perf_tests::start_measuring_time();
-    auto it = store.find(*store.last_value());
-    perf_tests::do_not_optimize(it);
-    perf_tests::stop_measuring_time();
-}
-
-template<class StoreT>
-void at_test(StoreT& store) {
-    perf_tests::start_measuring_time();
-    auto it = store.at_index(store.size() - 1);
-    perf_tests::do_not_optimize(it);
-    perf_tests::stop_measuring_time();
-}
-
-PERF_TEST(cstore_bench, xor_frame_append) {
-    delta_xor_frame frame{};
-    append_test(frame, 4096);
-}
-
-PERF_TEST(cstore_bench, xor_frame_append_tx) {
-    delta_xor_frame frame{};
-    append_tx_test(frame, 4096);
-}
-
-PERF_TEST(cstore_bench, xor_column_append) {
-    delta_xor_column column{};
-    append_test(column, 4096);
-}
-
-PERF_TEST(cstore_bench, xor_column_append_tx) {
-    delta_xor_column column{};
-    append_tx_test(column, 4096);
-}
-
-PERF_TEST(cstore_bench, xor_column_append_tx2) {
-    // trigger code path that commits by splicing the list
-    delta_xor_column column{};
-    append_tx_test(column, 4097);
-}
-
-PERF_TEST(cstore_bench, xor_frame_find_4K) { find_test(xor_frame_4K); }
-
-PERF_TEST(cstore_bench, xor_column_find_4K) { find_test(xor_column_4K); }
-
-PERF_TEST(cstore_bench, xor_frame_at_4K) { at_test(xor_frame_4K); }
-
-PERF_TEST(cstore_bench, xor_column_at_4K) { at_test(xor_column_4K); }
-
-PERF_TEST(cstore_bench, xor_column_at_4M) { at_test(xor_column_4M); }
-
-PERF_TEST(cstore_bench, delta_frame_append) {
-    delta_delta_frame frame{};
-    append_test(frame, 4096);
-}
-
-PERF_TEST(cstore_bench, delta_frame_append_tx) {
-    delta_delta_frame frame{};
-    append_tx_test(frame, 4096);
-}
-
-PERF_TEST(cstore_bench, delta_column_append) {
-    delta_delta_column column{};
-    append_test(column, 4096);
-}
-
-PERF_TEST(cstore_bench, delta_column_append_tx) {
-    delta_delta_column column{};
-    append_tx_test(column, 4096);
-}
-
-PERF_TEST(cstore_bench, delta_column_append_tx2) {
-    // trigger code path that commits by splicing the list
-    delta_delta_column column{};
-    append_tx_test(column, 4097);
-}
-
-PERF_TEST(cstore_bench, delta_frame_find_4K) { find_test(delta_frame_4K); }
-
-PERF_TEST(cstore_bench, delta_column_find_4K) { find_test(delta_column_4K); }
-
-PERF_TEST(cstore_bench, delta_column_find_4M) { at_test(delta_column_4M); }
-
-PERF_TEST(cstore_bench, delta_frame_at_4K) { at_test(delta_frame_4K); }
-
-PERF_TEST(cstore_bench, delta_column_at_4K) { at_test(delta_column_4K); }
-
-PERF_TEST(cstore_bench, delta_column_at_4M) { at_test(delta_column_4M); }
-
-PERF_TEST(cstore_bench, xor_frame_at_with_index_4K) {
-    std::map<int32_t, delta_xor_frame::hint_t> index;
-    delta_xor_frame frame{};
-    int64_t value = random_generators::get_int(1000);
-    for (int64_t i = 0; i < 4096; i++) {
-        value += random_generators::get_int(1, 100);
-        frame.append(value);
-        if (i % 16 == 0) {
-            auto row = frame.get_current_stream_pos();
-            if (row) {
-                index.insert(std::make_pair(i, row.value()));
-            }
-        }
-    }
-    auto it = index.at(4000);
-    perf_tests::start_measuring_time();
-    frame.at_index(4000, it);
-    perf_tests::stop_measuring_time();
-}
-
-PERF_TEST(cstore_bench, xor_column_at_with_index_4K) {
-    std::map<int32_t, delta_xor_column::hint_t> index;
-    delta_xor_column column{};
-    int64_t value = random_generators::get_int(1000);
-    for (int64_t i = 0; i < 4096; i++) {
-        value += random_generators::get_int(1, 100);
-        column.append(value);
-        if (i % 16 == 0) {
-            auto row = column.get_current_stream_pos();
-            if (row) {
-                index.insert(std::make_pair(i, row.value()));
-            }
-        }
-    }
-    auto it = index.at(4000);
-    perf_tests::start_measuring_time();
-    column.at_index(4000, it);
-    perf_tests::stop_measuring_time();
-}
 
 std::vector<segment_meta> generate_metadata(size_t sz) {
     namespace rg = random_generators;
@@ -386,7 +150,7 @@ public:
     }
 
 private:
-    static void serialize(iobuf& buf, auto const& v) {
+    static void serialize(iobuf& buf, const auto& v) {
         auto tmp = std::bit_cast<std::array<uint8_t, sizeof(v)>>(v);
         buf.append(tmp.data(), tmp.size());
     }
@@ -435,6 +199,10 @@ void cs_scan_test(StoreT& store, size_t sz) {
     perf_tests::stop_measuring_time();
 }
 
+auto last_n(size_t n) {
+    return std::views::reverse | std::views::take(n) | std::views::reverse;
+}
+
 template<class StoreT>
 void cs_find_test(StoreT& store, size_t sz) {
     auto manifest = generate_metadata(sz);
@@ -443,10 +211,12 @@ void cs_find_test(StoreT& store, size_t sz) {
         store.insert(s);
     }
 
-    perf_tests::start_measuring_time();
-    auto i = store.find(manifest.back().base_offset);
-    perf_tests::do_not_optimize(i);
-    perf_tests::stop_measuring_time();
+    for (auto& e : manifest | last_n(20)) {
+        perf_tests::start_measuring_time();
+        auto i = store.find(e.base_offset);
+        perf_tests::do_not_optimize(i);
+        perf_tests::stop_measuring_time();
+    }
 }
 
 template<class StoreT>
@@ -457,10 +227,12 @@ void cs_lower_bound_test(StoreT& store, size_t sz) {
         store.insert(s);
     }
 
-    perf_tests::start_measuring_time();
-    auto i = store.lower_bound(manifest.back().base_offset);
-    perf_tests::do_not_optimize(i);
-    perf_tests::stop_measuring_time();
+    for (auto& e : manifest | last_n(20)) {
+        perf_tests::start_measuring_time();
+        auto i = store.lower_bound(e.base_offset + model::offset(1));
+        perf_tests::do_not_optimize(i);
+        perf_tests::stop_measuring_time();
+    }
 }
 
 template<class StoreT>
@@ -471,10 +243,12 @@ void cs_upper_bound_test(StoreT& store, size_t sz) {
         store.insert(s);
     }
 
-    perf_tests::start_measuring_time();
-    auto i = store.upper_bound(manifest.back().base_offset);
-    perf_tests::do_not_optimize(i);
-    perf_tests::stop_measuring_time();
+    for (auto& e : manifest | last_n(20)) {
+        perf_tests::start_measuring_time();
+        auto i = store.upper_bound(e.base_offset + model::offset(1));
+        perf_tests::do_not_optimize(i);
+        perf_tests::stop_measuring_time();
+    }
 }
 
 template<class StoreT>
@@ -539,6 +313,15 @@ PERF_TEST(cstore_bench, column_store_find_baseline) {
 
 PERF_TEST(cstore_bench, column_store_find_result) {
     segment_meta_cstore store;
+    cs_find_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_find_no_hints) {
+    segment_meta_cstore store;
+    config::shard_local_cfg().storage_ignore_cstore_hints.set_value(true);
+    auto _ = ss::defer([] {
+        config::shard_local_cfg().storage_ignore_cstore_hints.set_value(false);
+    });
     cs_find_test(store, 10000);
 }
 

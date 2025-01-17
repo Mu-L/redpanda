@@ -11,11 +11,14 @@
 
 #pragma once
 
+#include "base/seastarx.h"
 #include "cluster/logger.h"
+#include "cluster/notification.h"
+#include "container/chunked_hash_map.h"
 #include "model/fundamental.h"
 #include "model/ktp.h"
-#include "raft/types.h"
-#include "seastarx.h"
+#include "raft/fundamental.h"
+#include "utils/notification_list.h"
 
 #include <seastar/core/reactor.hh> // shard_id
 
@@ -27,20 +30,13 @@ namespace cluster {
 class shard_table final {
     struct shard_revision {
         ss::shard_id shard;
-        model::revision_id revision;
+        model::revision_id log_revision;
     };
 
 public:
-    bool contains(const raft::group_id& group) {
-        return _group_idx.find(group) != _group_idx.end();
-    }
-    ss::shard_id shard_for(const raft::group_id& group) {
-        return _group_idx.find(group)->second.shard;
-    }
-
-    std::optional<model::revision_id> revision_for(const model::ntp& ntp) {
-        if (auto it = _ntp_idx.find(ntp); it != _ntp_idx.end()) {
-            return it->second.revision;
+    std::optional<ss::shard_id> shard_for(const raft::group_id& group) {
+        if (auto it = _group_idx.find(group); it != _group_idx.end()) {
+            return it->second.shard;
         }
         return std::nullopt;
     }
@@ -60,80 +56,73 @@ public:
       const model::ntp& ntp,
       raft::group_id g,
       ss::shard_id shard,
-      model::revision_id rev) {
+      model::revision_id log_rev) {
         if (auto it = _ntp_idx.find(ntp); it != _ntp_idx.end()) {
-            if (it->second.revision > rev) {
+            if (it->second.log_revision > log_rev) {
                 return;
             }
         }
         if (auto it = _group_idx.find(g); it != _group_idx.end()) {
-            if (it->second.revision > rev) {
+            if (it->second.log_revision > log_rev) {
                 return;
             }
         }
 
         vlog(
           clusterlog.trace,
-          "[{}] updating shard table, shard_id: {}, rev: {}",
+          "[{}] updating shard table, shard_id: {}, log_rev: {}",
           ntp,
           shard,
-          rev);
-        _ntp_idx.insert_or_assign(ntp, shard_revision{shard, rev});
-        _group_idx.insert_or_assign(g, shard_revision{shard, rev});
+          log_rev);
+        _ntp_idx.insert_or_assign(ntp, shard_revision{shard, log_rev});
+        _group_idx.insert_or_assign(g, shard_revision{shard, log_rev});
+
+        _notification_list.notify(ntp, g, shard);
     }
 
     void
-    erase(const model::ntp& ntp, raft::group_id g, model::revision_id rev) {
+    erase(const model::ntp& ntp, raft::group_id g, model::revision_id log_rev) {
+        // Revision check protects against race conditions between operations
+        // on instances of the same ntp with different log revisions (e.g. after
+        // a topic was deleted and then re-created). These operations can happen
+        // on different shards, therefore erase() corresponding to the old
+        // instance can happen after update() corresponding to the new one. Note
+        // that concurrent updates are not a problem during cross-shard
+        // transfers because even though corresponding erase() and update() will
+        // have the same log_revision, update() will always come after erase().
         if (auto it = _ntp_idx.find(ntp); it != _ntp_idx.end()) {
-            // The check on exact revision match (= rev case) below is a special
-            // case. This only happens when bootstrapping cross core movements
-            // on multiple shards at the same time. Bootstrapping across shards
-            // is not coordinated and can result in parallel updates to the
-            // shard table.
-            //
-            // A general invariant of the shard table (excluding parallel
-            // bootstrapping) is that the command revision of the shutdown `rev`
-            // (which invokes erase from the shard table) is strictly greater
-            // than the command that added it the table, with highest version
-            // eventually prevailing.
-            //
-            // This is violated during parallel bootstrap with cross core
-            // movements where there can be interleaved updates.In this process
-            // if there is an exact revision match, it indicates that an other
-            // shard already updated the shard table and is starting up the
-            // partition and the calling shard should not remove it.
-            //
-            // Example: consider this sequence o commands [add(ntp),
-            // update(shard 0 -> shard 1)]
-            // shard 0 bootstraps with [add, update]
-            // shard 1 bootstraps with [update]
-
-            // shard 0 treats update as a shutdown on core 0 while shard 1
-            // treats it as a bootstrap on shard 1, however both of them use the
-            // same command revision of the update.
-            // This translates to the following shard table updates.
-            // shard 0: (erase ntp, update_rev)
-            // shard 1: (add ntp, update_rev)
-
-            // If shard 0 update ends up running after shard 1, we will end up
-            // with no shard table entries for this ntp resulting in an
-            // availability loss. The equality check guards against these racy
-            // update siutations.
-
-            if (it->second.revision >= rev) {
+            if (it->second.log_revision > log_rev) {
                 return;
             }
         }
         if (auto it = _group_idx.find(g); it != _group_idx.end()) {
-            if (it->second.revision > rev) {
+            if (it->second.log_revision > log_rev) {
                 return;
             }
         }
 
         vlog(
-          clusterlog.trace, "[{}] erasing from shard table, rev: {}", ntp, rev);
+          clusterlog.trace,
+          "[{}] erasing from shard table, log_rev: {}",
+          ntp,
+          log_rev);
         _ntp_idx.erase(ntp);
         _group_idx.erase(g);
+
+        _notification_list.notify(ntp, g, std::nullopt);
+    }
+
+    using change_cb_t = ss::noncopyable_function<void(
+      const model::ntp& ntp,
+      raft::group_id g,
+      std::optional<ss::shard_id> shard)>;
+
+    notification_id_type register_notification(change_cb_t&& cb) {
+        return _notification_list.register_cb(std::move(cb));
+    }
+
+    void unregister_delta_notification(cluster::notification_id_type id) {
+        _notification_list.unregister_cb(id);
     }
 
 private:
@@ -153,13 +142,15 @@ private:
      */
 
     // kafka index
-    absl::node_hash_map<
+    chunked_hash_map<
       model::ntp,
       shard_revision,
       model::ktp_hash_eq,
       model::ktp_hash_eq>
       _ntp_idx;
     // raft index
-    absl::node_hash_map<raft::group_id, shard_revision> _group_idx;
+    chunked_hash_map<raft::group_id, shard_revision> _group_idx;
+
+    notification_list<change_cb_t, notification_id_type> _notification_list;
 };
 } // namespace cluster

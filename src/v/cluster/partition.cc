@@ -9,180 +9,111 @@
 
 #include "cluster/partition.h"
 
-#include "archival/ntp_archiver_service.h"
-#include "archival/upload_housekeeping_service.h"
 #include "cloud_storage/async_manifest_view.h"
-#include "cloud_storage/partition_probe.h"
+#include "cloud_storage/partition_manifest_downloader.h"
+#include "cloud_storage/read_path_probes.h"
 #include "cloud_storage/remote_partition.h"
+#include "cloud_topics/dl_stm/dl_stm.h"
+#include "cloud_topics/dl_stm/dl_stm_api.h"
+#include "cluster/archival/archival_metadata_stm.h"
+#include "cluster/archival/ntp_archiver_service.h"
+#include "cluster/archival/upload_housekeeping_service.h"
+#include "cluster/id_allocator_stm.h"
+#include "cluster/log_eviction_stm.h"
 #include "cluster/logger.h"
-#include "cluster/tm_stm_cache_manager.h"
+#include "cluster/partition_properties_stm.h"
+#include "cluster/rm_stm.h"
+#include "cluster/tm_stm.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
-#include "prometheus/prometheus_sanitize.h"
-#include "raft/types.h"
+#include "raft/fundamental.h"
+#include "raft/fwd.h"
+#include "raft/state_machine_manager.h"
+#include "storage/ntp_config.h"
+#include "utils/rwlock.h"
 
+#include <seastar/core/shared_ptr_incomplete.hh>
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
 
-#include <exception>
+#include <chrono>
 
 namespace cluster {
 
-static bool is_id_allocator_topic(model::ntp ntp) {
-    return ntp.ns == model::kafka_internal_namespace
-           && ntp.tp.topic == model::id_allocator_topic;
-}
-
-static bool is_tx_manager_topic(const model::ntp& ntp) {
-    return ntp.ns == model::kafka_internal_namespace
-           && ntp.tp.topic == model::tx_manager_topic;
-}
-
 partition::partition(
   consensus_ptr r,
-  ss::sharded<cluster::tx_gateway_frontend>& tx_gateway_frontend,
   ss::sharded<cloud_storage::remote>& cloud_storage_api,
   ss::sharded<cloud_storage::cache>& cloud_storage_cache,
   ss::lw_shared_ptr<const archival::configuration> archival_conf,
   ss::sharded<features::feature_table>& feature_table,
-  ss::sharded<cluster::tm_stm_cache_manager>& tm_stm_cache_manager,
   ss::sharded<archival::upload_housekeeping_service>& upload_hks,
-  storage::kvstore& kvstore,
-  config::binding<uint64_t> max_concurrent_producer_ids,
   std::optional<cloud_storage_clients::bucket_name> read_replica_bucket)
-  : _raft(r)
-  , _partition_mem_tracker(
-      ss::make_shared<util::mem_tracker>(_raft->ntp().path()))
+  : _raft(std::move(r))
   , _probe(std::make_unique<replicated_partition_probe>(*this))
-  , _tx_gateway_frontend(tx_gateway_frontend)
   , _feature_table(feature_table)
-  , _tm_stm_cache_manager(tm_stm_cache_manager)
-  , _is_tx_enabled(config::shard_local_cfg().enable_transactions.value())
-  , _is_idempotence_enabled(
-      config::shard_local_cfg().enable_idempotence.value())
-  , _archival_conf(archival_conf)
+  , _archival_conf(std::move(archival_conf))
   , _cloud_storage_api(cloud_storage_api)
   , _cloud_storage_cache(cloud_storage_cache)
   , _cloud_storage_probe(
       ss::make_shared<cloud_storage::partition_probe>(_raft->ntp()))
   , _upload_housekeeping(upload_hks)
-  , _kvstore(kvstore) {
-    auto stm_manager = _raft->log()->stm_manager();
-
-    if (is_id_allocator_topic(_raft->ntp())) {
-        _id_allocator_stm = ss::make_shared<cluster::id_allocator_stm>(
-          clusterlog, _raft.get());
-    } else if (is_tx_manager_topic(_raft->ntp())) {
-        if (
-          _raft->log_config().is_collectable()
-          && !storage::deletion_exempt(_raft->ntp())) {
-            _log_eviction_stm = ss::make_shared<cluster::log_eviction_stm>(
-              _raft.get(), clusterlog, _as, _kvstore);
-            stm_manager->add_stm(_log_eviction_stm);
-        }
-
-        if (_is_tx_enabled) {
-            auto tm_stm_cache = _tm_stm_cache_manager.local().get(
-              _raft->ntp().tp.partition);
-            _tm_stm = ss::make_shared<cluster::tm_stm>(
-              clusterlog, _raft.get(), feature_table, tm_stm_cache);
-            stm_manager->add_stm(_tm_stm);
-        }
-    } else {
-        if (
-          _raft->log_config().is_collectable()
-          && !storage::deletion_exempt(_raft->ntp())) {
-            _log_eviction_stm = ss::make_shared<cluster::log_eviction_stm>(
-              _raft.get(), clusterlog, _as, _kvstore);
-            stm_manager->add_stm(_log_eviction_stm);
-        }
-        const model::topic_namespace tp_ns(
-          _raft->ntp().ns, _raft->ntp().tp.topic);
-        bool is_group_ntp = tp_ns == model::kafka_consumer_offsets_nt;
-
-        bool has_rm_stm = (_is_tx_enabled || _is_idempotence_enabled)
-                          && model::controller_ntp != _raft->ntp()
-                          && !is_group_ntp;
-
-        if (has_rm_stm) {
-            _rm_stm = ss::make_shared<cluster::rm_stm>(
-              clusterlog,
-              _raft.get(),
-              _tx_gateway_frontend,
-              _feature_table,
-              max_concurrent_producer_ids);
-            stm_manager->add_stm(_rm_stm);
-        }
-
-        // Construct cloud_storage read path (remote_partition)
-        if (
-          config::shard_local_cfg().cloud_storage_enabled()
-          && _cloud_storage_api.local_is_initialized()
-          && _raft->ntp().ns == model::kafka_namespace) {
-            _archival_meta_stm
-              = ss::make_shared<cluster::archival_metadata_stm>(
-                _raft.get(),
-                _cloud_storage_api.local(),
-                _feature_table.local(),
-                clusterlog,
-                _partition_mem_tracker);
-            stm_manager->add_stm(_archival_meta_stm);
-
-            if (cloud_storage_cache.local_is_initialized()) {
-                const auto& bucket_config
-                  = cloud_storage::configuration::get_bucket_config();
-                auto bucket = bucket_config.value();
-                if (
-                  read_replica_bucket
-                  && _raft->log_config().is_read_replica_mode_enabled()) {
-                    vlog(
-                      clusterlog.info,
-                      "{} Remote topic bucket is {}",
-                      _raft->ntp(),
-                      read_replica_bucket);
-                    // Override the bucket for read replicas
-                    _read_replica_bucket = read_replica_bucket;
-                    bucket = read_replica_bucket;
-                }
-                if (!bucket) {
-                    throw std::runtime_error{fmt::format(
-                      "configuration property {} is not set",
-                      bucket_config.name())};
-                }
-
-                _cloud_storage_manifest_view
-                  = ss::make_shared<cloud_storage::async_manifest_view>(
-                    _cloud_storage_api,
-                    cloud_storage_cache,
-                    _archival_meta_stm->manifest(),
-                    cloud_storage_clients::bucket_name{*bucket},
-                    *_cloud_storage_probe);
-
-                _cloud_storage_partition
-                  = ss::make_shared<cloud_storage::remote_partition>(
-                    _cloud_storage_manifest_view,
-                    _cloud_storage_api.local(),
-                    cloud_storage_cache.local(),
-                    cloud_storage_clients::bucket_name{*bucket},
-                    *_cloud_storage_probe);
+  , _log_cleanup_policy(config::shard_local_cfg().log_cleanup_policy.bind()) {
+    // Construct cloud_storage read path (remote_partition)
+    if (
+      config::shard_local_cfg().cloud_storage_enabled()
+      && _cloud_storage_api.local_is_initialized()
+      && _raft->ntp().ns == model::kafka_namespace) {
+        if (_cloud_storage_cache.local_is_initialized()) {
+            const auto& bucket_config
+              = cloud_storage::configuration::get_bucket_config();
+            auto bucket = bucket_config.value();
+            if (
+              read_replica_bucket
+              && _raft->log_config().is_read_replica_mode_enabled()) {
+                vlog(
+                  clusterlog.info,
+                  "{} Remote topic bucket is {}",
+                  _raft->ntp(),
+                  read_replica_bucket);
+                // Override the bucket for read replicas
+                _read_replica_bucket = read_replica_bucket;
+                bucket = read_replica_bucket;
+            }
+            if (!bucket) {
+                throw std::runtime_error{fmt::format(
+                  "configuration property {} is not set",
+                  bucket_config.name())};
             }
         }
-
-        // Construct cloud_storage write path (ntp_archiver)
-        maybe_construct_archiver();
     }
-}
 
-partition::~partition() {}
+    _log_cleanup_policy.watch([this]() {
+        if (_as.abort_requested()) {
+            return ss::now();
+        }
+        auto changed = _raft->log()->notify_compaction_update();
+        if (changed) {
+            vlog(
+              clusterlog.debug,
+              "[{}] updating archiver for cluster config change in "
+              "log_cleanup_policy",
+              _raft->ntp());
+
+            return restart_archiver(false);
+        }
+        return ss::now();
+    });
+}
 
 ss::future<std::error_code> partition::prefix_truncate(
   model::offset rp_start_offset,
   kafka::offset kafka_start_offset,
   ss::lowres_clock::time_point deadline) {
-    if (!_log_eviction_stm) {
+    if (!_log_eviction_stm || !_raft->log_config().is_collectable()) {
         vlog(
           clusterlog.info,
           "Cannot prefix-truncate topic/partition {} retention settings not "
@@ -225,7 +156,7 @@ ss::future<std::error_code> partition::prefix_truncate(
     co_return errc::success;
 }
 
-ss::future<std::vector<rm_stm::tx_range>> partition::aborted_transactions_cloud(
+ss::future<std::vector<tx::tx_range>> partition::aborted_transactions_cloud(
   const cloud_storage::offset_range& offsets) {
     return _cloud_storage_partition->aborted_transactions(offsets);
 }
@@ -239,9 +170,6 @@ cluster::cloud_storage_mode partition::get_cloud_storage_mode() const {
 
     if (cfg.is_read_replica_mode_enabled()) {
         return cluster::cloud_storage_mode::read_replica;
-    }
-    if (cfg.is_tiered_storage()) {
-        return cluster::cloud_storage_mode::full;
     }
     if (cfg.is_tiered_storage()) {
         return cluster::cloud_storage_mode::full;
@@ -262,8 +190,7 @@ partition_cloud_storage_status partition::get_cloud_storage_status() const {
         if (o == model::offset{}) {
             return std::nullopt;
         }
-        return model::offset_cast(
-          get_offset_translator_state()->from_log_offset(o));
+        return model::offset_cast(log()->from_log_offset(o));
     };
 
     auto time_point_to_delta = [](ss::lowres_clock::time_point tp)
@@ -287,8 +214,14 @@ partition_cloud_storage_status partition::get_cloud_storage_status() const {
     const auto local_log_offsets = local_log->offsets();
     status.local_log_start_offset = wrap_model_offset(
       local_log_offsets.start_offset);
-    status.local_log_last_offset = wrap_model_offset(
-      local_log_offsets.committed_offset);
+    /**
+     * If committed offset is smaller than the log start offset it indicates
+     * that committed offset wasn't yet established (log is empty)
+     */
+    if (local_log_offsets.committed_offset >= local_log_offsets.start_offset) {
+        status.local_log_last_offset = wrap_model_offset(
+          local_log_offsets.committed_offset);
+    }
 
     if (status.mode != cloud_storage_mode::disabled && _archival_meta_stm) {
         const auto& manifest = _archival_meta_stm->manifest();
@@ -310,7 +243,7 @@ partition_cloud_storage_status partition::get_cloud_storage_status() const {
         // Calculate local space usage that does not overlap with cloud space
         const auto local_space_excl = status.cloud_log_last_offset
                                         ? _raft->log()->size_bytes_after_offset(
-                                          manifest.get_last_offset())
+                                            manifest.get_last_offset())
                                         : status.local_log_size_bytes;
 
         status.total_log_size_bytes = status.cloud_log_size_bytes
@@ -339,6 +272,15 @@ partition_cloud_storage_status partition::get_cloud_storage_status() const {
     }
 
     return status;
+}
+
+std::optional<cloud_storage::anomalies>
+partition::get_cloud_storage_anomalies() const {
+    if (!_archival_meta_stm || !is_leader()) {
+        return std::nullopt;
+    }
+
+    return _archival_meta_stm->manifest().detected_anomalies();
 }
 
 bool partition::is_remote_fetch_enabled() const {
@@ -396,51 +338,75 @@ ss::future<storage::translating_reader> partition::make_cloud_reader(
 }
 
 ss::future<result<kafka_result>> partition::replicate(
-  model::record_batch_reader&& r, raft::replicate_options opts) {
+  chunked_vector<model::record_batch> batches, raft::replicate_options opts) {
     using ret_t = result<kafka_result>;
-    auto res = co_await _raft->replicate(std::move(r), opts);
+
+    auto maybe_units = co_await hold_writes_enabled();
+    if (!maybe_units) {
+        co_return ret_t(maybe_units.error());
+    }
+
+    auto res = co_await _raft->replicate(std::move(batches), opts);
     if (!res) {
         co_return ret_t(res.error());
     }
-    co_return ret_t(
-      kafka_result{kafka::offset(get_offset_translator_state()->from_log_offset(
-        res.value().last_offset)())});
+    co_return ret_t(kafka_result{
+      kafka::offset(log()->from_log_offset(res.value().last_offset)())});
 }
 
 ss::shared_ptr<cluster::rm_stm> partition::rm_stm() {
     if (!_rm_stm) {
-        if (!_is_tx_enabled && !_is_idempotence_enabled) {
-            vlog(
-              clusterlog.error,
-              "Can't process transactional and idempotent requests to {}. The "
-              "feature is disabled.",
-              _raft->ntp());
-        } else {
-            vlog(
-              clusterlog.error,
-              "Topic {} doesn't support idempotency and transactional "
-              "processing.",
-              _raft->ntp());
-        }
+        vlog(
+          clusterlog.error,
+          "Topic {} doesn't support idempotent and transactional "
+          "processing.",
+          _raft->ntp());
     }
     return _rm_stm;
 }
 
+ss::shared_ptr<experimental::cloud_topics::dl_stm_api> partition::dl_stm_api() {
+    return _dl_stm_api;
+}
+
+namespace {
+template<class Units, class StagesFutureFunc>
+ss::future<result<kafka_result>> stages_with_units_helper(
+  ss::future<result<Units>> maybe_units_f,
+  ss::promise<> enqueued_promise,
+  StagesFutureFunc stages_future_func) {
+    auto maybe_units = co_await std::move(maybe_units_f);
+    if (!maybe_units.has_value()) {
+        enqueued_promise.set_value();
+        co_return maybe_units.error();
+    }
+    kafka_stages orig_stages = stages_future_func();
+    co_await std::move(orig_stages.request_enqueued);
+    enqueued_promise.set_value();
+    co_return co_await std::move(orig_stages.replicate_finished);
+}
+
+template<class Units, class StagesFutureFunc>
+kafka_stages stages_with_units(
+  ss::future<result<Units>> maybe_units_f,
+  StagesFutureFunc stages_future_func) {
+    ss::promise<> enqueued_promise;
+    auto enqueued_f = enqueued_promise.get_future();
+    auto replicated_f = stages_with_units_helper(
+      std::move(maybe_units_f),
+      std::move(enqueued_promise),
+      std::move(stages_future_func));
+    return {std::move(enqueued_f), std::move(replicated_f)};
+}
+} // namespace
+
 kafka_stages partition::replicate_in_stages(
   model::batch_identity bid,
-  model::record_batch_reader&& r,
+  model::record_batch batch,
   raft::replicate_options opts) {
     using ret_t = result<kafka_result>;
-    if (bid.is_transactional) {
-        if (!_is_tx_enabled) {
-            vlog(
-              clusterlog.error,
-              "Can't process a transactional request to {}. Transactional "
-              "processing isn't enabled.",
-              _raft->ntp());
-            return kafka_stages(raft::errc::timeout);
-        }
 
+    if (bid.is_transactional) {
         if (!_rm_stm) {
             vlog(
               clusterlog.error,
@@ -450,82 +416,134 @@ kafka_stages partition::replicate_in_stages(
         }
     }
 
-    if (bid.has_idempotent()) {
-        if (!_is_idempotence_enabled) {
-            vlog(
-              clusterlog.error,
-              "Can't process an idempotent request to {}. Idempotency isn't "
-              "enabled.",
-              _raft->ntp());
-            return kafka_stages(raft::errc::timeout);
-        }
-
+    if (bid.is_idempotent()) {
         if (!_rm_stm) {
             vlog(
               clusterlog.error,
-              "Topic {} doesn't support idempotency.",
+              "Topic {} doesn't support idempotent requests.",
               _raft->ntp());
             return kafka_stages(raft::errc::timeout);
         }
     }
 
-    if (_rm_stm) {
-        return _rm_stm->replicate_in_stages(bid, std::move(r), opts);
-    }
-
-    auto res = _raft->replicate_in_stages(std::move(r), opts);
-    auto replicate_finished = res.replicate_finished.then(
-      [this](result<raft::replicate_result> r) {
-          if (!r) {
-              return ret_t(r.error());
+    return stages_with_units(
+      hold_writes_enabled(),
+      [this,
+       bid = std::move(bid),
+       batch = std::move(batch),
+       opts = std::move(opts)]() mutable {
+          if (_rm_stm) {
+              return _rm_stm->replicate_in_stages(bid, std::move(batch), opts);
           }
-          auto old_offset = r.value().last_offset;
-          auto new_offset = kafka::offset(
-            get_offset_translator_state()->from_log_offset(old_offset)());
-          return ret_t(kafka_result{new_offset});
+          auto res = _raft->replicate_in_stages(std::move(batch), opts);
+          auto replicate_finished = res.replicate_finished.then(
+            [this](result<raft::replicate_result> r) {
+                if (!r) {
+                    return ret_t(r.error());
+                }
+                auto old_offset = r.value().last_offset;
+                auto new_offset = kafka::offset(
+                  log()->from_log_offset(old_offset)());
+                return ret_t(kafka_result{new_offset});
+            });
+          return kafka_stages(
+            std::move(res.request_enqueued), std::move(replicate_finished));
       });
-    return kafka_stages(
-      std::move(res.request_enqueued), std::move(replicate_finished));
 }
 
-ss::future<> partition::start() {
-    auto ntp = _raft->ntp();
+raft::group_id partition::group() const { return _raft->group(); }
 
+ss::future<> partition::start(
+  state_machine_registry& stm_registry,
+  const std::optional<xshard_transfer_state>& xst_state) {
+    const auto& ntp = _raft->ntp();
+    raft::state_machine_manager_builder builder = stm_registry.make_builder_for(
+      _raft.get());
+
+    std::optional<raft::xshard_transfer_state> raft_xst_state;
+    if (xst_state) {
+        raft_xst_state = xst_state->raft;
+    }
+    co_await _raft->start(std::move(builder), std::move(raft_xst_state));
+    // store rm_stm pointer in partition as this is commonly used stm
+    _rm_stm = _raft->stm_manager()->get<cluster::rm_stm>();
+    _log_eviction_stm = _raft->stm_manager()->get<cluster::log_eviction_stm>();
+    // store _archival_meta_stm pointer in partition as this is commonly used
+    // stm (in future we may decide to remove it from partition)
+    _archival_meta_stm
+      = _raft->stm_manager()->get<cluster::archival_metadata_stm>();
+
+    // store partition properties stm offset for fast access
+    _partition_properties_stm
+      = _raft->stm_manager()->get<cluster::partition_properties_stm>();
+    // Start the probe after the partition is fully initialised
     _probe.setup_metrics(ntp);
 
-    auto f = _raft->start();
+    // Construct cloud_storage read path (remote_partition)
 
-    if (is_id_allocator_topic(ntp)) {
-        return f.then([this] { return _id_allocator_stm->start(); });
-    } else if (_log_eviction_stm) {
-        f = f.then([this] { return _log_eviction_stm->start(); });
+    if (_archival_meta_stm && _cloud_storage_cache.local_is_initialized()) {
+        const auto& bucket_config
+          = cloud_storage::configuration::get_bucket_config();
+        auto bucket = bucket_config.value();
+        if (
+          _read_replica_bucket
+          && _raft->log_config().is_read_replica_mode_enabled()) {
+            vlog(
+              clusterlog.info,
+              "{} Remote topic bucket is {}",
+              _raft->ntp(),
+              _read_replica_bucket);
+            // Override the bucket for read replicas
+            bucket = _read_replica_bucket;
+        }
+        if (!bucket) {
+            throw std::runtime_error{fmt::format(
+              "configuration property {} is not set", bucket_config.name())};
+        }
+
+        _cloud_storage_manifest_view
+          = ss::make_shared<cloud_storage::async_manifest_view>(
+            _cloud_storage_api,
+            _cloud_storage_cache,
+            _archival_meta_stm->manifest(),
+            cloud_storage_clients::bucket_name{*bucket},
+            _archival_meta_stm->path_provider());
+
+        _cloud_storage_partition
+          = ss::make_shared<cloud_storage::remote_partition>(
+            _cloud_storage_manifest_view,
+            _cloud_storage_api.local(),
+            _cloud_storage_cache.local(),
+            cloud_storage_clients::bucket_name{*bucket},
+            *_cloud_storage_probe);
     }
-
-    if (_rm_stm) {
-        f = f.then([this] { return _rm_stm->start(); });
-    }
-
-    if (_tm_stm) {
-        f = f.then([this] { return _tm_stm->start(); });
-    }
-
-    if (_archival_meta_stm) {
-        f = f.then([this] { return _archival_meta_stm->start(); });
-    }
-
     if (_cloud_storage_manifest_view) {
-        f = f.then([this] { return _cloud_storage_manifest_view->start(); });
+        co_await _cloud_storage_manifest_view->start();
     }
 
     if (_cloud_storage_partition) {
-        f = f.then([this] { return _cloud_storage_partition->start(); });
+        co_await _cloud_storage_partition->start();
     }
 
-    if (_archiver) {
-        f = f.then([this] { return _archiver->start(); });
+    {
+        auto archiver_reset_guard = co_await ssx::with_timeout_abortable(
+          ss::get_units(_archiver_reset_mutex, 1),
+          ss::lowres_clock::now() + archiver_reset_mutex_timeout,
+          _as);
+
+        maybe_construct_archiver();
+
+        if (_archiver) {
+            co_await _archiver->start();
+        }
     }
 
-    return f;
+    auto dl_stm
+      = _raft->stm_manager()->get<experimental::cloud_topics::dl_stm>();
+    if (dl_stm) {
+        _dl_stm_api = ss::make_shared<experimental::cloud_topics::dl_stm_api>(
+          clusterlog, std::move(dl_stm));
+    }
 }
 
 ss::future<> partition::stop() {
@@ -533,22 +551,22 @@ ss::future<> partition::stop() {
     vlog(clusterlog.debug, "Stopping partition: {}", partition_ntp);
     _as.request_abort();
 
-    if (_archiver) {
-        _upload_housekeeping.local().deregister_jobs(
-          _archiver->get_housekeeping_jobs());
-        vlog(
-          clusterlog.debug,
-          "Stopping archiver on partition: {}",
-          partition_ntp);
-        co_await _archiver->stop();
-    }
+    {
+        // `partition_manager::do_shutdown` (caller of stop) will assert
+        // out on any thrown exceptions. Hence, acquire the units without
+        // a timeout or abort source.
+        auto archiver_reset_guard = co_await ss::get_units(
+          _archiver_reset_mutex, 1);
 
-    if (_archival_meta_stm) {
-        vlog(
-          clusterlog.debug,
-          "Stopping archival_meta_stm on partition: {}",
-          partition_ntp);
-        co_await _archival_meta_stm->stop();
+        if (_archiver) {
+            _upload_housekeeping.local().deregister_jobs(
+              _archiver->get_housekeeping_jobs());
+            vlog(
+              clusterlog.debug,
+              "Stopping archiver on partition: {}",
+              partition_ntp);
+            co_await _archiver->stop();
+        }
     }
 
     if (_cloud_storage_partition) {
@@ -567,33 +585,15 @@ ss::future<> partition::stop() {
         co_await _cloud_storage_manifest_view->stop();
     }
 
-    if (_id_allocator_stm) {
+    if (_dl_stm_api) {
         vlog(
           clusterlog.debug,
-          "Stopping id_allocator_stm on partition: {}",
+          "Stopping dl_stm_api on partition: {}",
           partition_ntp);
-        co_await _id_allocator_stm->stop();
+        co_await _dl_stm_api->stop();
     }
 
-    if (_log_eviction_stm) {
-        vlog(
-          clusterlog.debug,
-          "Stopping log_eviction_stm on partition: {}",
-          partition_ntp);
-        co_await _log_eviction_stm->stop();
-    }
-
-    if (_rm_stm) {
-        vlog(
-          clusterlog.debug, "Stopping rm_stm on partition: {}", partition_ntp);
-        co_await _rm_stm->stop();
-    }
-
-    if (_tm_stm) {
-        vlog(
-          clusterlog.debug, "Stopping tm_stm on partition: {}", partition_ntp);
-        co_await _tm_stm->stop();
-    }
+    _probe.clear_metrics();
     vlog(clusterlog.debug, "Stopped partition {}", partition_ntp);
 }
 
@@ -604,122 +604,148 @@ partition::timequery(storage::timequery_config cfg) {
         co_return co_await cloud_storage_timequery(cfg);
     }
 
+    const bool may_answer_from_cloud
+      = may_read_from_cloud()
+        && _cloud_storage_partition->bounds_timestamp(cfg.time)
+        && cfg.min_offset < kafka::offset_cast(
+             _cloud_storage_partition->next_kafka_offset());
+
     if (_raft->log()->start_timestamp() <= cfg.time) {
-        // The query is ahead of the local data's start_timestamp: this means
-        // it _might_ hit on local data: start_timestamp is not precise, so
-        // once we query we might still fall back to cloud storage
-        auto result = co_await local_timequery(cfg);
-        if (!result.has_value()) {
+        // The query is ahead of the local data's start_timestamp: this
+        // means it _might_ hit on local data: start_timestamp is not
+        // precise, so once we query we might still fall back to cloud
+        // storage
+        //
+        // We also need to adjust the lower bound for the local query as the
+        // min_offset corresponds to the full log (including tiered storage).
+        auto local_query_cfg = cfg;
+        local_query_cfg.min_offset = std::max(
+          log()->from_log_offset(_raft->start_offset()),
+          local_query_cfg.min_offset);
+
+        // If the min_offset is ahead of max_offset, the local log is empty
+        // or was truncated since the timequery_config was created.
+        if (local_query_cfg.min_offset > local_query_cfg.max_offset) {
+            co_return std::nullopt;
+        }
+
+        auto result = co_await local_timequery(
+          local_query_cfg, may_answer_from_cloud);
+        if (result.has_value()) {
+            co_return result;
+        } else {
             // The local storage hit a case where it needs to fall back
             // to querying cloud storage.
             co_return co_await cloud_storage_timequery(cfg);
-        } else {
-            co_return result;
         }
     } else {
-        if (
-          may_read_from_cloud()
-          && _cloud_storage_partition->bounds_timestamp(cfg.time)) {
+        if (may_answer_from_cloud) {
             // Timestamp is before local storage but within cloud storage
             co_return co_await cloud_storage_timequery(cfg);
         } else {
-            // No cloud data: queries earlier than the start of the log
-            // will hit on the start of the log.
-            co_return co_await local_timequery(cfg);
+            // No cloud data OR not allowed to read from cloud: queries earlier
+            // than the start of the log will hit on the start of the log.
+            //
+            // Adjust the lower bound for the local query as the min_offset
+            // corresponds to the full log (including tiered storage).
+            auto local_query_cfg = cfg;
+            local_query_cfg.min_offset = std::max(
+              log()->from_log_offset(_raft->start_offset()),
+              local_query_cfg.min_offset);
+
+            // If the min_offset is ahead of max_offset, the local log is empty
+            // or was truncated since the timequery_config was created.
+            if (local_query_cfg.min_offset > local_query_cfg.max_offset) {
+                co_return std::nullopt;
+            }
+
+            co_return co_await local_timequery(local_query_cfg, false);
         }
     }
 }
 
 bool partition::may_read_from_cloud() const {
-    return _cloud_storage_partition
-           && _cloud_storage_partition->is_data_available();
+    return (is_remote_fetch_enabled() || is_read_replica_mode_enabled())
+           && (_cloud_storage_partition && _cloud_storage_partition->is_data_available());
 }
 
 ss::future<std::optional<storage::timequery_result>>
 partition::cloud_storage_timequery(storage::timequery_config cfg) {
-    if (may_read_from_cloud()) {
-        // We have data in the remote partition, and all the data in the raft
-        // log is ahead of the query timestamp or the topic is a read replica,
-        // so proceed to query the remote partition to try and find the earliest
-        // data that has timestamp >= the query time.
-        vlog(
-          clusterlog.debug,
-          "timequery (cloud) {} t={} max_offset(k)={}",
-          _raft->ntp(),
-          cfg.time,
-          cfg.max_offset);
-
-        // remote_partition pre-translates offsets for us, so no call into
-        // the offset translator here
-        auto result = co_await _cloud_storage_partition->timequery(cfg);
-        if (result) {
-            vlog(
-              clusterlog.debug,
-              "timequery (cloud) {} t={} max_offset(r)={} result(r)={}",
-              _raft->ntp(),
-              cfg.time,
-              cfg.max_offset,
-              result->offset);
-        }
-
-        co_return result;
+    if (!may_read_from_cloud()) {
+        co_return std::nullopt;
     }
 
-    co_return std::nullopt;
+    // We have data in the remote partition, and all the data in the
+    // raft log is ahead of the query timestamp or the topic is a read
+    // replica, so proceed to query the remote partition to try and
+    // find the earliest data that has timestamp >= the query time.
+    vlog(clusterlog.debug, "timequery (cloud) {} cfg(k)={}", _raft->ntp(), cfg);
+
+    // remote_partition pre-translates offsets for us, so no call into
+    // the offset translator here
+    auto result = co_await _cloud_storage_partition->timequery(cfg);
+    if (result.has_value()) {
+        vlog(
+          clusterlog.debug,
+          "timequery (cloud) {} cfg(k)={} result(k)={}",
+          _raft->ntp(),
+          cfg,
+          result->offset);
+    }
+
+    co_return result;
 }
 
-ss::future<std::optional<storage::timequery_result>>
-partition::local_timequery(storage::timequery_config cfg) {
-    vlog(
-      clusterlog.debug,
-      "timequery (raft) {} t={} max_offset(k)={}",
-      _raft->ntp(),
-      cfg.time,
-      cfg.max_offset);
+ss::future<std::optional<storage::timequery_result>> partition::local_timequery(
+  storage::timequery_config cfg, bool allow_cloud_fallback) {
+    vlog(clusterlog.debug, "timequery (raft) {} cfg(k)={}", _raft->ntp(), cfg);
 
-    cfg.max_offset = _raft->get_offset_translator_state()->to_log_offset(
-      cfg.max_offset);
+    cfg.min_offset = _raft->log()->to_log_offset(cfg.min_offset);
+    cfg.max_offset = _raft->log()->to_log_offset(cfg.max_offset);
+
+    vlog(clusterlog.debug, "timequery (raft) {} cfg(r)={}", _raft->ntp(), cfg);
 
     auto result = co_await _raft->timequery(cfg);
 
-    bool may_answer_from_cloud = may_read_from_cloud()
-                                 && _cloud_storage_partition->bounds_timestamp(
-                                   cfg.time);
+    if (result.has_value()) {
+        if (allow_cloud_fallback) {
+            // We need to test for cases in which we will fall back to querying
+            // cloud storage.
+            if (_raft->log()->start_timestamp() > cfg.time) {
+                // Query raced with prefix truncation
+                vlog(
+                  clusterlog.debug,
+                  "timequery (raft) {} cfg(r)={} raced with truncation "
+                  "(start_timestamp {}, result {})",
+                  _raft->ntp(),
+                  cfg,
+                  _raft->log()->start_timestamp(),
+                  result->time);
+                co_return std::nullopt;
+            }
 
-    if (result) {
-        if (
-          _raft->log()->start_timestamp() > cfg.time && may_answer_from_cloud) {
-            // Query raced with prefix truncation
-            vlog(
-              clusterlog.debug,
-              "timequery (raft) {} ts={} raced with truncation "
-              "(start_timestamp {}, result {})",
-              _raft->ntp(),
-              cfg.time,
-              _raft->log()->start_timestamp(),
-              result->time);
-            co_return std::nullopt;
-        }
-
-        if (
-          _raft->log()->start_timestamp() <= cfg.time && result->time > cfg.time
-          && may_answer_from_cloud) {
-            // start_timestamp() points to the beginning of the oldest segment,
-            // but start_offset points to somewhere within a segment.  If our
-            // timequery hits the range between the start of segment and
-            // the start_offset, consensus::timequery may answer with
-            // the start offset rather than the pre-start-offset location
-            // where the timestamp is actually found.
-            // Ref https://github.com/redpanda-data/redpanda/issues/9669
-            vlog(
-              clusterlog.debug,
-              "Timequery (raft) {} ts={} miss on local log (start_timestamp "
-              "{}, result {})",
-              _raft->ntp(),
-              cfg.time,
-              _raft->log()->start_timestamp(),
-              result->time);
-            co_return std::nullopt;
+            if (
+              _raft->log()->start_timestamp() <= cfg.time
+              && result->time > cfg.time) {
+                // start_timestamp() points to the beginning of the oldest
+                // segment, but start_offset points to somewhere within a
+                // segment.  If our timequery hits the range between the start
+                // of segment and the start_offset, consensus::timequery may
+                // answer with the start offset rather than the
+                // pre-start-offset location where the timestamp is actually
+                // found. Ref
+                // https://github.com/redpanda-data/redpanda/issues/9669
+                vlog(
+                  clusterlog.debug,
+                  "Timequery (raft) {} cfg(r)={} miss on local log "
+                  "(start_timestamp "
+                  "{}, result {})",
+                  _raft->ntp(),
+                  cfg,
+                  _raft->log()->start_timestamp(),
+                  result->time);
+                co_return std::nullopt;
+            }
         }
 
         if (result->offset == _raft->log()->offsets().start_offset) {
@@ -728,49 +754,50 @@ partition::local_timequery(storage::timequery_config cfg) {
             // have the same timestamp and are present in cloud storage.
             vlog(
               clusterlog.debug,
-              "Timequery (raft) {} ts={} hit start_offset in local log "
+              "Timequery (raft) {} cfg(r)={} hit start_offset in local log "
               "(start_offset {} start_timestamp {}, result {})",
               _raft->ntp(),
+              cfg,
               _raft->log()->offsets().start_offset,
-              cfg.time,
               _raft->log()->start_timestamp(),
               cfg.time);
-            if (
-              _cloud_storage_partition
-              && _cloud_storage_partition->is_data_available()
-              && may_answer_from_cloud) {
-                // Even though we hit data with the desired timestamp, we cannot
-                // be certain that this is the _first_ batch with the desired
-                // timestamp: return null so that the caller will fall back
-                // to cloud storage.
+
+            if (allow_cloud_fallback) {
+                // Even though we hit data with the desired timestamp, we
+                // cannot be certain that this is the _first_ batch with
+                // the desired timestamp: return null so that the caller
+                // will fall back to cloud storage.
                 co_return std::nullopt;
             }
         }
 
         vlog(
           clusterlog.debug,
-          "timequery (raft) {} t={} max_offset(r)={} result(r)={}",
+          "timequery (raft) {} cfg(r)={} result(r)={}",
           _raft->ntp(),
-          cfg.time,
-          cfg.max_offset,
+          cfg,
           result->offset);
-        result->offset = _raft->get_offset_translator_state()->from_log_offset(
-          result->offset);
+        result->offset = _raft->log()->from_log_offset(result->offset);
     }
 
     co_return result;
 }
 
-void partition::maybe_construct_archiver() {
-    // NOTE: construct and archiver even if shadow indexing isn't enabled, e.g.
+bool partition::should_construct_archiver() {
+    // NOTE: construct an archiver even if shadow indexing isn't enabled, e.g.
     // in the case of read replicas -- we still need the archiver to drive
     // manifest updates, etc.
-    auto& ntp_config = _raft->log()->config();
-    if (
-      config::shard_local_cfg().cloud_storage_enabled()
-      && _cloud_storage_api.local_is_initialized()
-      && _raft->ntp().ns == model::kafka_namespace
-      && (ntp_config.is_archival_enabled() || ntp_config.is_read_replica_mode_enabled())) {
+    const auto& ntp_config = _raft->log()->config();
+    return config::shard_local_cfg().cloud_storage_enabled()
+           && config::shard_local_cfg().cloud_storage_disable_archiver_manager()
+           && _cloud_storage_api.local_is_initialized()
+           && _raft->ntp().ns == model::kafka_namespace
+           && (ntp_config.is_archival_enabled() || ntp_config.is_read_replica_mode_enabled());
+}
+
+void partition::maybe_construct_archiver() {
+    if (should_construct_archiver()) {
+        const auto& ntp_config = _raft->log()->config();
         _archiver = std::make_unique<archival::ntp_archiver>(
           ntp_config,
           _archival_conf,
@@ -787,38 +814,27 @@ void partition::maybe_construct_archiver() {
 
 uint64_t partition::non_log_disk_size_bytes() const {
     uint64_t raft_size = _raft->get_snapshot_size();
-
-    std::optional<uint64_t> rm_size;
-    if (_rm_stm) {
-        rm_size = _rm_stm->get_snapshot_size();
-    }
-
-    std::optional<uint64_t> tm_size;
-    if (_tm_stm) {
-        tm_size = _tm_stm->get_snapshot_size();
-    }
-
-    std::optional<uint64_t> archival_size;
-    if (_archival_meta_stm) {
-        archival_size = _archival_meta_stm->get_snapshot_size();
-    }
-
-    std::optional<uint64_t> idalloc_size;
-    if (_id_allocator_stm) {
-        idalloc_size = _id_allocator_stm->get_snapshot_size();
-    }
+    uint64_t stm_local_size = 0;
+    _raft->stm_manager()->for_each_stm(
+      [this, &stm_local_size](
+        const ss::sstring& name, const raft::state_machine_base& stm) {
+          const auto sz = stm.get_local_state_size();
+          vlog(
+            clusterlog.trace,
+            "local non-log disk size of {} stm {} = {} bytes",
+            _raft->ntp(),
+            name,
+            sz);
+          stm_local_size += sz;
+      });
 
     vlog(
       clusterlog.trace,
-      "non-log disk size: raft {} rm {} tm {} archival {} idalloc {}",
-      raft_size,
-      rm_size,
-      tm_size,
-      archival_size,
-      idalloc_size);
+      "local non-log disk size of {}: {}",
+      _raft->ntp(),
+      raft_size + stm_local_size);
 
-    return raft_size + rm_size.value_or(0) + tm_size.value_or(0)
-           + archival_size.value_or(0) + idalloc_size.value_or(0);
+    return raft_size + stm_local_size;
 }
 
 ss::future<> partition::update_configuration(topic_properties properties) {
@@ -828,51 +844,73 @@ ss::future<> partition::update_configuration(topic_properties properties) {
     // Before applying change, consider whether it changes cloud storage
     // mode
     bool cloud_storage_changed = false;
+
+    bool old_archival = old_ntp_config.is_archival_enabled();
     bool new_archival = new_ntp_config.shadow_indexing_mode
                         && model::is_archival_enabled(
                           new_ntp_config.shadow_indexing_mode.value());
 
-    bool new_compaction_status
-      = new_ntp_config.cleanup_policy_bitflags.has_value()
-        && (new_ntp_config.cleanup_policy_bitflags.value()
-            & model::cleanup_policy_bitflags::compaction)
-             == model::cleanup_policy_bitflags::compaction;
-    if (
-      old_ntp_config.is_archival_enabled() != new_archival
-      || old_ntp_config.is_read_replica_mode_enabled()
-           != new_ntp_config.read_replica
-      || old_ntp_config.is_compacted() != new_compaction_status) {
+    auto old_retention_ms = old_ntp_config.has_overrides()
+                              ? old_ntp_config.get_overrides().retention_time
+                              : tristate<std::chrono::milliseconds>(
+                                  std::nullopt);
+    auto new_retention_ms = new_ntp_config.retention_time;
+
+    auto old_retention_bytes
+      = old_ntp_config.has_overrides()
+          ? old_ntp_config.get_overrides().retention_bytes
+          : tristate<size_t>(std::nullopt);
+    auto new_retention_bytes = new_ntp_config.retention_bytes;
+
+    if (old_archival != new_archival) {
+        vlog(
+          clusterlog.debug,
+          "[{}] updating archiver for topic config change in "
+          "archival_enabled",
+          _raft->ntp());
+        cloud_storage_changed = true;
+    }
+    if (old_retention_ms != new_retention_ms) {
+        vlog(
+          clusterlog.debug,
+          "[{}] updating archiver for topic config change in "
+          "retention_ms",
+          _raft->ntp());
+        cloud_storage_changed = true;
+    }
+    if (old_retention_bytes != new_retention_bytes) {
+        vlog(
+          clusterlog.debug,
+          "[{}] updating archiver for topic config change in "
+          "retention_bytes",
+          _raft->ntp());
         cloud_storage_changed = true;
     }
 
     // Pass the configuration update into the storage layer
-    co_await _raft->log()->update_configuration(new_ntp_config);
+    _raft->log()->set_overrides(new_ntp_config);
+    bool compaction_changed = _raft->log()->notify_compaction_update();
+    if (compaction_changed) {
+        vlog(
+          clusterlog.debug,
+          "[{}] updating archiver for topic config change in compaction",
+          _raft->ntp());
+        cloud_storage_changed = true;
+    }
 
     // Update cached instance of topic properties
     if (_topic_cfg) {
         _topic_cfg->properties = std::move(properties);
     }
 
+    // Pass the configuration update to the raft layer
+    _raft->notify_config_update();
+
     // If this partition's cloud storage mode changed, rebuild the archiver.
-    // This must happen after raft update, because it reads raft's
+    // This must happen after the raft+storage update, because it reads raft's
     // ntp_config to decide whether to construct an archiver.
     if (cloud_storage_changed) {
-        vlog(
-          clusterlog.debug,
-          "update_configuration[{}]: updating archiver for config {}",
-          new_ntp_config,
-          _raft->ntp());
-        if (_archiver) {
-            _upload_housekeeping.local().deregister_jobs(
-              _archiver->get_housekeeping_jobs());
-            co_await _archiver->stop();
-            _archiver = nullptr;
-        }
-        maybe_construct_archiver();
-        if (_archiver) {
-            _archiver->notify_topic_config();
-            co_await _archiver->start();
-        }
+        co_await restart_archiver(true);
     } else {
         vlog(
           clusterlog.trace,
@@ -888,6 +926,27 @@ ss::future<> partition::update_configuration(topic_properties properties) {
             // configuration changes.
             _archiver->notify_topic_config();
         }
+    }
+}
+
+ss::future<> partition::restart_archiver(bool should_notify_topic_config) {
+    auto archiver_reset_guard = co_await ssx::with_timeout_abortable(
+      ss::get_units(_archiver_reset_mutex, 1),
+      ss::lowres_clock::now() + archiver_reset_mutex_timeout,
+      _as);
+
+    if (_archiver) {
+        _upload_housekeeping.local().deregister_jobs(
+          _archiver->get_housekeeping_jobs());
+        co_await _archiver->stop();
+        _archiver = nullptr;
+    }
+    maybe_construct_archiver();
+    if (_archiver) {
+        if (should_notify_topic_config) {
+            _archiver->notify_topic_config();
+        }
+        co_await _archiver->start();
     }
 }
 
@@ -914,21 +973,8 @@ partition::get_cloud_term_last_offset(model::term_id term) const {
 }
 
 ss::future<> partition::remove_persistent_state() {
-    if (_rm_stm) {
-        co_await _rm_stm->remove_persistent_state();
-    }
-    if (_tm_stm) {
-        co_await _tm_stm->remove_persistent_state();
-    }
-    if (_archival_meta_stm) {
-        co_await _archival_meta_stm->remove_persistent_state();
-    }
-    if (_id_allocator_stm) {
-        co_await _id_allocator_stm->remove_persistent_state();
-    }
-    if (_log_eviction_stm) {
-        co_await _log_eviction_stm->remove_persistent_state();
-    }
+    _cloud_storage_probe->clear_metrics();
+    co_await _raft->stm_manager()->remove_local_state();
 }
 
 /**
@@ -973,8 +1019,8 @@ static ss::future<bool> should_finalize(
 ss::future<> partition::finalize_remote_partition(ss::abort_source& as) {
     if (!_feature_table.local().is_active(
           features::feature::cloud_storage_manifest_format_v2)) {
-        // this is meant to prevent uploading manifests with new format while
-        // the cluster is in a mixed state
+        // this is meant to prevent uploading manifests with new format
+        // while the cluster is in a mixed state
         vlog(
           clusterlog.info, "skipping finalize of remote partition {}", ntp());
         co_return;
@@ -1019,8 +1065,6 @@ ss::future<> partition::serialize_json_manifest_to_output_stream(
           "{} not configured for cloud storage", _topic_cfg->tp_ns));
     }
 
-    auto lock = _archival_meta_stm->acquire_manifest_lock();
-
     // The timeout here is meant to place an upper bound on the amount
     // of time the manifest lock is held for.
     co_await ss::with_timeout(
@@ -1030,7 +1074,7 @@ ss::future<> partition::serialize_json_manifest_to_output_stream(
 }
 
 ss::future<std::error_code>
-partition::transfer_leadership(transfer_leadership_request req) {
+partition::transfer_leadership(raft::transfer_leadership_request req) {
     auto target = req.target;
 
     vlog(
@@ -1043,8 +1087,12 @@ partition::transfer_leadership(transfer_leadership_request req) {
     auto archival_timeout
       = config::shard_local_cfg().cloud_storage_graceful_transfer_timeout_ms();
     if (_archiver && archival_timeout.has_value()) {
-        complete_archiver.emplace(
-          [a = _archiver.get()]() { a->complete_transfer_leadership(); });
+        complete_archiver.emplace([this]() {
+            if (_archiver) {
+                _archiver->complete_transfer_leadership();
+            }
+        });
+
         vlog(
           clusterlog.debug,
           "transfer_leadership[{}]: entering archiver prepare",
@@ -1053,11 +1101,11 @@ partition::transfer_leadership(transfer_leadership_request req) {
         bool archiver_clean = co_await _archiver->prepare_transfer_leadership(
           archival_timeout.value());
         if (!archiver_clean) {
-            // This is legal: if we are very tight on bandwidth to S3, then it
-            // can take longer than the available timeout for an upload of
-            // a large segment to complete.  If this happens, we will leak
-            // an object, but retain a consistent+correct manifest when
-            // the new leader writes it.
+            // This is legal: if we are very tight on bandwidth to S3,
+            // then it can take longer than the available timeout for an
+            // upload of a large segment to complete.  If this happens, we
+            // will leak an object, but retain a consistent+correct
+            // manifest when the new leader writes it.
             vlog(
               clusterlog.warn,
               "Timed out waiting for {} uploads to complete before "
@@ -1079,8 +1127,8 @@ partition::transfer_leadership(transfer_leadership_request req) {
     ss::basic_rwlock<>::holder stm_prepare_lock;
     if (_rm_stm) {
         stm_prepare_lock = co_await _rm_stm->prepare_transfer_leadership();
-    } else if (_tm_stm) {
-        stm_prepare_lock = co_await _tm_stm->prepare_transfer_leadership();
+    } else if (auto stm = tm_stm(); stm) {
+        stm_prepare_lock = co_await stm->prepare_transfer_leadership();
     }
 
     co_return co_await _raft->do_transfer_leadership(req);
@@ -1094,8 +1142,57 @@ partition::get_follower_metrics() const {
     return _raft->get_follower_metrics();
 }
 
-ss::future<> partition::unsafe_reset_remote_partition_manifest(iobuf buf) {
-    vlog(clusterlog.info, "[{}] Unsafe manifest reset requested", ntp());
+ss::future<>
+partition::replicate_unsafe_reset(cloud_storage::partition_manifest manifest) {
+    vlog(
+      clusterlog.info,
+      "Replicating replace manifest command. New manifest details: {{ "
+      "start_offset: {}, last_offset: {}}}",
+      manifest.get_start_offset(),
+      manifest.get_last_offset());
+
+    // Replicate the reset command which contains the downloaded manifest
+    auto sync_timeout = config::shard_local_cfg()
+                          .cloud_storage_metadata_sync_timeout_ms.value();
+    auto replication_deadline = ss::lowres_clock::now() + sync_timeout;
+    std::vector<cluster::command_batch_builder> builders;
+
+    // TODO: move this logic to the ntp_archiver
+    // currently, the 'batch_start' method will work even if there is an
+    // active input queue instance. The batch replicated here may interrupt
+    // some operation in the archiver but the correctness will not be
+    // compromised.
+    auto reset_builder = _archival_meta_stm->batch_start(
+      replication_deadline, _as);
+    reset_builder.replace_manifest(manifest.to_iobuf());
+
+    auto errc = co_await reset_builder.replicate();
+    if (errc) {
+        if (errc == raft::errc::shutting_down) {
+            // During shutdown, act like we hit an abort source rather
+            // than trying to log+handle this like a write error.
+            throw ss::abort_requested_exception();
+        }
+
+        vlog(
+          clusterlog.warn,
+          "[{}] Unsafe reset failed to update archival STM: "
+          "{}",
+          ntp(),
+          errc.message());
+        throw std::runtime_error(
+          fmt::format("Failed to update archival STM: {}", errc.message()));
+    }
+
+    vlog(
+      clusterlog.info,
+      "[{}] Unsafe reset replicated STM commands successfully",
+      ntp());
+}
+
+ss::future<>
+partition::unsafe_reset_remote_partition_manifest_from_json(iobuf json_buf) {
+    vlog(clusterlog.info, "[{}] Manual unsafe manifest reset requested", ntp());
 
     if (!(config::shard_local_cfg().cloud_storage_enabled()
           && _archival_meta_stm)) {
@@ -1116,49 +1213,548 @@ ss::future<> partition::unsafe_reset_remote_partition_manifest(iobuf buf) {
 
     // Deserialise provided manifest
     cloud_storage::partition_manifest req_m{
-      _raft->ntp(), _raft->log_config().get_initial_revision()};
-    req_m.update_with_json(std::move(buf));
+      _raft->ntp(), _raft->log_config().get_remote_revision()};
+    req_m.update_with_json(std::move(json_buf));
 
-    // A generous timeout of 60 seconds is used as it applies
-    // for the replication multiple batches.
-    auto deadline = ss::lowres_clock::now() + 60s;
-    std::vector<cluster::command_batch_builder> builders;
+    co_await replicate_unsafe_reset(std::move(req_m));
+}
 
-    auto reset_builder = _archival_meta_stm->batch_start(deadline, _as);
-
-    // Add command to replace manifest. When applied, the current manifest
-    // will be replaced with the one provided.
-    reset_builder.replace_manifest(req_m.to_iobuf());
-
+ss::future<>
+partition::unsafe_reset_remote_partition_manifest_from_cloud(bool force) {
     vlog(
       clusterlog.info,
-      "Replicating replace manifest command. New manifest start offset: {}",
-      req_m.get_start_offset());
+      "[{}] Unsafe manifest reset from cloud state requested",
+      ntp());
 
-    auto errc = co_await reset_builder.replicate();
-    if (errc) {
-        if (errc == raft::errc::shutting_down) {
-            // During shutdown, act like we hit an abort source rather
-            // than trying to log+handle this like a write error.
-            throw ss::abort_requested_exception();
+    _as.check();
+
+    if (!(config::shard_local_cfg().cloud_storage_enabled()
+          && _archival_meta_stm)) {
+        vlog(
+          clusterlog.warn,
+          "[{}] Archival STM not present. Skipping unsafe reset ...",
+          ntp());
+        throw std::runtime_error("Archival STM not present");
+    }
+
+    std::optional<ssx::semaphore_units> archiver_reset_guard;
+    if (should_construct_archiver()) {
+        archiver_reset_guard = co_await ssx::with_timeout_abortable(
+          ss::get_units(_archiver_reset_mutex, 1),
+          ss::lowres_clock::now() + archiver_reset_mutex_timeout,
+          _as);
+    }
+
+    // Stop the archiver and its housekeeping jobs
+    if (_archiver) {
+        _upload_housekeeping.local().deregister_jobs(
+          _archiver->get_housekeeping_jobs());
+        co_await _archiver->stop();
+        _archiver = nullptr;
+    }
+
+    auto start_archiver = [this]() {
+        maybe_construct_archiver();
+        if (_archiver) {
+            // Topic configs may have changed while the archiver was
+            // stopped, so mark them as dirty just in case.
+            _archiver->notify_topic_config();
+            return _archiver->start();
+        }
+
+        return ss::now();
+    };
+
+    // Ensure that all commands on the log have been applied.
+    // No new archival commands should be replicated now.
+    auto sync_timeout = config::shard_local_cfg()
+                          .cloud_storage_metadata_sync_timeout_ms.value();
+    auto sync_result = co_await ss::coroutine::as_future(
+      _archival_meta_stm->sync(sync_timeout));
+    if (sync_result.failed() || sync_result.get() == std::nullopt) {
+        vlog(
+          clusterlog.warn,
+          "[{}] Could not sync with log. Skipping unsafe reset ...",
+          ntp());
+
+        co_await start_archiver();
+        throw std::runtime_error("Could not sync with log");
+    }
+
+    _as.check();
+
+    // Attempt the reset
+    auto future_result = co_await ss::coroutine::as_future(
+      do_unsafe_reset_remote_partition_manifest_from_cloud(force));
+
+    // Reconstruct the archiver and start it if needed
+    co_await start_archiver();
+
+    // Rethrow the exception if we failed to reset
+    future_result.get();
+}
+ss::future<result<model::offset>>
+partition::fetch_latest_cloud_offset_from_manifest(
+  model::timeout_clock::time_point deadline) {
+    if (!cloud_data_available()) {
+        co_return errc::invalid_partition_operation;
+    }
+
+    const auto initial_rev = _raft->log_config().get_remote_revision();
+    const auto bucket = [this]() {
+        if (is_read_replica_mode_enabled()) {
+            return get_read_replica_bucket();
+        }
+
+        const auto& bucket_config
+          = cloud_storage::configuration::get_bucket_config();
+        vassert(
+          bucket_config.value(),
+          "configuration property {} must be set",
+          bucket_config.name());
+
+        return cloud_storage_clients::bucket_name{
+          bucket_config.value().value()};
+    }();
+
+    cloud_storage::partition_manifest new_manifest{ntp(), initial_rev};
+
+    auto backoff = config::shard_local_cfg().cloud_storage_initial_backoff_ms();
+
+    retry_chain_node rtc(_as, deadline, backoff);
+    cloud_storage::partition_manifest_downloader dl(
+      bucket,
+      _archival_meta_stm->path_provider(),
+      ntp(),
+      initial_rev,
+      _cloud_storage_api.local());
+
+    auto res = co_await dl.download_manifest(rtc, &new_manifest);
+    if (res.has_error()) {
+        co_return res.error();
+    }
+    if (
+      res.value()
+      == cloud_storage::find_partition_manifest_outcome::no_matching_manifest) {
+        vlog(
+          clusterlog.warn, "No matching manifest for {} ", ntp(), initial_rev);
+        co_return errc::invalid_partition_operation;
+    }
+
+    co_return new_manifest.get_last_offset();
+}
+
+ss::future<>
+partition::do_unsafe_reset_remote_partition_manifest_from_cloud(bool force) {
+    const auto initial_rev = _raft->log_config().get_remote_revision();
+    const auto bucket = [this]() {
+        if (is_read_replica_mode_enabled()) {
+            return get_read_replica_bucket();
+        }
+
+        const auto& bucket_config
+          = cloud_storage::configuration::get_bucket_config();
+        vassert(
+          bucket_config.value(),
+          "configuration property {} must be set",
+          bucket_config.name());
+
+        return cloud_storage_clients::bucket_name{
+          bucket_config.value().value()};
+    }();
+
+    // Download the current partition manifest from the cloud
+    cloud_storage::partition_manifest new_manifest{ntp(), initial_rev};
+
+    auto timeout
+      = config::shard_local_cfg().cloud_storage_manifest_upload_timeout_ms();
+    auto backoff = config::shard_local_cfg().cloud_storage_initial_backoff_ms();
+
+    retry_chain_node rtc(_as, timeout, backoff);
+    cloud_storage::partition_manifest_downloader dl(
+      bucket,
+      _archival_meta_stm->path_provider(),
+      ntp(),
+      initial_rev,
+      _cloud_storage_api.local());
+    auto res = co_await dl.download_manifest(rtc, &new_manifest);
+    if (res.has_error()) {
+        throw std::runtime_error(ssx::sformat(
+          "Failed to download partition manifest with error: {}", res.error()));
+    }
+    if (
+      res.value()
+      == cloud_storage::find_partition_manifest_outcome::no_matching_manifest) {
+        throw std::runtime_error(ssx::sformat(
+          "No matching manifest for {} rev {}", ntp(), initial_rev));
+    }
+
+    const auto max_collectible
+      = _raft->log()->stm_manager()->max_collectible_offset();
+    if (new_manifest.get_last_offset() < max_collectible) {
+        auto msg = ssx::sformat(
+          "Applying the cloud manifest would cause data loss since the last "
+          "offset in the downloaded manifest is below the max_collectible "
+          "offset "
+          "{} < {}",
+          new_manifest.get_last_offset(),
+          max_collectible);
+
+        if (!force) {
+            throw std::runtime_error(msg);
         }
 
         vlog(
           clusterlog.warn,
-          "[{}] Unsafe reset failed to update archival STM: {}",
+          "[{}] {}. Proceeding since the force flag was used.",
           ntp(),
-          errc.message());
-        throw std::runtime_error(
-          fmt::format("Failed to update archival STM: {}", errc.message()));
+          msg);
     }
 
-    vlog(
-      clusterlog.info,
-      "[{}] Unsafe reset replicated STM commands successfully",
-      ntp());
+    co_await replicate_unsafe_reset(std::move(new_manifest));
+}
+
+ss::shared_ptr<cloud_storage::async_manifest_view>
+partition::get_cloud_storage_manifest_view() {
+    return _cloud_storage_manifest_view;
+}
+
+ss::future<result<model::offset, std::error_code>>
+partition::sync_kafka_start_offset_override(
+  model::timeout_clock::duration timeout) {
+    if (is_read_replica_mode_enabled()) {
+        auto term = _raft->term();
+        if (!co_await _archival_meta_stm->sync(timeout)) {
+            if (term != _raft->term()) {
+                co_return errc::not_leader;
+            } else {
+                co_return errc::timeout;
+            }
+        }
+        auto start_kafka_offset
+          = _archival_meta_stm->manifest().get_start_kafka_offset_override();
+
+        co_return kafka::offset_cast(start_kafka_offset);
+    }
+
+    if (_log_eviction_stm) {
+        auto offset_res = co_await _log_eviction_stm
+                            ->sync_kafka_start_offset_override(timeout);
+        if (offset_res.has_failure()) {
+            co_return offset_res.as_failure();
+        }
+        if (offset_res.value() != kafka::offset{}) {
+            co_return kafka::offset_cast(offset_res.value());
+        }
+    }
+
+    if (!_archival_meta_stm) {
+        co_return model::offset{};
+    }
+
+    // There are a few cases in which the log_eviction_stm will return a kafka
+    // offset of `kafka::offset{}` for the start offset override.
+    // - The topic was remotely recovered.
+    // - A start offset override was never set.
+    // - The broker has restarted and the log_eviction_stm couldn't recover the
+    //   kafka offset for the start offset override.
+    //
+    // In all cases we'll need to fall back to the archival stm to figure out if
+    // a start offset override exists, and if so, what it is.
+    //
+    // For this we'll sync the archival stm a single time to ensure we have the
+    // most up-to-date manifest. From that point onwards the offset
+    // `_archival_meta_stm->manifest().get_start_kafka_offset_override()` will
+    // be correct without having to sync again. This is since the offset will
+    // not change until another offset override has been applied to the log
+    // eviction stm. And at that point the log eviction stm will be able to give
+    // us the correct offset override.
+    if (!_has_synced_archival_for_start_override) [[unlikely]] {
+        auto term = _raft->term();
+        if (!co_await _archival_meta_stm->sync(timeout)) {
+            if (term != _raft->term()) {
+                co_return errc::not_leader;
+            } else {
+                co_return errc::timeout;
+            }
+        }
+        _has_synced_archival_for_start_override = true;
+    }
+
+    auto start_kafka_offset
+      = _archival_meta_stm->manifest().get_start_kafka_offset_override();
+    co_return kafka::offset_cast(start_kafka_offset);
+}
+
+model::offset partition::last_stable_offset() const {
+    if (_rm_stm) {
+        return _rm_stm->last_stable_offset();
+    }
+
+    return high_watermark();
+}
+
+std::optional<model::offset> partition::eviction_requested_offset() {
+    if (_log_eviction_stm) {
+        return _log_eviction_stm->eviction_requested_offset();
+    } else {
+        return std::nullopt;
+    }
+}
+
+ss::shared_ptr<cluster::id_allocator_stm> partition::id_allocator_stm() const {
+    return _raft->stm_manager()->get<cluster::id_allocator_stm>();
 }
 
 std::ostream& operator<<(std::ostream& o, const partition& x) {
     return o << x._raft;
 }
+ss::shared_ptr<cluster::tm_stm> partition::tm_stm() {
+    return _raft->stm_manager()->get<cluster::tm_stm>();
+}
+
+ss::future<fragmented_vector<tx::tx_range>>
+partition::aborted_transactions(model::offset from, model::offset to) {
+    if (!_rm_stm) {
+        return ss::make_ready_future<fragmented_vector<tx::tx_range>>(
+          fragmented_vector<tx::tx_range>());
+    }
+    return _rm_stm->aborted_transactions(from, to);
+}
+
+model::producer_id partition::highest_producer_id() {
+    auto pid = _rm_stm ? _rm_stm->highest_producer_id() : model::producer_id{};
+    if (_archival_meta_stm) {
+        // It's possible this partition is a recovery partition, in which
+        // case the archival metadata may be higher than what's in the
+        // rm_stm.
+        return std::max(
+          pid, _archival_meta_stm->manifest().highest_producer_id());
+    }
+    return pid;
+}
+
+const ss::shared_ptr<cluster::archival_metadata_stm>&
+partition::archival_meta_stm() const {
+    return _archival_meta_stm;
+}
+
+std::optional<model::offset> partition::kafka_start_offset_override() const {
+    if (_log_eviction_stm && !is_read_replica_mode_enabled()) {
+        auto o = _log_eviction_stm->kafka_start_offset_override();
+        if (o != kafka::offset{}) {
+            return kafka::offset_cast(o);
+        }
+    }
+    if (_archival_meta_stm) {
+        auto o
+          = _archival_meta_stm->manifest().get_start_kafka_offset_override();
+        if (o != kafka::offset{}) {
+            return kafka::offset_cast(o);
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::reference_wrapper<cluster::topic_configuration>>
+partition::get_topic_config() {
+    if (_topic_cfg) {
+        return std::ref(*_topic_cfg);
+    } else {
+        return std::nullopt;
+    }
+}
+
+ss::sharded<features::feature_table>& partition::feature_table() const {
+    return _feature_table;
+}
+
+ss::shared_ptr<const cloud_storage::remote_partition>
+partition::remote_partition() const {
+    return _cloud_storage_partition;
+}
+
+ss::future<model::record_batch_reader> partition::make_reader(
+  storage::log_reader_config config,
+  std::optional<model::timeout_clock::time_point> debounce_deadline) {
+    return _raft->make_reader(std::move(config), debounce_deadline);
+}
+
+model::term_id partition::term() const { return _raft->term(); }
+
+bool partition::is_read_replica_mode_enabled() const {
+    const auto& cfg = _raft->log_config();
+    return cfg.is_read_replica_mode_enabled();
+}
+
+model::offset partition::raft_start_offset() const {
+    return _raft->start_offset();
+}
+
+model::offset partition::committed_offset() const {
+    return _raft->committed_offset();
+}
+model::offset partition::high_watermark() const {
+    return model::next_offset(_raft->last_visible_index());
+}
+model::offset partition::leader_high_watermark() const {
+    return model::next_offset(_raft->last_leader_visible_index());
+}
+model::offset partition::dirty_offset() const {
+    return _raft->log()->offsets().dirty_offset;
+}
+
+const model::ntp& partition::ntp() const { return _raft->ntp(); }
+
+ss::shared_ptr<storage::log> partition::log() const { return _raft->log(); }
+
+bool partition::is_elected_leader() const { return _raft->is_elected_leader(); }
+bool partition::is_leader() const { return _raft->is_leader(); }
+bool partition::has_followers() const { return _raft->has_followers(); }
+void partition::block_new_leadership() const {
+    return _raft->block_new_leadership();
+}
+void partition::unblock_new_leadership() const {
+    return _raft->unblock_new_leadership();
+}
+
+ss::future<result<model::offset>> partition::linearizable_barrier() {
+    return _raft->linearizable_barrier();
+}
+
+ss::future<std::error_code> partition::update_replica_set(
+  std::vector<raft::broker_revision> brokers,
+  model::revision_id new_revision_id) {
+    return _raft->replace_configuration(std::move(brokers), new_revision_id);
+}
+
+ss::future<std::error_code> partition::update_replica_set(
+  std::vector<raft::vnode> nodes,
+  model::revision_id new_revision_id,
+  std::optional<model::offset> learner_start_offset) {
+    return _raft->replace_configuration(
+      std::move(nodes), new_revision_id, learner_start_offset);
+}
+
+ss::future<std::error_code> partition::force_update_replica_set(
+  std::vector<raft::vnode> voters,
+  std::vector<raft::vnode> learners,
+  model::revision_id new_revision_id) {
+    return _raft->force_replace_configuration_locally(
+      std::move(voters), std::move(learners), new_revision_id);
+}
+
+raft::group_configuration partition::group_configuration() const {
+    return _raft->config();
+}
+
+model::revision_id partition::get_revision_id() const {
+    return _raft->config().revision_id();
+}
+model::revision_id partition::get_log_revision_id() const {
+    return _raft->log_config().get_revision();
+}
+
+model::revision_id partition::get_topic_revision_id() const {
+    return _raft->log_config().get_topic_revision();
+}
+
+std::optional<model::node_id> partition::get_leader_id() const {
+    return _raft->get_leader_id();
+}
+
+std::optional<uint8_t> partition::get_under_replicated() const {
+    return _raft->get_under_replicated();
+}
+
+model::offset partition::get_latest_configuration_offset() const {
+    return _raft->get_latest_configuration_offset();
+}
+
+ss::lw_shared_ptr<const storage::offset_translator_state>
+partition::get_offset_translator_state() const {
+    return _raft->log()->get_offset_translator_state();
+}
+
+size_t partition::size_bytes() const { return _raft->log()->size_bytes(); }
+size_t partition::reclaimable_size_bytes() const {
+    return _raft->log()->reclaimable_size_bytes();
+}
+
+const storage::ntp_config& partition::get_ntp_config() const {
+    return _raft->log_config();
+}
+model::term_id partition::get_term(model::offset o) const {
+    return _raft->get_term(o);
+}
+
+ss::future<std::error_code>
+partition::cancel_replica_set_update(model::revision_id rev) {
+    return _raft->cancel_configuration_change(rev);
+}
+
+ss::future<std::error_code>
+partition::force_abort_replica_set_update(model::revision_id rev) {
+    return _raft->abort_configuration_change(rev);
+}
+consensus_ptr partition::raft() const { return _raft; }
+
+ss::future<std::error_code> partition::set_writes_disabled(
+  partition_properties_stm::writes_disabled disable,
+  model::timeout_clock::time_point deadline) {
+    ssx::rwlock::holder holder;
+    auto lock_deadline = ss::semaphore::clock::now()
+                         + ss::semaphore::clock::duration(
+                           deadline - model::timeout_clock::now());
+    try {
+        holder = co_await _produce_lock.hold_write_lock(lock_deadline);
+    } catch (ss::semaphore_timed_out&) {
+        co_return errc::timeout;
+    }
+    if (!_feature_table.local().is_active(
+          features::feature::partition_properties_stm)) {
+        co_return errc::feature_disabled;
+    }
+    if (_partition_properties_stm == nullptr) {
+        co_return errc::invalid_partition_operation;
+    }
+    if (disable && _rm_stm) {
+        auto res = co_await _rm_stm->abort_all_txes();
+        if (res != tx::errc::none) {
+            co_return res;
+        }
+    }
+    auto method = disable ? &partition_properties_stm::disable_writes
+                          : &partition_properties_stm::enable_writes;
+    co_return co_await (*_partition_properties_stm.*method)();
+}
+
+ss::future<result<ssx::rwlock_unit>> partition::hold_writes_enabled() {
+    auto maybe_units = _produce_lock.attempt_read_lock();
+    if (!maybe_units) {
+        co_return errc::resource_is_being_migrated;
+    }
+
+    auto are_disabled
+      = _partition_properties_stm
+          ? co_await _partition_properties_stm->sync_writes_disabled()
+          : partition_properties_stm::writes_disabled::no;
+    if (!are_disabled.has_value()) {
+        co_return are_disabled.error();
+    }
+    if (are_disabled.value()) {
+        co_return errc::resource_is_being_migrated;
+    }
+
+    co_return *std::move(maybe_units);
+}
+
 } // namespace cluster
+
+namespace seastar {
+
+void lw_shared_ptr_deleter<cluster::partition>::dispose(cluster::partition* s) {
+    delete s;
+}
+
+} // namespace seastar

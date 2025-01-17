@@ -55,7 +55,7 @@ public:
                            .node_count()
                          == node_count;
               });
-        }).get0();
+        }).get();
     }
 
     void add_node(int id) {
@@ -94,9 +94,9 @@ public:
         auto md = node_application(source_node)
                     ->controller->get_topics_state()
                     .local()
-                    .get_topic_metadata(model::topic_namespace_view(ntp));
+                    .get_topic_metadata_ref(model::topic_namespace_view(ntp));
 
-        return md->get_assignments().begin()->replicas;
+        return md->get().get_assignments().begin()->second.replicas;
     }
 
     void create_topic(cluster::topic_configuration cfg) {
@@ -104,34 +104,9 @@ public:
                      ->controller->get_topics_frontend()
                      .local()
                      .autocreate_topics({std::move(cfg)}, 2s)
-                     .get0();
+                     .get();
         wait_for_metadata(
           node_application(0)->controller->get_topics_state().local(), res);
-    }
-
-    ss::future<foreign_batches_t> read_replica_batches(
-      model::broker_shard replica, model::ntp ntp, model::offset max_offset) {
-        auto& pm = get_partition_manager(replica.node_id);
-        return pm.invoke_on(
-          replica.shard,
-          [ntp = std::move(ntp), max_offset](cluster::partition_manager& pm) {
-              auto p = pm.get(ntp);
-              if (!p) {
-                  return ss::make_ready_future<foreign_batches_t>(
-                    ss::make_lw_shared<batches_t>({}));
-              }
-              storage::log_reader_config cfg(
-                model::offset(0), max_offset, ss::default_priority_class());
-
-              return p->make_reader(cfg).then([](model::record_batch_reader r) {
-                  return model::consume_reader_to_memory(
-                           std::move(r), model::no_timeout)
-                    .then([](batches_t batches) {
-                        return ss::make_foreign<batches_ptr_t>(
-                          ss::make_lw_shared<batches_t>(std::move(batches)));
-                    });
-              });
-          });
     }
 
     foreign_batches_t replicate_data(model::ntp ntp, int count) {
@@ -151,35 +126,36 @@ public:
                     });
               })
               .handle_exception([](std::exception_ptr) { return false; });
-        }).get0();
+        }).get();
 
         auto retries = 10;
         foreign_batches_t ret;
         auto single_retry = [count, ntp](cluster::partition_manager& pm) {
-            auto batches = model::test::make_random_batches(
-              model::offset(0), count);
-            auto rdr = model::make_memory_record_batch_reader(
-              std::move(batches));
-            // replicate
-            auto f = pm.get(ntp)->raft()->replicate(
-              std::move(rdr),
-              raft::replicate_options(raft::consistency_level::quorum_ack));
+            return model::test::make_random_batches(model::offset(0), count)
+              .then([&pm, ntp](auto batches) {
+                  // replicate
+                  auto f = pm.get(ntp)->raft()->replicate(
+                    chunked_vector<model::record_batch>(std::move(batches)),
+                    raft::replicate_options(
+                      raft::consistency_level::quorum_ack));
 
-            return ss::with_timeout(
-                     model::timeout_clock::now() + 2s, std::move(f))
-              .then([&pm, ntp](result<raft::replicate_result> res) {
-                  auto p = pm.get(ntp);
-                  return p->make_reader(storage::log_reader_config(
-                    model::offset(0),
-                    p->committed_offset(),
-                    ss::default_priority_class()));
-              })
-              .then([](model::record_batch_reader r) {
-                  return model::consume_reader_to_memory(
-                           std::move(r), model::no_timeout)
-                    .then([](batches_t batches) {
-                        return ss::make_foreign<batches_ptr_t>(
-                          ss::make_lw_shared<batches_t>(std::move(batches)));
+                  return ss::with_timeout(
+                           model::timeout_clock::now() + 2s, std::move(f))
+                    .then([&pm, ntp](result<raft::replicate_result> res) {
+                        auto p = pm.get(ntp);
+                        return p->make_reader(storage::log_reader_config(
+                          model::offset(0),
+                          p->committed_offset(),
+                          ss::default_priority_class()));
+                    })
+                    .then([](model::record_batch_reader r) {
+                        return model::consume_reader_to_memory(
+                                 std::move(r), model::no_timeout)
+                          .then([](batches_t batches) {
+                              return ss::make_foreign<batches_ptr_t>(
+                                ss::make_lw_shared<batches_t>(
+                                  std::move(batches)));
+                          });
                     });
               });
         };
@@ -190,13 +166,13 @@ public:
                 model::node_id leader_id;
                 leader_id = get_local_cache(model::node_id(0))
                               .get_leader(ntp, 1s + model::timeout_clock::now())
-                              .get0();
+                              .get();
 
                 auto shard = get_shard_table(leader_id).shard_for(ntp);
                 auto& pm = get_partition_manager(leader_id);
-                ret = pm.invoke_on(*shard, single_retry).get0();
+                ret = pm.invoke_on(*shard, single_retry).get();
             } catch (...) {
-                ss::sleep(1s).get0();
+                ss::sleep(1s).get();
                 continue;
             }
         }
@@ -205,9 +181,9 @@ public:
     }
 
     void populate_all_topics_with_data() {
-        auto md = get_local_cache(model::node_id(0)).all_topics_metadata();
+        auto& md = get_local_cache(model::node_id(0)).all_topics_metadata();
         for (auto& [tp_ns, topic_metadata] : md) {
-            for (auto& p : topic_metadata.get_assignments()) {
+            for (auto& [_, p] : topic_metadata.get_assignments()) {
                 model::ntp ntp(tp_ns.ns, tp_ns.tp, p.id);
                 replicate_data(ntp, 10);
             }

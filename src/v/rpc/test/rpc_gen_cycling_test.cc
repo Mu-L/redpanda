@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "bytes/random.h"
 #include "model/timeout_clock.h"
 #include "random/generators.h"
 #include "rpc/backoff_policy.h"
@@ -17,7 +18,6 @@
 #include "rpc/test/cycling_service.h"
 #include "rpc/test/echo_service.h"
 #include "rpc/test/echo_v2_service.h"
-#include "rpc/test/rpc_gen_types.h"
 #include "rpc/test/rpc_integration_fixture.h"
 #include "rpc/types.h"
 #include "test_utils/async.h"
@@ -46,12 +46,12 @@ struct movistar final : cycling::team_movistar_service_base<Codec> {
     movistar(ss::scheduling_group& sc, ss::smp_service_group& ssg)
       : cycling::team_movistar_service_base<Codec>(sc, ssg) {}
     ss::future<cycling::mount_tamalpais>
-    ibis_hakka(cycling::san_francisco&&, rpc::streaming_context&) final {
+    ibis_hakka(cycling::san_francisco, rpc::streaming_context&) final {
         return ss::make_ready_future<cycling::mount_tamalpais>(
           cycling::mount_tamalpais{66});
     }
     ss::future<cycling::nairo_quintana>
-    canyon(cycling::ultimate_cf_slx&&, rpc::streaming_context&) final {
+    canyon(cycling::ultimate_cf_slx, rpc::streaming_context&) final {
         return ss::make_ready_future<cycling::nairo_quintana>(
           cycling::nairo_quintana{32});
     }
@@ -62,31 +62,31 @@ struct echo_impl final : echo::echo_service_base<Codec> {
     echo_impl(ss::scheduling_group& sc, ss::smp_service_group& ssg)
       : echo::echo_service_base<Codec>(sc, ssg) {}
     ss::future<echo::echo_resp>
-    prefix_echo(echo::echo_req&& req, rpc::streaming_context&) final {
+    prefix_echo(echo::echo_req req, rpc::streaming_context&) final {
         return ss::make_ready_future<echo::echo_resp>(
           echo::echo_resp{.str = ssx::sformat("prefix_{}", req.str)});
     }
     ss::future<echo::echo_resp>
-    suffix_echo(echo::echo_req&& req, rpc::streaming_context&) final {
+    suffix_echo(echo::echo_req req, rpc::streaming_context&) final {
         return ss::make_ready_future<echo::echo_resp>(
           echo::echo_resp{.str = ssx::sformat("{}_suffix", req.str)});
     }
 
     ss::future<echo::sleep_resp>
-    sleep_for(echo::sleep_req&& req, rpc::streaming_context&) final {
+    sleep_for(echo::sleep_req req, rpc::streaming_context&) final {
         return ss::sleep(std::chrono::seconds(req.secs)).then([]() {
             return echo::sleep_resp{.str = "Zzz..."};
         });
     }
 
     ss::future<echo::cnt_resp>
-    counter(echo::cnt_req&& req, rpc::streaming_context&) final {
+    counter(echo::cnt_req req, rpc::streaming_context&) final {
         return ss::make_ready_future<echo::cnt_resp>(
           echo::cnt_resp{.expected = req.expected, .current = cnt++});
     }
 
     ss::future<echo::throw_resp>
-    throw_exception(echo::throw_req&& req, rpc::streaming_context&) final {
+    throw_exception(echo::throw_req req, rpc::streaming_context&) final {
         switch (req.type) {
         case echo::failure_type::exceptional_future:
             return ss::make_exception_future<echo::throw_resp>(
@@ -99,7 +99,7 @@ struct echo_impl final : echo::echo_service_base<Codec> {
     }
 
     ss::future<echo::echo_resp>
-    echo(echo::echo_req&& req, rpc::streaming_context&) final {
+    echo(echo::echo_req req, rpc::streaming_context&) final {
         return ss::make_ready_future<echo::echo_resp>(
           echo::echo_resp{.str = req.str});
     }
@@ -113,7 +113,7 @@ struct echo_v2_impl final : echo_v2::echo_service_base<Codec> {
       : echo_v2::echo_service_base<Codec>(sc, ssg) {}
 
     ss::future<echo_v2::echo_resp>
-    echo(echo_v2::echo_req&& req, rpc::streaming_context&) final {
+    echo(echo_v2::echo_req req, rpc::streaming_context&) final {
         return ss::make_ready_future<echo_v2::echo_resp>(
           echo_v2::echo_resp{.str = req.str, .str_two = req.str_two});
     }
@@ -133,6 +133,41 @@ public:
     static constexpr uint16_t redpanda_rpc_port = 32147;
 };
 
+struct certificate {
+    ss::sstring key;
+    ss::sstring crt;
+    ss::sstring ca;
+};
+
+namespace {
+ss::sstring root_path() {
+    // if this file exists, we are running in cmake
+    if (std::filesystem::exists("redpanda.key")) {
+        return "";
+    }
+
+    // otherwise we are running in bazel and we need
+    // the full path
+    return "src/v/rpc/test/";
+}
+
+certificate redpanda_cert() {
+    const auto root = root_path();
+    return {
+      .key = root + "redpanda.key",
+      .crt = root + "redpanda.crt",
+      .ca = root + "root_certificate_authority.crt"};
+}
+
+certificate redpanda_other_cert() {
+    const auto root = root_path();
+    return {
+      .key = root + "redpanda.other.key",
+      .crt = root + "redpanda.other.crt",
+      .ca = root + "root_certificate_authority.other.crt"};
+}
+} // namespace
+
 FIXTURE_TEST(echo_round_trip, rpc_integration_fixture) {
     configure_server();
     register_services();
@@ -148,6 +183,75 @@ FIXTURE_TEST(echo_round_trip, rpc_integration_fixture) {
     auto ret = f.get();
     BOOST_REQUIRE(ret.has_value());
     BOOST_REQUIRE_EQUAL(ret.value().data.str, payload);
+}
+
+FIXTURE_TEST(basic_cache_ops, rpc_integration_fixture) {
+    configure_server();
+    register_services();
+    start_server();
+
+    ss::sharded<ss::abort_source> as;
+    as.start().get();
+
+    const unsigned connections_per_node = 1;
+    ss::sharded<rpc::connection_cache> cc;
+    cc.start(std::ref(as), std::nullopt, connections_per_node).get();
+
+    auto deferred = ss::defer([&] {
+        cc.stop().get();
+        as.stop().get();
+    });
+
+    const auto ccfg = client_config();
+    cc.local()
+      .update_broker_client(
+        model::node_id(0),
+        model::node_id(1),
+        ccfg.server_addr,
+        config::tls_config())
+      .get();
+
+    absl::flat_hash_map<ss::shard_id, size_t> shards_with_con;
+    for (auto shard : ss::smp::all_cpus()) {
+        auto con_shard = cc.invoke_on(
+                             shard,
+                             [](auto& c) {
+                                 return *c.shard_for(
+                                   model::node_id(),
+                                   ss::shard_id(),
+                                   model::node_id(1));
+                             })
+                           .get();
+        shards_with_con[con_shard]++;
+    }
+    BOOST_REQUIRE_EQUAL(shards_with_con.size(), connections_per_node);
+
+    const auto payload = random_generators::gen_alphanum_string(100);
+    auto res
+      = cc.local()
+          .connection_cache::with_node_client<echo::echo_client_protocol>(
+            model::node_id(0),
+            ss::this_shard_id(),
+            model::node_id(1),
+            100ms,
+            [payload](echo::echo_client_protocol client) {
+                return client.echo(
+                  echo::echo_req{.str = payload},
+                  rpc::client_opts(rpc::clock_type::now() + 100ms));
+            });
+    auto ret = res.get();
+
+    BOOST_CHECK(ret.has_value());
+    BOOST_CHECK_EQUAL(ret.value().data.str, payload);
+
+    cc.local().remove_broker_client(model::node_id(0), model::node_id(1)).get();
+    for (auto& [shard, _] : shards_with_con) {
+        auto has_con
+          = cc.invoke_on(
+                shard, [](auto& c) { return c.contains(model::node_id(1)); })
+              .get();
+        BOOST_REQUIRE(!has_con);
+    }
 }
 
 FIXTURE_TEST(echo_from_cache, rpc_integration_fixture) {
@@ -166,7 +270,7 @@ FIXTURE_TEST(echo_from_cache, rpc_integration_fixture) {
     // Check that we can create connections from a cache, and moreover that we
     // can run several clients targeted at the same server, if we provide
     // multiple node IDs to the cache.
-    constexpr const size_t num_nodes_ids = 10;
+    constexpr const int num_nodes_ids = 10;
     const auto ccfg = client_config();
     for (int i = 0; i < num_nodes_ids; ++i) {
         const auto payload = random_generators::gen_alphanum_string(100);
@@ -230,13 +334,15 @@ FIXTURE_TEST(rpc_abort_from_cache, rpc_integration_fixture) {
 }
 
 FIXTURE_TEST(echo_round_trip_tls, rpc_integration_fixture) {
+    const auto cert = redpanda_cert();
     auto creds_builder = config::tls_config(
                            true,
-                           config::key_cert{"redpanda.key", "redpanda.crt"},
-                           "root_certificate_authority.chain_cert",
+                           config::key_cert{cert.key, cert.crt},
+                           cert.ca,
+                           std::nullopt, /* CRL */
                            false)
                            .get_credentials_builder()
-                           .get0();
+                           .get();
 
     configure_server(creds_builder);
     register_services();
@@ -259,7 +365,7 @@ class temporary_dir {
 public:
     temporary_dir()
       : _tmp_path("/tmp/rpc-test-XXXX") {
-        _dir = ss::make_tmp_dir(_tmp_path).get0();
+        _dir = ss::make_tmp_dir(_tmp_path).get();
     }
 
     temporary_dir(const temporary_dir&) = delete;
@@ -267,7 +373,7 @@ public:
     temporary_dir(temporary_dir&&) = delete;
     temporary_dir& operator=(temporary_dir&&) = delete;
 
-    ~temporary_dir() { _dir.remove().get0(); }
+    ~temporary_dir() { _dir.remove().get(); }
     /// Prefix file name with tmp path
     std::filesystem::path prefix(const char* name) const {
         auto res = _dir.get_path();
@@ -278,7 +384,7 @@ public:
     std::filesystem::path copy_file(const char* src, const char* dst) {
         auto res = prefix(dst);
         if (std::filesystem::exists(res)) {
-            ss::remove_file(res.native()).get0();
+            ss::remove_file(res.native()).get();
         }
         BOOST_REQUIRE(std::filesystem::copy_file(src, res));
         return res;
@@ -295,37 +401,40 @@ struct certificate_reload_ctx {
 };
 
 FIXTURE_TEST(rpcgen_reload_credentials_integration, rpc_integration_fixture) {
+    const certificate cert = redpanda_cert();
+    const certificate other_cert = redpanda_other_cert();
+
     // Server starts with bad credentials, files are updated on disk and then
     // client connects. Expected behavior is that client can connect without
     // issues. Condition variable is used to wait for credentials to reload.
     auto context = ss::make_lw_shared<certificate_reload_ctx>();
     temporary_dir tmp;
     // client credentials
-    auto client_key = tmp.copy_file("redpanda.key", "client.key");
-    auto client_crt = tmp.copy_file("redpanda.crt", "client.crt");
-    auto client_ca = tmp.copy_file(
-      "root_certificate_authority.chain_cert", "ca_client.pem");
+    auto client_key = tmp.copy_file(cert.key.c_str(), "client.key");
+    auto client_crt = tmp.copy_file(cert.crt.c_str(), "client.crt");
+    auto client_ca = tmp.copy_file(cert.ca.c_str(), "ca_client.pem");
     auto client_creds_builder = config::tls_config(
                                   true,
                                   config::key_cert{
                                     client_key.native(), client_crt.native()},
                                   client_ca.native(),
+                                  std::nullopt, /* CRL */
                                   true)
                                   .get_credentials_builder()
-                                  .get0();
+                                  .get();
     // server credentials
-    auto server_key = tmp.copy_file("redpanda.other.key", "server.key");
-    auto server_crt = tmp.copy_file("redpanda.other.crt", "server.crt");
-    auto server_ca = tmp.copy_file(
-      "root_certificate_authority.other.chain_cert", "ca_server.pem");
+    auto server_key = tmp.copy_file(other_cert.key.c_str(), "server.key");
+    auto server_crt = tmp.copy_file(other_cert.crt.c_str(), "server.crt");
+    auto server_ca = tmp.copy_file(other_cert.ca.c_str(), "ca_server.pem");
     auto server_creds_builder = config::tls_config(
                                   true,
                                   config::key_cert{
                                     server_key.native(), server_crt.native()},
                                   server_ca.native(),
+                                  std::nullopt, /* CRL */
                                   true)
                                   .get_credentials_builder()
-                                  .get0();
+                                  .get();
 
     configure_server(
       server_creds_builder,
@@ -358,9 +467,9 @@ FIXTURE_TEST(rpcgen_reload_credentials_integration, rpc_integration_fixture) {
 
     // fix client credentials and reconnect
     info("replacing files");
-    tmp.copy_file("redpanda.key", "server.key");
-    tmp.copy_file("redpanda.crt", "server.crt");
-    tmp.copy_file("root_certificate_authority.chain_cert", "ca_server.pem");
+    tmp.copy_file(cert.key.c_str(), "server.key");
+    tmp.copy_file(cert.crt.c_str(), "server.crt");
+    tmp.copy_file(cert.ca.c_str(), "ca_server.pem");
 
     context->cvar.wait([context] { return context->updated.size() == 3; })
       .get();
@@ -373,9 +482,9 @@ FIXTURE_TEST(rpcgen_reload_credentials_integration, rpc_integration_fixture) {
                    .ibis_hakka(
                      cycling::san_francisco{66},
                      rpc::client_opts(rpc::no_timeout))
-                   .get0();
+                   .get();
     BOOST_REQUIRE_EQUAL(okret.value().data.x, 66);
-    cli.stop().get0();
+    cli.stop().get();
 }
 
 FIXTURE_TEST(client_muxing, rpc_integration_fixture) {
@@ -393,14 +502,14 @@ FIXTURE_TEST(client_muxing, rpc_integration_fixture) {
                  .ibis_hakka(
                    cycling::san_francisco{66},
                    rpc::client_opts(rpc::no_timeout))
-                 .get0();
+                 .get();
     BOOST_REQUIRE(ret.has_value());
     info("Calling echo method");
     auto echo_resp = client
                        .suffix_echo(
                          echo::echo_req{.str = "testing..."},
                          rpc::client_opts(rpc::no_timeout))
-                       .get0();
+                       .get();
     client.stop().get();
     BOOST_REQUIRE(echo_resp.has_value());
 
@@ -419,7 +528,7 @@ FIXTURE_TEST(timeout_test, rpc_integration_fixture) {
       echo::sleep_req{.secs = 1},
       rpc::client_opts(rpc::clock_type::now() + 100ms));
     BOOST_REQUIRE_EQUAL(
-      echo_resp.get0().error(), rpc::errc::client_request_timeout);
+      echo_resp.get().error(), rpc::errc::client_request_timeout);
     client.stop().get();
 }
 
@@ -431,7 +540,7 @@ FIXTURE_TEST(timeout_test_cleanup_resources, rpc_integration_fixture) {
     auto client = rpc::make_client<echo::echo_client_protocol>(client_config());
     client.connect(model::no_timeout).get();
     using units_t = std::vector<ssx::semaphore_units>;
-    ::mutex lock;
+    ::mutex lock{"rpc_integration_fixture"};
     units_t units;
     units.push_back(std::move(lock.get_units().get()));
 
@@ -444,7 +553,7 @@ FIXTURE_TEST(timeout_test_cleanup_resources, rpc_integration_fixture) {
     auto echo_resp = client.sleep_for(
       echo::sleep_req{.secs = 10}, std::move(opts));
     BOOST_REQUIRE_EQUAL(
-      echo_resp.get0().error(), rpc::errc::client_request_timeout);
+      echo_resp.get().error(), rpc::errc::client_request_timeout);
     // Verify that the resources are released correctly after timeout.
     BOOST_REQUIRE(lock.try_get_units().has_value());
     client.stop().get();
@@ -466,7 +575,7 @@ FIXTURE_TEST(test_cleanup_on_timeout_before_sending, rpc_integration_fixture) {
     // case resource units must be returned before the request finishes.
     std::vector<ss::future<>> requests;
     for (size_t i = 0; i < num_reqs; ++i) {
-        auto lock = ss::make_lw_shared<::mutex>();
+        auto lock = ss::make_lw_shared<::mutex>("rpc_integration_fixture");
 
         auto units = lock->try_get_units();
         BOOST_REQUIRE(units);
@@ -502,7 +611,7 @@ FIXTURE_TEST(rpc_mixed_compression, rpc_integration_fixture) {
     auto echo_resp
       = client
           .echo(echo::echo_req{.str = data}, rpc::client_opts(rpc::no_timeout))
-          .get0();
+          .get();
     BOOST_REQUIRE_EQUAL(echo_resp.value().data.str, data);
     BOOST_TEST_MESSAGE("Calling echo method *WITH* compression");
     echo_resp = client
@@ -512,7 +621,7 @@ FIXTURE_TEST(rpc_mixed_compression, rpc_integration_fixture) {
                       rpc::timeout_spec::none,
                       rpc::compression_type::zstd,
                       0 /*min bytes compress*/))
-                  .get0();
+                  .get();
     BOOST_REQUIRE_EQUAL(echo_resp.value().data.str, data);
 
     // close resources
@@ -538,7 +647,7 @@ FIXTURE_TEST(ordering_test, rpc_integration_fixture) {
                 BOOST_REQUIRE_EQUAL(r.value().expected, i);
             }));
     }
-    ss::when_all_succeed(futures.begin(), futures.end()).get0();
+    ss::when_all_succeed(futures.begin(), futures.end()).get();
     client.stop().get();
 }
 
@@ -552,7 +661,7 @@ FIXTURE_TEST(server_exception_test, rpc_integration_fixture) {
                  .throw_exception(
                    {.type = echo::failure_type::exceptional_future},
                    rpc::client_opts(model::no_timeout))
-                 .get0();
+                 .get();
 
     BOOST_REQUIRE(ret.has_error());
     BOOST_REQUIRE_EQUAL(ret.error(), rpc::errc::service_error);
@@ -615,12 +724,9 @@ FIXTURE_TEST(missing_method_test, rpc_integration_fixture) {
 
         ss::when_all_succeed(requests.begin(), requests.end()).get();
     };
-    // If the server is configured to allow use of service_unavailable, while
-    // the server hasn't added all services, we should see a retriable error
-    // instead of method_not_found.
-    server().set_use_service_unavailable();
-    verify_bad_method_errors(rpc::errc::exponential_backoff);
-
+    // While the server hasn't added all services, we should see a retriable
+    // error instead of method_not_found.
+    verify_bad_method_errors(rpc::errc::service_unavailable);
     server().set_all_services_added();
     verify_bad_method_errors(rpc::errc::method_not_found);
 }
@@ -638,7 +744,7 @@ FIXTURE_TEST(corrupted_header_at_client_test, rpc_integration_fixture) {
                        .echo(
                          echo::echo_req{.str = "testing..."},
                          rpc::client_opts(rpc::no_timeout))
-                       .get0();
+                       .get();
     BOOST_REQUIRE_EQUAL(echo_resp.value().data.str, "testing...");
 
     // Send request but do not consume response
@@ -654,7 +760,7 @@ FIXTURE_TEST(corrupted_header_at_client_test, rpc_integration_fixture) {
         auto ret = t->send(
                       std::move(nb),
                       rpc::client_opts(rpc::clock_type::now() + 1s))
-                     .get0();
+                     .get();
         ret.value()->signal_body_parse();
     } catch (...) {
         err = std::current_exception();
@@ -664,13 +770,13 @@ FIXTURE_TEST(corrupted_header_at_client_test, rpc_integration_fixture) {
 
     // reconnect
     BOOST_TEST_MESSAGE("Another request with valid payload");
-    t->connect(model::no_timeout).get0();
+    t->connect(model::no_timeout).get();
     for (int i = 0; i < 10; ++i) {
         auto echo_resp_new = client
                                .echo(
                                  echo::echo_req{.str = "testing..."},
                                  rpc::client_opts(rpc::clock_type::now() + 1s))
-                               .get0();
+                               .get();
 
         BOOST_REQUIRE_EQUAL(echo_resp_new.value().data.str, "testing...");
     }
@@ -689,7 +795,7 @@ FIXTURE_TEST(corrupted_data_at_server, rpc_integration_fixture) {
                        .echo(
                          echo::echo_req{.str = "testing..."},
                          rpc::client_opts(rpc::no_timeout))
-                       .get0();
+                       .get();
     BOOST_REQUIRE_EQUAL(echo_resp.value().data.str, "testing...");
 
     rpc::netbuf nb;
@@ -697,22 +803,22 @@ FIXTURE_TEST(corrupted_data_at_server, rpc_integration_fixture) {
     nb.set_correlation_id(10);
     nb.set_service_method(echo::echo_service::echo_method);
     auto bytes = random_generators::get_bytes();
-    nb.buffer().append(bytes.c_str(), bytes.size());
+    nb.buffer().append(bytes.data(), bytes.size());
 
     BOOST_TEST_MESSAGE("Request with invalid payload");
     // will fail all the futures as server close the connection
     auto ret = t->send(
                   std::move(nb), rpc::client_opts(rpc::clock_type::now() + 2s))
-                 .get0();
+                 .get();
     // reconnect
     BOOST_TEST_MESSAGE("Another request with valid payload");
-    t->connect(model::no_timeout).get0();
+    t->connect(model::no_timeout).get();
     for (int i = 0; i < 10; ++i) {
         auto echo_resp_new = client
                                .echo(
                                  echo::echo_req{.str = "testing..."},
                                  rpc::client_opts(rpc::clock_type::now() + 2s))
-                               .get0();
+                               .get();
 
         BOOST_REQUIRE_EQUAL(echo_resp_new.value().data.str, "testing...");
     }

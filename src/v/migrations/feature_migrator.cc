@@ -9,13 +9,13 @@
 
 #include "feature_migrator.h"
 
+#include "base/vassert.h"
+#include "base/vlog.h"
 #include "cluster/controller.h"
 #include "cluster/feature_manager.h"
 #include "features/feature_table.h"
 #include "features/logger.h"
 #include "ssx/future-util.h"
-#include "vassert.h"
-#include "vlog.h"
 
 #include <seastar/core/sleep.hh>
 
@@ -35,15 +35,6 @@ ss::future<> feature_migrator::stop() {
 
 void feature_migrator::start(ss::abort_source& as) {
     _as = as;
-    features::feature_table& ft = _controller.get_feature_table().local();
-    if (ft.is_active(get_feature())) {
-        vlog(
-          featureslog.trace,
-          "Feature {} already active, no migration required.",
-          get_feature());
-        return;
-    }
-
     ssx::spawn_with_gate(_gate, [this]() { return do_migrate(); });
 }
 

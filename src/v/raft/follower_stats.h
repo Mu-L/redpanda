@@ -11,11 +11,8 @@
 
 #pragma once
 
-#include "model/fundamental.h"
-#include "model/metadata.h"
-#include "raft/follower_queue.h"
+#include "base/vassert.h"
 #include "raft/types.h"
-#include "vassert.h"
 
 #include <absl/container/node_hash_map.h>
 
@@ -26,10 +23,10 @@ public:
     using container_t = absl::node_hash_map<vnode, follower_index_metadata>;
     using iterator = container_t::iterator;
     using const_iterator = container_t::const_iterator;
+    using value_type = container_t::value_type;
 
-    explicit follower_stats(vnode self, uint32_t max_concurrent_append_entries)
-      : _self(self)
-      , _max_concurrent_append_entries(max_concurrent_append_entries) {}
+    explicit follower_stats(vnode self)
+      : _self(self) {}
 
     const follower_index_metadata& get(vnode n) const {
         auto it = _followers.find(n);
@@ -71,8 +68,6 @@ public:
 
     size_t size() const { return _followers.size(); }
 
-    ss::future<ssx::semaphore_units> get_append_entries_unit(vnode);
-
     void return_append_entries_units(vnode);
 
     void update_with_configuration(const group_configuration&);
@@ -86,9 +81,7 @@ public:
 private:
     friend std::ostream& operator<<(std::ostream&, const follower_stats&);
     vnode _self;
-    uint32_t _max_concurrent_append_entries;
     container_t _followers;
-    absl::node_hash_map<vnode, follower_queue> _queues;
 };
 
 } // namespace raft

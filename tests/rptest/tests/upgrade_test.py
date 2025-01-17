@@ -12,7 +12,7 @@ import time
 from collections import defaultdict
 from packaging.version import Version
 
-from ducktape.mark import parametrize
+from ducktape.mark import parametrize, matrix
 from ducktape.utils.util import wait_until
 from rptest.services.admin import Admin
 from rptest.clients.rpk import RpkTool
@@ -27,10 +27,10 @@ from rptest.util import (
     produce_until_segments,
     wait_until_segments,
 )
+from rptest.utils.mode_checks import skip_fips_mode
 from rptest.utils.si_utils import BucketView
-from rptest.utils.mode_checks import skip_azure_blob_storage
 from rptest.services.cluster import cluster
-from rptest.services.redpanda import SISettings
+from rptest.services.redpanda import SISettings, CloudStorageType, get_cloud_storage_type
 from rptest.services.kgo_verifier_services import (
     KgoVerifierProducer,
     KgoVerifierSeqConsumer,
@@ -220,13 +220,16 @@ class UpgradeBackToBackTest(PreallocNodesTest):
         # Is our producer/consumer currently stopped (having already been started)?
         paused = False
 
-        wrote_at_least = None
+        wrote_at_least = 0
 
         for current_version in self.upgrade_through_versions(self.versions):
             if not started:
                 # First version, start up the workload
                 self._producer.start(clean=False)
                 self._producer.wait_for_offset_map()
+                self._producer.wait_for_acks(100,
+                                             timeout_sec=10,
+                                             backoff_sec=2)
                 wrote_at_least = self._producer.produce_status.acked
                 for consumer in self._consumers:
                     consumer.start(clean=False)
@@ -241,12 +244,19 @@ class UpgradeBackToBackTest(PreallocNodesTest):
             elif current_version[0:2] == (22, 1) and paused:
                 self._producer.start(clean=False)
 
-        for consumer in self._consumers:
-            consumer.wait()
+            # Wait for consumers to finish work and check invariants.
+            for consumer in self._consumers:
+                consumer.wait()
 
-        assert self._seq_consumer.consumer_status.validator.valid_reads >= wrote_at_least
-        assert self._rand_consumer.consumer_status.validator.total_reads >= self.RANDOM_READ_COUNT * self.RANDOM_READ_PARALLEL
-        assert self._cg_consumer.consumer_status.validator.valid_reads >= wrote_at_least
+            # Check consumer invariants after each upgrade.
+            assert self._seq_consumer.consumer_status.validator.valid_reads >= wrote_at_least
+            assert self._rand_consumer.consumer_status.validator.total_reads >= self.RANDOM_READ_COUNT * self.RANDOM_READ_PARALLEL
+            assert self._cg_consumer.consumer_status.validator.valid_reads >= wrote_at_least
+
+            # Restart the consumers for the next upgrade.
+            for consumer in self._consumers:
+                consumer.stop()
+                consumer.start(clean=False)
 
         # Validate that the data structures written by a mixture of historical
         # versions remain readable by our current debug tools
@@ -256,6 +266,11 @@ class UpgradeBackToBackTest(PreallocNodesTest):
             self.logger.info(
                 f"Read {len(controller_records)} controller records from node {node.name} successfully"
             )
+            if log_viewer.has_controller_snapshot(node):
+                controller_snapshot = log_viewer.read_controller_snapshot(
+                    node=node)
+                self.logger.info(
+                    f"Read controller snapshot: {controller_snapshot}")
 
 
 class UpgradeWithWorkloadTest(EndToEndTest):
@@ -379,9 +394,12 @@ class UpgradeFromPriorFeatureVersionCloudStorageTest(RedpandaTest):
         self.installer.install(self.redpanda.nodes, self.prev_version)
         super().setUp()
 
+    # before v24.2, dns query to s3 endpoint do not include the bucketname, which is required for AWS S3 fips endpoints
+    @skip_fips_mode
     @cluster(num_nodes=4, log_allow_list=RESTART_LOG_ALLOW_LIST)
-    @skip_azure_blob_storage
-    def test_rolling_upgrade(self):
+    @matrix(cloud_storage_type=get_cloud_storage_type(
+        applies_only_on=[CloudStorageType.S3]))
+    def test_rolling_upgrade(self, cloud_storage_type):
         """
         Verify that when tiered storage writes happen during a rolling upgrade,
         we continue to write remote content that old versions can read, until
@@ -469,7 +487,7 @@ class UpgradeFromPriorFeatureVersionCloudStorageTest(RedpandaTest):
         # Verify all data readable
         verify()
 
-        # Pick some arbitrary partition to write data to via a new-verison node
+        # Pick some arbitrary partition to write data to via a new-version node
         newdata_p = 0
 
         # There might not be any partitions with leadership on new version
@@ -503,7 +521,9 @@ class UpgradeFromPriorFeatureVersionCloudStorageTest(RedpandaTest):
                 'cloud_storage_manifest_max_upload_interval_sec':
                 1,
                 'cloud_storage_spillover_manifest_max_segments':
-                2
+                2,
+                'cloud_storage_spillover_manifest_size':
+                None,
             },
                                        node=new_version_node)
 
@@ -533,6 +553,11 @@ class UpgradeFromPriorFeatureVersionCloudStorageTest(RedpandaTest):
                 target_bytes=local_retention_bytes + segment_bytes,
                 timeout_sec=60)
 
+        # capture the cloud storage state to run a progress check later
+        bucket_view = BucketView(self.redpanda)
+        manifest_mid_upgrade = bucket_view.manifest_for_ntp(
+            topic=topic, partition=newdata_p)
+
         # Move leadership to the old version node and check the partition is readable
         # from there.
         admin.transfer_leadership_to(namespace="kafka",
@@ -544,10 +569,6 @@ class UpgradeFromPriorFeatureVersionCloudStorageTest(RedpandaTest):
 
         # Verify all data readable
         verify()
-
-        bucket_view = BucketView(self.redpanda)
-        manifest_mid_upgrade = bucket_view.manifest_for_ntp(
-            topic=topic, partition=newdata_p)
 
         # Finish the upgrade
         self.redpanda.rolling_restart_nodes([self.redpanda.nodes[-1]],

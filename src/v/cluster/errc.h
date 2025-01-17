@@ -68,7 +68,40 @@ enum class errc : int16_t {
     no_partition_assignments,
     failed_to_create_partition,
     partition_operation_failed,
+    transform_does_not_exist,
+    transform_invalid_update,
+    transform_invalid_create,
+    transform_invalid_source,
+    transform_invalid_environment,
+    trackable_keys_limit_exceeded,
+    topic_disabled,
+    partition_disabled,
+    invalid_partition_operation,
+    concurrent_modification_error,
+    transform_count_limit_exceeded,
+    role_exists,
+    role_does_not_exist,
+    inconsistent_stm_update,
+    waiting_for_shard_placement_update,
+    topic_invalid_partitions_core_limit,
+    topic_invalid_partitions_memory_limit,
+    topic_invalid_partitions_fd_limit,
+    topic_invalid_partitions_decreased,
+    producer_ids_vcluster_limit_exceeded,
+    validation_of_recovery_topic_failed,
+    replica_does_not_exist,
+    invalid_data_migration_state,
+    data_migration_not_exists,
+    data_migration_already_exists,
+    data_migration_invalid_resources,
+    data_migration_invalid_definition,
+    data_migrations_disabled,
+    resource_is_being_migrated,
+    invalid_target_node_id,
 };
+
+std::ostream& operator<<(std::ostream& o, errc err);
+
 struct errc_category final : public std::error_category {
     const char* name() const noexcept final { return "cluster::errc"; }
 
@@ -85,7 +118,7 @@ struct errc_category final : public std::error_category {
         case errc::topic_invalid_replication_factor:
             return "Unable to allocate topic with given replication factor";
         case errc::topic_invalid_config:
-            return "Topic configuration is either bogus or not supported";
+            return "Configuration is invalid";
         case errc::not_leader_controller:
             return "This node is not raft-0 leader. i.e is not leader "
                    "controller";
@@ -120,7 +153,7 @@ struct errc_category final : public std::error_category {
         case errc::waiting_for_recovery:
             return "Waiting for partition to recover";
         case errc::waiting_for_reconfiguration_finish:
-            return "Waiting for partition recovery to be finished";
+            return "Waiting for partition reconfiguration to be finished";
         case errc::update_in_progress:
             return "Partition configuration update in progress";
         case errc::user_exists:
@@ -143,7 +176,7 @@ struct errc_category final : public std::error_category {
             return "Unable to perform requested topic operation ";
         case errc::no_eligible_allocation_nodes:
             return "No nodes are available to perform allocation after hard "
-                   "constrains were solved";
+                   "constraints were solved";
         case errc::allocation_error:
             return "Exception was thrown when allocating partitions ";
         case errc::partition_configuration_revision_not_updated:
@@ -195,6 +228,68 @@ struct errc_category final : public std::error_category {
         case errc::partition_operation_failed:
             return "Generic failure occurred during partition operation "
                    "execution";
+        case errc::transform_does_not_exist:
+            return "Transform does not exist";
+        case errc::transform_invalid_update:
+            return "Invalid update to transform, topic configuration "
+                   "cannot change";
+        case errc::transform_invalid_source:
+            return "Invalid transform source";
+        case errc::transform_invalid_create:
+            return "Invalid create transform configuration";
+        case errc::transform_invalid_environment:
+            return "Invalid transform environment";
+        case errc::trackable_keys_limit_exceeded:
+            return "Too many keys are currently tracked, no space for more";
+        case errc::topic_disabled:
+            return "Topic disabled by user";
+        case errc::partition_disabled:
+            return "Partition disabled by user";
+        case errc::invalid_partition_operation:
+            return "Invalid partition operation";
+        case errc::concurrent_modification_error:
+            return "Concurrent modification error";
+        case errc::transform_count_limit_exceeded:
+            return "Too many transforms deployed";
+        case errc::role_exists:
+            return "Role already exists";
+        case errc::role_does_not_exist:
+            return "Role does not exist";
+        case errc::inconsistent_stm_update:
+            return "STM command can't be applied";
+        case errc::waiting_for_shard_placement_update:
+            return "Waiting for shard placement table update to finish";
+        case errc::topic_invalid_partitions_core_limit:
+            return "Can not increase partition count due to core limit";
+        case errc::topic_invalid_partitions_memory_limit:
+            return "Can not increase partition count due to memory limit";
+        case errc::topic_invalid_partitions_fd_limit:
+            return "Can not increase partition count due to FD limit";
+        case errc::topic_invalid_partitions_decreased:
+            return "Can not decrease the number of partitions";
+        case errc::producer_ids_vcluster_limit_exceeded:
+            return "To many vclusters registered in producer state cache";
+        case errc::validation_of_recovery_topic_failed:
+            return "Validation of recovery topic failed";
+        case errc::replica_does_not_exist:
+            return "Partition replica does not exist";
+        case errc::invalid_data_migration_state:
+            return "Invalid data migration state transition requested";
+        case errc::data_migration_not_exists:
+            return "Requested data migration does not exist";
+        case errc::data_migration_already_exists:
+            return "Data migration with requested id already exists";
+        case errc::data_migration_invalid_resources:
+            return "Data migration contains resources that are not eligible";
+        case errc::data_migration_invalid_definition:
+            return "Data migration definition contains errors";
+        case errc::data_migrations_disabled:
+            return "Data migrations are disabled for this cluster";
+        case errc::resource_is_being_migrated:
+            return "Requested operation can not be executed as the resource is "
+                   "undergoing data migration";
+        case errc::invalid_target_node_id:
+            return "Request was intended for the node with different node id";
         }
         return "cluster::errc::unknown";
     }

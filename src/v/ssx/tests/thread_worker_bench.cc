@@ -7,14 +7,14 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "seastarx.h"
+#include "base/seastarx.h"
 #include "ssx/thread_worker.h"
 
 #include <seastar/testing/perf_tests.hh>
 
 ss::future<> run_test(size_t data_size) {
-    auto w = ssx::thread_worker{};
-    co_await w.start();
+    auto w = ssx::singleton_thread_worker{};
+    co_await w.start({});
 
     std::vector<ss::future<size_t>> vec;
     vec.reserve(data_size);

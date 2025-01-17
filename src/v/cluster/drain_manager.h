@@ -9,10 +9,10 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "base/seastarx.h"
 #include "cluster/fwd.h"
 #include "reflection/adl.h"
-#include "seastarx.h"
-#include "serde/serde.h"
+#include "serde/envelope.h"
 #include "ssx/semaphore.h"
 
 #include <seastar/core/abort_source.hh>
@@ -72,15 +72,11 @@ public:
 
     /*
      * Start draining this broker.
-     *
-     * Invoke this on each core.
      */
     ss::future<> drain();
 
     /*
      * Restore broker to a non-drain[ing] state.
-     *
-     * Invoke this on each core.
      */
     ss::future<> restore();
 
@@ -98,7 +94,9 @@ private:
 
     ss::sharded<cluster::partition_manager>& _partition_manager;
     std::optional<ss::future<>> _drain;
-    bool _draining{false};
+    bool _draining_requested{false};
+    bool _restore_requested{false};
+    bool _drained{false};
     ssx::semaphore _sem{0, "c/drain-mgr"};
     drain_status _status;
     ss::abort_source _abort;

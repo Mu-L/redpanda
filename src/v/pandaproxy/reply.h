@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "base/seastarx.h"
 #include "kafka/client/exceptions.h"
 #include "kafka/protocol/exceptions.h"
 #include "pandaproxy/error.h"
@@ -20,7 +21,6 @@
 #include "pandaproxy/logger.h"
 #include "pandaproxy/parsing/exceptions.h"
 #include "pandaproxy/schema_registry/exceptions.h"
-#include "seastarx.h"
 
 #include <seastar/core/gate.hh>
 #include <seastar/core/sstring.hh>
@@ -60,6 +60,15 @@ inline ss::http::reply& set_reply_unavailable(ss::http::reply& rep) {
       .add_header("Retry-After", "0");
 }
 
+inline ss::http::reply& set_reply_too_many_requests(ss::http::reply& rep) {
+    return rep.set_status(ss::http::reply::status_type::too_many_requests)
+      .add_header("Retry-After", "0");
+}
+
+inline ss::http::reply& set_reply_payload_too_large(ss::http::reply& rep) {
+    return rep.set_status(ss::http::reply::status_type::payload_too_large);
+}
+
 inline std::unique_ptr<ss::http::reply> reply_unavailable() {
     auto rep = std::make_unique<ss::http::reply>(ss::http::reply{});
     set_reply_unavailable(*rep);
@@ -71,8 +80,7 @@ errored_body(std::error_condition ec, ss::sstring msg) {
     pandaproxy::json::error_body body{.ec = ec, .message = std::move(msg)};
     auto rep = std::make_unique<ss::http::reply>();
     rep->set_status(error_code_to_status(ec));
-    auto b = json::rjson_serialize(body);
-    rep->write_body("json", b);
+    rep->write_body("json", json::rjson_serialize(body));
     return rep;
 }
 

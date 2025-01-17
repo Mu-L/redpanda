@@ -12,6 +12,7 @@
 #include "config/base_property.h"
 #include "config/property.h"
 
+#include <cstdlib>
 #include <optional>
 
 namespace config {
@@ -83,6 +84,10 @@ concept bounds = requires(T bounds, const typename T::underlying_t& value) {
     { bounds.validate(value) } -> std::same_as<std::optional<ss::sstring>>;
     { bounds.clamp(value) } -> std::same_as<typename T::underlying_t>;
 };
+
+inline bool bounds_checking_disabled() {
+    return std::getenv("__REDPANDA_TEST_DISABLE_BOUNDED_PROPERTY_CHECKS");
+}
 
 } // namespace detail
 
@@ -191,33 +196,39 @@ public:
       B<I> bounds,
       std::optional<legacy_default<T>> legacy = std::nullopt)
       : property<T>(
-        conf,
-        name,
-        desc,
-        meta,
-        def,
-        [this](T new_value) -> std::optional<ss::sstring> {
-            // Extract inner value if we are an optional<>,
-            // and pass through into numeric_bounds::validate
-            using outer_type = std::decay_t<T>;
-            if constexpr (reflection::is_std_optional<outer_type>) {
-                if (new_value.has_value()) {
-                    return _bounds.validate(new_value.value());
-                } else {
-                    // nullopt is always valid
-                    return std::nullopt;
-                }
-            } else {
-                return _bounds.validate(new_value);
-            }
-        },
-        legacy)
+          conf,
+          name,
+          desc,
+          meta,
+          def,
+          [this](T new_value) -> std::optional<ss::sstring> {
+              if (detail::bounds_checking_disabled()) {
+                  return std::nullopt;
+              }
+              // Extract inner value if we are an optional<>,
+              // and pass through into numeric_bounds::validate
+              using outer_type = std::decay_t<T>;
+              if constexpr (reflection::is_std_optional<outer_type>) {
+                  if (new_value.has_value()) {
+                      return _bounds.validate(new_value.value());
+                  } else {
+                      // nullopt is always valid
+                      return std::nullopt;
+                  }
+              } else {
+                  return _bounds.validate(new_value);
+              }
+          },
+          legacy)
       , _bounds(bounds)
       , _example(generate_example()) {}
+
+    using property<T>::set_value;
 
     void set_value(std::any v) override {
         property<T>::update_value(std::any_cast<T>(std::move(v)));
     }
+
     bool set_value(YAML::Node n) override {
         auto val = std::move(n.as<T>());
         return clamp_and_update(val);
@@ -232,6 +243,13 @@ public:
     }
 
 private:
+    I clamp_with_bounds(I val) {
+        if (detail::bounds_checking_disabled()) {
+            return val;
+        }
+        return _bounds.clamp(val);
+    }
+
     bool clamp_and_update(T val) {
         using outer_type = std::decay_t<T>;
 
@@ -245,13 +263,13 @@ private:
         if constexpr (reflection::is_std_optional<outer_type>) {
             if (val.has_value()) {
                 return property<T>::update_value(
-                  std::move(_bounds.clamp(val.value())));
+                  std::move(clamp_with_bounds(val.value())));
             } else {
                 // nullopt is always valid, never clamped.  Pass it through.
                 return property<T>::update_value(std::move(val));
             }
         } else {
-            return property<T>::update_value(std::move(_bounds.clamp(val)));
+            return property<T>::update_value(std::move(clamp_with_bounds(val)));
         }
     }
 

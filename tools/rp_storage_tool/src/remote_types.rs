@@ -1,6 +1,7 @@
 use crate::error::BucketReaderError;
 use crate::fundamental::{
-    raw_to_kafka, DeltaOffset, KafkaOffset, RaftTerm, RawOffset, Timestamp, NTP, NTPR, NTR,
+    raw_to_kafka, DeltaOffset, KafkaOffset, LabeledNTPR, RaftTerm, RawOffset, Timestamp, NTP, NTPR,
+    NTR,
 };
 use deltafor::envelope::{SerdeEnvelope, SerdeEnvelopeContext};
 use deltafor::{DeltaAlg, DeltaDelta, DeltaFORDecoder, DeltaXor};
@@ -12,6 +13,30 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use xxhash_rust::xxh32::xxh32;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemoteLabel {
+    pub cluster_uuid: String,
+}
+
+impl RemoteLabel {
+    pub fn from_string(s_opt: &Option<String>) -> Option<RemoteLabel> {
+        s_opt.as_ref().map(|s| RemoteLabel {
+            cluster_uuid: s.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClusterMetadataManifest {
+    pub version: u32,
+    pub compat_version: u32,
+    pub upload_time_since_epoch: i64,
+    pub cluster_uuid: String,
+    pub metadata_id: i64,
+    pub controller_snapshot_offset: i64,
+    pub controller_snapshot_path: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PartitionManifestSegment {
@@ -36,6 +61,84 @@ pub struct PartitionManifestSegment {
 
     // Since v22.3.x, only set if sname_format==segment_name_format::v2
     pub delta_offset_end: Option<DeltaOffset>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(into = "PartitionManifestSegment")]
+pub struct SpilloverManifestMeta {
+    size_bytes: i64,
+    start_offset: RawOffset,
+    last_offset: RawOffset,
+    start_timestamp: Timestamp,
+    last_timestamp: Timestamp,
+    delta_offset: DeltaOffset,
+    delta_offset_end: DeltaOffset,
+    ntp_revision: u64,
+    start_term: RaftTerm,
+    last_term: RaftTerm,
+}
+
+impl From<SpilloverManifestMeta> for PartitionManifestSegment {
+    fn from(spill: SpilloverManifestMeta) -> Self {
+        PartitionManifestSegment {
+            base_offset: spill.start_offset,
+            committed_offset: spill.last_offset,
+            is_compacted: false,
+            size_bytes: spill.size_bytes,
+            archiver_term: spill.start_term,
+            delta_offset: Some(spill.delta_offset),
+            base_timestamp: Some(spill.start_timestamp),
+            max_timestamp: Some(spill.last_timestamp),
+            ntp_revision: Some(spill.ntp_revision),
+            sname_format: Some(3),
+            segment_term: Some(spill.last_term),
+            delta_offset_end: Some(spill.delta_offset_end),
+        }
+    }
+}
+
+impl TryFrom<PartitionManifestSegment> for SpilloverManifestMeta {
+    type Error = BucketReaderError;
+
+    fn try_from(seg: PartitionManifestSegment) -> Result<Self, Self::Error> {
+        let sname_format = seg.sname_format.ok_or(Self::Error::SyntaxError(format!(
+            "sname_format not present in {seg:?}"
+        )))?;
+
+        // Spillover manifests encoded in segment meta should be segment_name_format::v3
+        if sname_format != 3 {
+            return Err(Self::Error::SyntaxError(format!(
+                "expected segment_name_format::v3 in {seg:?}"
+            )));
+        }
+
+        Ok(SpilloverManifestMeta {
+            size_bytes: seg.size_bytes,
+            start_offset: seg.base_offset,
+            last_offset: seg.committed_offset,
+            start_timestamp: seg.base_timestamp.ok_or(Self::Error::SyntaxError(format!(
+                "base_timestamp not present in {seg:?}"
+            )))?,
+            last_timestamp: seg.max_timestamp.ok_or(Self::Error::SyntaxError(format!(
+                "base_timestamp not present in {seg:?}"
+            )))?,
+            delta_offset: seg.delta_offset.ok_or(Self::Error::SyntaxError(format!(
+                "delta_offset not present in {seg:?}"
+            )))?,
+            delta_offset_end: seg
+                .delta_offset_end
+                .ok_or(Self::Error::SyntaxError(format!(
+                    "delta_offset_end not present in {seg:?}"
+                )))?,
+            ntp_revision: seg.ntp_revision.ok_or(Self::Error::SyntaxError(format!(
+                "ntp_revision not present in {seg:?}"
+            )))?,
+            start_term: seg.archiver_term,
+            last_term: seg.segment_term.ok_or(Self::Error::SyntaxError(format!(
+                "segment term not present in {seg:?}"
+            )))?,
+        })
+    }
 }
 
 struct ColumnReader<A: DeltaAlg + 'static> {
@@ -358,6 +461,10 @@ pub struct PartitionManifest {
     pub start_kafka_offset: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archive_size_bytes: Option<u64>, // << Since v23.2.x
+
+    #[serde(default)] // If missing, deserialize as an empty Vec
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub spillover: Vec<SpilloverManifestMeta>,
 }
 
 impl PartitionManifest {
@@ -625,6 +732,7 @@ impl PartitionManifest {
             archive_clean_offset: Some(i64::MIN),
             start_kafka_offset: None,
             archive_size_bytes: Some(0),
+            spillover: Vec::new(),
         }
     }
 
@@ -716,6 +824,21 @@ impl PartitionManifest {
             None
         };
 
+        let spillover = if (reader.position() as u32) < envelope.size {
+            let spills_deserialized = read_iobuf(&mut reader)?;
+            let mut spills_as_segments = decode_colstore(spills_deserialized)?;
+
+            let mut spills: Vec<SpilloverManifestMeta> = spills_as_segments
+                .into_values()
+                .map(|seg| SpilloverManifestMeta::try_from(seg))
+                .collect::<Result<Vec<_>, _>>()?;
+            spills.sort_by(|lhs, rhs| lhs.start_offset.cmp(&rhs.start_offset));
+
+            spills
+        } else {
+            Vec::new()
+        };
+
         Ok(PartitionManifest {
             version: envelope.version as u32,
             namespace,
@@ -734,6 +857,7 @@ impl PartitionManifest {
             archive_clean_offset: Some(archive_clean_offset),
             start_kafka_offset: Some(start_kafka_offset),
             archive_size_bytes: archive_size_bytes,
+            spillover: spillover,
         })
 
         // TODO: respect envelope + skip any unread bytes
@@ -747,21 +871,28 @@ impl PartitionManifest {
         }
     }
 
-    pub fn manifest_key(ntpr: &NTPR, extension: &str) -> String {
+    pub fn manifest_key(ntpr: &LabeledNTPR, extension: &str) -> String {
         let path = format!(
             "{}/{}/{}_{}",
-            ntpr.ntp.namespace, ntpr.ntp.topic, ntpr.ntp.partition_id, ntpr.revision_id
+            ntpr.ntpr.ntp.namespace,
+            ntpr.ntpr.ntp.topic,
+            ntpr.ntpr.ntp.partition_id,
+            ntpr.ntpr.revision_id
         );
         let bitmask = 0xf0000000;
         let hash = xxh32(path.as_bytes(), 0);
-        format!(
-            "{:08x}/meta/{}/manifest.{}",
-            hash & bitmask,
-            path,
-            extension
-        )
+        let prefix = if let Some(label) = &ntpr.label {
+            label.clone()
+        } else {
+            format!("{:08x}/meta", hash & bitmask)
+        };
+        format!("{}/meta/{}/manifest.{}", prefix, path, extension)
     }
-    pub fn segment_key(&self, segment: &PartitionManifestSegment) -> Option<String> {
+    pub fn segment_key(
+        &self,
+        segment: &PartitionManifestSegment,
+        label: &Option<RemoteLabel>,
+    ) -> Option<String> {
         let sname_format = match segment.sname_format {
             None => SegmentNameFormat::V1,
             Some(1) => SegmentNameFormat::V1,
@@ -806,6 +937,12 @@ impl PartitionManifest {
             "{}/{}/{}_{}/{}",
             self.namespace, self.topic, self.partition, self.revision, name
         );
+        if let Some(remote_label) = label {
+            return Some(format!(
+                "{}/{}.{}",
+                remote_label.cluster_uuid, path, segment.archiver_term
+            ));
+        }
 
         let hash = xxh32(path.as_bytes(), 0);
 
@@ -827,16 +964,24 @@ pub struct ArchivePartitionManifest {
 }
 
 impl ArchivePartitionManifest {
-    pub fn key(&self, ntpr: &NTPR) -> String {
+    pub fn key(&self, ntpr: &LabeledNTPR) -> String {
         let path = format!(
             "{}/{}/{}_{}",
-            ntpr.ntp.namespace, ntpr.ntp.topic, ntpr.ntp.partition_id, ntpr.revision_id
+            ntpr.ntpr.ntp.namespace,
+            ntpr.ntpr.ntp.topic,
+            ntpr.ntpr.ntp.partition_id,
+            ntpr.ntpr.revision_id
         );
         let bitmask = 0xf0000000;
         let hash = xxh32(path.as_bytes(), 0);
+        let prefix = if let Some(label) = &ntpr.label {
+            label.clone()
+        } else {
+            format!("{:08x}/meta", hash & bitmask)
+        };
         format!(
-            "{:08x}/meta/{}/manifest.json_{}_{}_{}_{}_{}_{}",
-            hash & bitmask,
+            "{}/{}/manifest.json_{}_{}_{}_{}_{}_{}",
+            prefix,
             path,
             self.base_offset,
             self.committed_offset,
@@ -974,6 +1119,10 @@ mod tests {
     }
 
     async fn read_manifest(path: &str) -> PartitionManifest {
+        read_json(path).await
+    }
+
+    async fn read_cluster_manifest(path: &str) -> ClusterMetadataManifest {
         read_json(path).await
     }
 
@@ -1142,6 +1291,24 @@ mod tests {
 
         let json_manifest = serde_json::to_string(&manifest).unwrap();
         assert_eq!(json_manifest.find("last_uploaded_compacted_offset"), None);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_cluster_manifest_decode() {
+        let manifest = read_cluster_manifest("/resources/test/cluster_manifest.json").await;
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.compat_version, 1);
+        assert_eq!(manifest.upload_time_since_epoch, 1668768681875);
+        assert_eq!(
+            manifest.cluster_uuid,
+            "19fd9bd7-29e9-4da4-85cf-7199b2997ad3"
+        );
+        assert_eq!(manifest.metadata_id, 3);
+        assert_eq!(manifest.controller_snapshot_offset, 380);
+        assert_eq!(
+            manifest.controller_snapshot_path,
+            "cluster_metadata/19fd9bd7-29e9-4da4-85cf-7199b2997ad3/380/controller.snapshot"
+        );
     }
 
     #[test_log::test(tokio::test)]

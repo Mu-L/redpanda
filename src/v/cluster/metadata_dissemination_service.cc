@@ -9,6 +9,9 @@
 
 #include "cluster/metadata_dissemination_service.h"
 
+#include "base/likely.h"
+#include "base/vassert.h"
+#include "base/vlog.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/health_monitor_frontend.h"
 #include "cluster/health_monitor_types.h"
@@ -21,17 +24,14 @@
 #include "cluster/partition_manager.h"
 #include "cluster/topic_table.h"
 #include "config/configuration.h"
-#include "likely.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/timeout_clock.h"
-#include "net/unresolved_address.h"
 #include "rpc/connection_cache.h"
 #include "rpc/types.h"
 #include "utils/retry.h"
-#include "vassert.h"
-#include "vlog.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/chunked_fifo.hh>
@@ -249,7 +249,7 @@ ss::future<> metadata_dissemination_service::do_request_metadata_update(
 
 ss::future<> metadata_dissemination_service::process_get_update_reply(
   result<get_leadership_reply> reply_result, request_retry_meta& meta) {
-    if (!reply_result) {
+    if (!reply_result || !reply_result.value().success) {
         vlog(
           clusterlog.debug,
           "Unable to initialize metadata using node {}",
@@ -384,39 +384,29 @@ ss::future<> metadata_dissemination_service::dispatch_disseminate_leadership() {
 ss::future<> metadata_dissemination_service::update_leaders_with_health_report(
   cluster_health_report report) {
     vlog(clusterlog.trace, "updating leadership from health report");
-    for (const auto& node_report : report.node_reports) {
+    for (const auto& report : report.node_reports) {
         co_await _leaders.invoke_on_all(
-          [&node_report](partition_leaders_table& leaders) {
-              for (auto& tp : node_report.topics) {
-                  for (auto& p : tp.partitions) {
-                      // Nodes may report a null leader if they're out of
-                      // touch, even if the leader is actually still up.  Only
-                      // trust leadership updates from health reports if
-                      // they're non-null (non-null updates are safe to apply
-                      // in any order because update_partition leader will
-                      // ignore old terms)
-                      if (p.leader_id.has_value()) {
-                          leaders.update_partition_leader(
-                            model::ntp(tp.tp_ns.ns, tp.tp_ns.tp, p.id),
-                            p.revision_id,
-                            p.term,
-                            p.leader_id);
-                      }
-                  }
-              }
+          [&report](partition_leaders_table& leaders) {
+              return leaders.update_with_node_report(report);
           });
     }
 }
 
 ss::future<> metadata_dissemination_service::dispatch_one_update(
   model::node_id target_id, update_retry_meta& meta) {
+    // copy updates to make retries possible
+    chunked_vector<ntp_leader_revision> updates;
+    updates.reserve(meta.updates.size());
+    std::copy(
+      meta.updates.begin(), meta.updates.end(), std::back_inserter(updates));
+
     return _clients.local()
       .with_node_client<metadata_dissemination_rpc_client_protocol>(
         _self.id(),
         ss::this_shard_id(),
         target_id,
         _dissemination_interval,
-        [this, updates = std::move(meta.updates), target_id](
+        [this, updates = std::move(updates), target_id](
           metadata_dissemination_rpc_client_protocol proto) mutable {
             vlog(
               clusterlog.trace,

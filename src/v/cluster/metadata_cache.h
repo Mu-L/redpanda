@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "base/seastarx.h"
 #include "cluster/fwd.h"
 #include "cluster/members_table.h"
 #include "cluster/partition_leaders_table.h"
@@ -20,8 +21,6 @@
 #include "model/metadata.h"
 #include "model/timestamp.h"
 #include "pandaproxy/schema_registry/subject_name_strategy.h"
-#include "seastarx.h"
-#include "utils/expiring_promise.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
@@ -57,6 +56,7 @@ public:
     using with_leaders = ss::bool_class<struct with_leaders_tag>;
     metadata_cache(
       ss::sharded<topic_table>&,
+      ss::sharded<data_migrations::migrated_resources>&,
       ss::sharded<members_table>&,
       ss::sharded<partition_leaders_table>&,
       ss::sharded<health_monitor_frontend>&);
@@ -124,6 +124,10 @@ public:
 
     bool should_reject_writes() const;
 
+    /// Check whether migrations block topic writes/reads
+    bool should_reject_reads(model::topic_namespace_view) const;
+    bool should_reject_writes(model::topic_namespace_view) const;
+
     bool contains(model::topic_namespace_view, model::partition_id) const;
     bool contains(model::topic_namespace_view) const;
     topic_table::topic_state
@@ -162,7 +166,14 @@ public:
 
     void reset_leaders();
     ss::future<> refresh_health_monitor();
-    cluster::partition_leaders_table::leaders_info_t get_leaders() const;
+
+    /**
+     * Get a snapshot of leaders from the partition_leaders_table.
+     *
+     * @throws if concurrent modification is detected.
+     */
+    ss::future<cluster::partition_leaders_table::leaders_info_t>
+    get_leaders() const;
 
     void set_is_node_isolated_status(bool is_node_isolated);
     bool is_node_isolated();
@@ -178,6 +189,10 @@ public:
     get_default_retention_duration() const;
     std::optional<size_t> get_default_retention_local_target_bytes() const;
     std::chrono::milliseconds get_default_retention_local_target_ms() const;
+    std::optional<size_t>
+    get_default_initial_retention_local_target_bytes() const;
+    std::optional<std::chrono::milliseconds>
+    get_default_initial_retention_local_target_ms() const;
     model::shadow_indexing_mode get_default_shadow_indexing_mode() const;
     uint32_t get_default_batch_max_bytes() const;
     std::optional<std::chrono::milliseconds> get_default_segment_ms() const;
@@ -187,6 +202,8 @@ public:
     bool get_default_record_value_schema_id_validation() const;
     pandaproxy::schema_registry::subject_name_strategy
     get_default_record_value_subject_name_strategy() const;
+    std::optional<std::chrono::milliseconds>
+    get_default_delete_retention_ms() const;
 
     topic_properties get_default_properties() const;
     std::optional<partition_assignment>
@@ -196,8 +213,16 @@ public:
     const topic_table::updates_t& updates_in_progress() const;
     bool is_update_in_progress(const model::ntp& ntp) const;
 
+    bool is_disabled(model::topic_namespace_view, model::partition_id) const;
+    const topic_disabled_partitions_set*
+      get_topic_disabled_set(model::topic_namespace_view) const;
+
+    std::optional<model::write_caching_mode>
+      get_topic_write_caching_mode(model::topic_namespace_view) const;
+
 private:
     ss::sharded<topic_table>& _topics_state;
+    ss::sharded<data_migrations::migrated_resources>& _migrated_resources;
     ss::sharded<members_table>& _members_table;
     ss::sharded<partition_leaders_table>& _leaders;
     ss::sharded<health_monitor_frontend>& _health_monitor;

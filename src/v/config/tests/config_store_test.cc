@@ -32,7 +32,7 @@ struct test_config : public config::config_store {
     config::property<int> optional_int;
     config::property<ss::sstring> required_string;
     config::property<int64_t> an_int64_t;
-    config::property<custom_aggregate> an_aggregate;
+    config::property<testing::custom_aggregate> an_aggregate;
     config::property<std::vector<ss::sstring>> strings;
     config::property<std::optional<int16_t>> nullable_int;
     config::property<std::optional<ss::sstring>> nullable_string;
@@ -47,11 +47,11 @@ struct test_config : public config::config_store {
 
     test_config()
       : optional_int(
-        *this,
-        "optional_int",
-        "An optional int value",
-        {.visibility = config::visibility::tunable},
-        100)
+          *this,
+          "optional_int",
+          "An optional int value",
+          {.visibility = config::visibility::tunable},
+          100)
       , required_string(
           *this,
           "required_string",
@@ -64,7 +64,7 @@ struct test_config : public config::config_store {
           "an_aggregate",
           "Aggregate type",
           {},
-          custom_aggregate{"str", 10})
+          testing::custom_aggregate{"str", 10})
       , strings(
           *this,
           "strings",
@@ -116,6 +116,8 @@ struct test_config : public config::config_store {
           true) {}
 };
 
+struct noop_config : public config::config_store {};
+
 YAML::Node minimal_valid_configuration() {
     return YAML::Load("required_string: test_value_1\n"
                       "strings:\n"
@@ -136,13 +138,15 @@ YAML::Node valid_configuration() {
                       " - two\n"
                       " - three\n"
                       "nullable_int: 111\n"
-                      "secret_string: actual_secret\n");
+                      "secret_string: actual_secret\n"
+                      "aliased_bool_legacy: false\n");
 }
 
 } // namespace
 
 namespace std {
-static inline ostream& operator<<(ostream& o, const custom_aggregate& c) {
+static inline ostream&
+operator<<(ostream& o, const testing::custom_aggregate& c) {
     o << "int_value=" << c.int_value << ", string_value=" << c.string_value;
     return o;
 }
@@ -161,8 +165,8 @@ operator<<(std::ostream& ostr, const std::optional<int16_t>& rhs) {
 
 namespace YAML {
 template<>
-struct convert<custom_aggregate> {
-    using type = custom_aggregate;
+struct convert<testing::custom_aggregate> {
+    using type = testing::custom_aggregate;
     static Node encode(const type& rhs) {
         Node node;
         node["string_value"] = rhs.string_value;
@@ -214,6 +218,7 @@ SEASTAR_THREAD_TEST_CASE(read_valid_configuration) {
     BOOST_TEST(cfg.strings().at(2) == "three");
     BOOST_TEST(cfg.nullable_int() == std::make_optional(111));
     BOOST_TEST(cfg.secret_string() == "actual_secret");
+    BOOST_TEST(cfg.aliased_bool() == false);
 };
 
 SEASTAR_THREAD_TEST_CASE(update_property_value) {
@@ -446,6 +451,13 @@ SEASTAR_THREAD_TEST_CASE(property_bind) {
     BOOST_TEST(bind2() == "newvalue4");
     BOOST_TEST(bind3() == "newvalue4");
     BOOST_TEST(watch_count == 6);
+
+    // Check that the bindings are updated when the property is reset to its
+    // default value.
+    cfg2.required_string.reset();
+    BOOST_TEST(bind2() == "");
+    BOOST_TEST(bind3() == "");
+    BOOST_TEST(watch_count == 8);
 }
 
 SEASTAR_THREAD_TEST_CASE(property_conversion_bind) {
@@ -499,6 +511,49 @@ SEASTAR_THREAD_TEST_CASE(property_conversion_bind) {
     BOOST_TEST(watch_count == 6);
 }
 
+SEASTAR_THREAD_TEST_CASE(property_bind_with_multiple_config_stores) {
+    // check that a copy of a configuration store, created for validating an
+    // incoming value, does not propagate the value to the bindings to the
+    // original configuration store
+
+    // main config store
+    auto cfg = test_config();
+    // set a property to a defined value
+    constexpr auto boolean_expected_value = false;
+    cfg.boolean.set_value(boolean_expected_value);
+    // create a like it's done in the codebase
+    auto boolean_bind = cfg.boolean.bind();
+    boolean_bind.watch([&] {
+        BOOST_TEST_CONTEXT("this watcher should not be called in this test") {
+            BOOST_CHECK_MESSAGE(false, "watcher called");
+            BOOST_CHECK_EQUAL(cfg.boolean.value(), boolean_expected_value);
+        }
+    });
+
+    BOOST_CHECK(cfg.boolean.value() == boolean_expected_value);
+    BOOST_TEST_CONTEXT("simulating patch_cluster_config") {
+        // tmp copy meant to validate an incoming value (see
+        // admin/server.cc::patch_cluster_config)
+        auto cfg_tmp = test_config();
+        // Populate the temporary config object with existing values
+        cfg.for_each([&](const auto& p) {
+            auto& tmp_p = cfg_tmp.get(p.name());
+            tmp_p = p;
+        });
+
+        BOOST_CHECK(cfg_tmp.boolean.value() == boolean_expected_value);
+        auto anti_value = YAML::Load(
+          fmt::format("{}", !boolean_expected_value));
+        auto& boolean_prop = cfg_tmp.get("boolean");
+        BOOST_CHECK_MESSAGE(
+          boolean_prop.validate(anti_value) == std::nullopt,
+          "sanity check: the test should pass validation");
+
+        // this is expected not to trigger the booload_bind watcher
+        boolean_prop.set_value(anti_value);
+    }
+}
+
 SEASTAR_THREAD_TEST_CASE(property_aliasing) {
     auto cfg = test_config();
 
@@ -525,4 +580,44 @@ SEASTAR_THREAD_TEST_CASE(property_aliasing) {
     auto property_names = cfg.property_names();
     BOOST_TEST(property_names.contains("aliased_bool") == true);
     BOOST_TEST(property_names.contains("aliased_bool_legacy") == false);
+
+    BOOST_TEST(cfg.property_names_and_aliases().contains("aliased_bool"));
+}
+
+SEASTAR_THREAD_TEST_CASE(ignored_keys) {
+    auto yaml_with_unknown_properties = YAML::Load(R"yaml(
+secret_string: terces
+aliased_bool_legacy: false
+    )yaml");
+
+    BOOST_TEST_CONTEXT(
+      "smoke test: check that the properties are valid for test_config") {
+        auto cfg = test_config{};
+        BOOST_CHECK_EQUAL(cfg.secret_string.value(), "");
+        BOOST_CHECK_EQUAL(cfg.aliased_bool.value(), true);
+        BOOST_REQUIRE_NO_THROW(cfg.read_yaml(yaml_with_unknown_properties));
+        BOOST_CHECK_EQUAL(cfg.secret_string.value(), "terces");
+        BOOST_CHECK_EQUAL(cfg.aliased_bool.value(), false);
+    }
+    BOOST_TEST_CONTEXT("if a key is managed by the config, it will be set and "
+                       "the ignored_missing list does not matter") {
+        auto cfg = test_config{};
+        BOOST_REQUIRE_NO_THROW(cfg.read_yaml(
+          yaml_with_unknown_properties,
+          {"secret_string", "aliased_bool_legacy"}));
+        BOOST_CHECK_EQUAL(cfg.secret_string.value(), "terces");
+        BOOST_CHECK_EQUAL(cfg.aliased_bool.value(), false);
+    }
+    BOOST_TEST_CONTEXT("an unknow key will generate an exception") {
+        auto noop_cfg = noop_config{};
+        BOOST_REQUIRE_THROW(
+          noop_cfg.read_yaml(yaml_with_unknown_properties),
+          std::invalid_argument);
+    }
+    BOOST_TEST_CONTEXT("unknown keys that are accounted for are fine") {
+        auto noop_cfg = noop_config{};
+        BOOST_REQUIRE_NO_THROW(noop_cfg.read_yaml(
+          yaml_with_unknown_properties,
+          test_config{}.property_names_and_aliases()));
+    }
 }

@@ -367,7 +367,12 @@ path_type_map = {
         "Topics": {
             "Partitions": ("model::partition_id", "int32"),
         }
-    }
+    },
+    "DescribeClientQuotasRequestData": {
+        "Components": {
+            "MatchType": ("kafka::describe_client_quotas_match_type", "int8"),
+        },
+    },
 }
 
 # a few kafka field types specify an entity type
@@ -400,6 +405,7 @@ basic_type_map = dict(
     int16=("int16_t", "read_int16()"),
     int32=("int32_t", "read_int32()"),
     int64=("int64_t", "read_int64()"),
+    float64=("float64_t", "read_float64()"),
     uuid=("uuid", "read_uuid()"),
     iobuf=("iobuf", None, "read_fragmented_nullable_bytes()", None,
            "read_fragmented_nullable_flex_bytes()"),
@@ -435,6 +441,20 @@ struct_renames = {
 
     ("IncrementalAlterConfigsResponseData", "Responses"):
         ("AlterConfigsResourceResponse", "IncrementalAlterConfigsResourceResponse"),
+
+    ("AlterClientQuotasRequestData", "Entries"):
+        ("EntryData", "AlterClientQuotasRequestEntryData"),
+    ("AlterClientQuotasResponseData", "Entries"):
+        ("EntryData", "AlterClientQuotasResponseEntryData"),
+    ("DescribeClientQuotasResponseData", "Entries"):
+        ("EntryData", "DescribeClientQuotasResponseEntryData"),
+
+    ("AlterClientQuotasRequestData", "Entries", "Entity"):
+        ("EntityData", "AlterClientQuotasRequestEntityData"),
+    ("AlterClientQuotasResponseData", "Entries", "Entity"):
+        ("EntityData", "AlterClientQuotasResponseEntityData"),
+    ("DescribeClientQuotasResponseData", "Entries", "Entity"):
+        ("EntityData", "DescribeClientQuotasResponseEntityData"),
 }
 
 # extra header per type name
@@ -461,9 +481,35 @@ extra_headers = {
 }
 # yapf: enable
 
-# These types, when they appear as the member type of an array, will use
-# a vector implementation which resists fragmentation.
-enable_fragmentation_resistance = {'metadata_response_partition'}
+# These types, when they appear as the member type of an array, will override
+# the container type from std::vector
+override_member_container = {
+    'metadata_response_partition': 'large_fragment_vector',
+    'metadata_response_topic': 'small_fragment_vector',
+    'fetchable_partition_response': 'small_fragment_vector',
+    'offset_fetch_response_partition': 'small_fragment_vector',
+    'int32_t': 'std::vector',
+    'model::node_id': 'std::vector',
+    'model::partition_id': 'std::vector',
+    'reassignable_partition_response': 'std::vector',
+    'reassignable_partition': 'std::vector',
+    'describe_configs_synonym': 'std::vector',
+    'createable_topic_config': 'std::vector',
+    'creatable_topic_configs': 'std::vector',
+    'creatable_replica_assignment': 'std::vector',
+    'offset_commit_request_partition': 'std::vector',
+    'offset_commit_response_partition': 'std::vector',
+    'offset_commit_request_topic': 'std::vector',
+    'offset_fetch_request_topic': 'std::vector',
+    'partition_produce_response': 'std::vector',
+    'creatable_acl_result': 'std::vector',
+    'offset_delete_request_partition': 'std::vector',
+    'deletable_group_result': 'std::vector',
+    'delete_acls_matching_acl': 'std::vector',
+    'txn_offset_commit_request_partition': 'std::vector',
+    'txn_offset_commit_request_topic': 'std::vector',
+    'txn_offset_commit_response_partition': 'std::vector',
+}
 
 
 def make_context_field(path):
@@ -578,6 +624,18 @@ STRUCT_TYPES = [
     "DeleteRecordsPartition",
     "DeleteRecordsTopicResult",
     "DeleteRecordsPartitionResult",
+    "EntryData",
+    "EntityData",
+    "OpData",
+    "ComponentData",
+    "ValueData",
+]
+
+DROP_STREAM_OPERATOR = [
+    "metadata_response_data",
+    "metadata_response_topic",
+    "metadata_response_partition",
+    "metadata_response_broker",
 ]
 
 # a list of struct types which are ineligible to have default-generated
@@ -613,17 +671,17 @@ class VersionRange:
         self.min, self.max = self._parse(spec)
 
     def _parse(self, spec):
-        match = re.match("^(?P<min>\d+)$", spec)
+        match = re.match(r"^(?P<min>\d+)$", spec)
         if match:
             min = int(match.group("min"))
             return min, min
 
-        match = re.match("^(?P<min>\d+)\+$", spec)
+        match = re.match(r"^(?P<min>\d+)\+$", spec)
         if match:
             min = int(match.group("min"))
             return min, None
 
-        match = re.match("^(?P<min>\d+)\-(?P<max>\d+)$", spec)
+        match = re.match(r"^(?P<min>\d+)\-(?P<max>\d+)$", spec)
         if match:
             min = int(match.group("min"))
             max = int(match.group("max"))
@@ -684,7 +742,7 @@ def snake_case(name):
 
 
 class FieldType:
-    ARRAY_RE = re.compile("^\[\](?P<type>.+)$")
+    ARRAY_RE = re.compile(r"^\[\](?P<type>.+)$")
 
     def __init__(self, name):
         self._name = name
@@ -823,6 +881,11 @@ class StructType(FieldType):
     @property
     def is_default_comparable(self):
         return all(field.is_default_comparable for field in self.fields)
+
+    @property
+    def is_streamable(self):
+        return self._name not in DROP_STREAM_OPERATOR and all(
+            field.is_streamable for field in self.fields)
 
 
 class ArrayType(FieldType):
@@ -1024,17 +1087,13 @@ class Field:
 
     @property
     def type_name(self):
-        name, default_value = self._redpanda_type()
+        gen = self.type_name_parts()
+        name = next(gen)
         if isinstance(self._type, ArrayType):
-            assert default_value is None  # not supported
-            if name in enable_fragmentation_resistance:
-                name = f'large_fragment_vector<{name}>'
-            else:
-                name = f'std::vector<{name}>'
+            name = f'{next(gen)}<{name}>'
         if self.nullable():
-            assert default_value is None  # not supported
-            return f"std::optional<{name}>", None
-        return name, default_value
+            return f'{next(gen)}<{name}>', None
+        return name, next(gen)
 
     def type_name_parts(self):
         """
@@ -1044,10 +1103,14 @@ class Field:
         yield name
         if isinstance(self._type, ArrayType):
             assert default_value is None  # not supported
-            yield "std::vector"
+            if name in override_member_container:
+                yield override_member_container[name]
+            else:
+                yield "chunked_vector"
         if self.nullable():
             assert default_value is None  # not supported
             yield "std::optional"
+        yield default_value
 
     @property
     def value_type(self):
@@ -1063,6 +1126,16 @@ class Field:
         type_name, _ = self._redpanda_type()
         return type_name not in WITHOUT_DEFAULT_EQUALITY_OPERATOR
 
+    @property
+    def is_streamable(self):
+        type_name, _ = self._redpanda_type()
+        return type_name not in DROP_STREAM_OPERATOR
+
+    @property
+    def is_error_code(self):
+        type_name, _ = self._redpanda_type()
+        return type_name == "kafka::error_code"
+
 
 HEADER_TEMPLATE = """
 #pragma once
@@ -1070,8 +1143,11 @@ HEADER_TEMPLATE = """
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "kafka/protocol/errors.h"
-#include "seastarx.h"
-#include "utils/fragmented_vector.h"
+#include "base/seastarx.h"
+#include "container/fragmented_vector.h"
+{%- if not struct.is_streamable %}
+#include <fmt/format.h>
+{%- endif %}
 
 {%- for header in struct.headers("header") %}
 {%- if header.startswith("<") %}
@@ -1115,6 +1191,33 @@ struct {{ struct.name }} {
 {%- if struct.is_default_comparable %}
     friend bool operator==(const {{ struct.name }}&, const {{ struct.name }}&) = default;
 {%- endif %}
+{%- if op_type == "response" %}
+    bool errored() const;
+{%- endif %}
+{% endmacro %}
+
+{% macro render_formatter(struct) %}
+{%- if not struct.is_streamable %}
+template<>
+struct fmt::formatter<kafka::{{ struct.name }}> : fmt::formatter<std::string_view> {
+    template <typename FormatContext>
+    auto format([[maybe_unused]] const kafka::{{ struct.name }} &v, FormatContext& ctx) const
+            -> decltype(ctx.out());
+};
+{%- for field in struct.fields %}
+{%- if field.is_array and not field.is_streamable %}
+{%- set vtype = field.value_type %}
+{%- set container = (field.type_name_parts() | list)[1] %}
+template<>
+struct fmt::formatter<{{ container }}<kafka::{{ vtype }}>> : fmt::formatter<std::string_view> {
+    template<typename FormatContext>
+    auto format(
+      [[maybe_unused]] const {{ container }}<kafka::{{ vtype}}>& v,
+      FormatContext& ctx) const -> decltype(ctx.out());
+};
+{%- endif %}
+{%- endfor %}
+{%- endif %}
 {% endmacro %}
 
 namespace kafka {
@@ -1127,7 +1230,10 @@ class response;
 
 {% for struct in struct.structs() %}
 {{ render_struct(struct) }}
+{%- if  struct.is_streamable %}
     friend std::ostream& operator<<(std::ostream&, const {{ struct.name }}&);
+{%- endif %}
+
 };
 
 {% endfor %}
@@ -1139,8 +1245,9 @@ class response;
 {%- else %}
     void decode(iobuf, api_version);
 {%- endif %}
-
+{%- if  struct.is_streamable %}
     friend std::ostream& operator<<(std::ostream&, const {{ struct.name }}&);
+{%- endif %}
 {%- if first_flex > 0 %}
 private:
     void encode_flex(protocol::encoder&, api_version);
@@ -1167,9 +1274,16 @@ struct {{ request_name }}_api final {
     static constexpr const char* name = "{{ request_name }}";
     static constexpr api_key key = api_key({{ api_key }});
     static constexpr api_version min_flexible = {% if first_flex == -1 %}never_flexible{% else %}api_version({{ first_flex }}){% endif %};
+    static constexpr api_version min_valid = api_version({{ valid_range.min }});
+    static constexpr api_version max_valid = api_version({{ valid_range.max }});
 };
 {%- endif %}
 }
+
+{% for struct in struct.structs() %}
+{{ render_formatter(struct) }}
+{% endfor %}
+{{ render_formatter(struct) }}
 """
 
 COMBINED_SOURCE_TEMPLATE = """
@@ -1178,6 +1292,8 @@ COMBINED_SOURCE_TEMPLATE = """
 {%- endfor %}
 
 #include "kafka/protocol/wire.h"
+
+#include <algorithm>
 
 #include <fmt/core.h>
 #include <fmt/format.h>
@@ -1274,19 +1390,10 @@ if ({{ cond }}) {
 {%- set fname = field.name %}
 {%- endif %}
 {%- if field.is_array %}
-{%- if field.nullable() %}
-{%- if flex %}
-{{ fname }} = reader.read_nullable_flex_array([version](protocol::decoder& reader) {
-{%- else %}
-{{ fname }} = reader.read_nullable_array([version](protocol::decoder& reader) {
-{%- endif %}
-{%- else %}
-{%- if flex %}
-{{ fname }} = reader.read_flex_array([version](protocol::decoder& reader) {
-{%- else %}
-{{ fname }} = reader.read_array([version](protocol::decoder& reader) {
-{%- endif %}
-{%- endif %}
+{%- set nullable = "nullable_" if field.nullable() else "" %}
+{%- set flex = "flex_" if flex else "" %}
+{%- set container = (field.type_name_parts() | list)[1] %}
+{{ fname }} = reader.read_{{nullable}}{{flex}}array<{{ container }}>([version](protocol::decoder& reader) {
     (void)version;
 {%- if field.type().value_type().is_struct %}
     {{ field.type().value_type().name }} v;
@@ -1444,6 +1551,83 @@ writer.write_tags(std::move({{ tf }}));
 {%- endif %}
 {%- endmacro %}
 
+{% macro render_errored_source(struct) %}
+{%- if op_type == "response" %}
+{%- if not struct.fields %}
+bool {{ struct.name }}::errored() const {
+    return false;
+}
+{%- else %}
+bool {{ struct.name }}::errored() const {
+    bool ret = false;
+    {%- for field in struct.fields %}
+    {%- if field.is_error_code %}
+    if ({{ field.name }} != kafka::error_code::none) {
+        return true;
+    }
+    {%- elif field.is_array and field.type().value_type().is_struct %}
+    {%- if field.nullable() %}
+    if ({{ field.name }}) {
+        ret = std::any_of(
+          {{ field.name }}->begin(),
+          {{ field.name }}->end(),
+          [](auto& item) { return item.errored(); });
+
+        if (ret) {
+            return ret;
+        }
+    }
+
+    {%- else %}
+    ret = std::any_of(
+      {{ field.name }}.begin(),
+      {{ field.name }}.end(),
+      [](auto& item) { return item.errored(); });
+
+    if (ret) {
+        return ret;
+    }
+    {%- endif %}
+    {%- endif %}
+    {%- endfor %}
+
+    return ret;
+}
+{%- endif %}
+{%- endif %}
+{% endmacro %}
+
+{% macro render_formatter(struct) %}
+{%- if not struct.is_streamable %}
+template<>
+fmt::format_context::iterator
+fmt::formatter<kafka::{{ struct.name }}>::format(
+  [[maybe_unused]] const kafka::{{ struct.name }} &v, fmt::format_context& ctx) const
+{
+    return fmt::format_to(ctx.out(),
+      "{{'{{' + struct.format + '}}'}}",
+      {%- for field in struct.fields %}
+      {%- if field.is_sensitive %}"****"{% else %}v.{{ field.name }}{% endif %}{% if not loop.last %},{% endif %}
+
+      {%- endfor %}
+    );
+}
+{%- for field in struct.fields %}
+{%- if field.is_array and not field.is_streamable %}
+{%- set vtype = field.value_type %}
+{%- set container = (field.type_name_parts() | list)[1] %}
+template<>
+fmt::format_context::iterator
+fmt::formatter<{{ container }}<kafka::{{ vtype }}>>::format(
+  [[maybe_unused]] const {{ container }}<kafka::{{ vtype }}>& v,
+  fmt::format_context& ctx) const {
+    return fmt::format_to(ctx.out(), "{}", fmt::join(v, ","));
+}
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+{% endmacro %}
+
 namespace kafka {
 
 {%- if struct.fields %}
@@ -1576,6 +1760,7 @@ void {{ struct.name }}::decode(iobuf, api_version) {}
 
 {% set structs = struct.structs() + [struct] %}
 {% for struct in structs %}
+{%- if struct.is_streamable %}
 {%- if struct.fields %}
 std::ostream& operator<<(std::ostream& o, [[maybe_unused]] const {{ struct.name }}& v) {
     fmt::print(o,
@@ -1592,8 +1777,15 @@ std::ostream& operator<<(std::ostream& o, const {{ struct.name }}&) {
     return o << "{}";
 }
 {%- endif %}
+{%- endif %}
+{{ render_errored_source(struct) }}
 {% endfor %}
 }
+
+{% for struct in struct.structs() %}
+{{ render_formatter(struct) }}
+{% endfor %}
+{{ render_formatter(struct) }}
 """
 
 # This is the schema of the json files from the kafka tree. This isn't strictly
@@ -1619,15 +1811,15 @@ SCHEMA = {
             "oneOf": [
                 {
                     "type": "string",
-                    "pattern": "^\d+$"
+                    "pattern": r"^\d+$"
                 },
                 {
                     "type": "string",
-                    "pattern": "^\d+\-\d+$"
+                    "pattern": r"^\d+\-\d+$"
                 },
                 {
                     "type": "string",
-                    "pattern": "^\d+\+$"
+                    "pattern": r"^\d+\+$"
                 },
             ],
         },
@@ -1756,7 +1948,7 @@ def codegen(schema_path):
     schema = io.StringIO()
     with open(schema_path, "r") as f:
         for line in f.readlines():
-            line = re.sub("\/\/.*", "", line)
+            line = re.sub(r"//.*", "", line)
             if line.strip():
                 schema.write(line)
 
@@ -1788,6 +1980,9 @@ def codegen(schema_path):
     # either 'none' or 'VersionRange'
     first_flex = parse_flexible_versions(msg["flexibleVersions"])
 
+    valid_range = VersionRange(msg["validVersions"])
+    assert valid_range.min >= 0 and valid_range.max >= valid_range.min, valid_range
+
     def fail(msg):
         assert False, msg
 
@@ -1798,7 +1993,8 @@ def codegen(schema_path):
         fail=fail,
         api_key=api_key,
         request_name=request_name,
-        first_flex=first_flex)
+        first_flex=first_flex,
+        valid_range=valid_range)
 
     src = jinja2.Template(SOURCE_TEMPLATE).render(struct=struct,
                                                   op_type=op_type,

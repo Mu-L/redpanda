@@ -1,9 +1,16 @@
-
+// Copyright 2024 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+#include "base/vlog.h"
 #include "config/mock_property.h"
 #include "net/conn_quota.h"
 #include "test_utils/async.h"
 #include "test_utils/fixture.h"
-#include "vlog.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/preempt.hh>
@@ -46,12 +53,15 @@ struct conn_quota_fixture {
         max_con_overrides.start(overrides).get();
 
         scq
-          .start([this]() {
-              return conn_quota_config{
-                .max_connections = max_con.local().bind(),
-                .max_connections_per_ip = max_con_per_ip.local().bind(),
-                .max_connections_overrides = max_con_overrides.local().bind()};
-          })
+          .start(
+            [this]() {
+                return conn_quota_config{
+                  .max_connections = max_con.local().bind(),
+                  .max_connections_per_ip = max_con_per_ip.local().bind(),
+                  .max_connections_overrides
+                  = max_con_overrides.local().bind()};
+            },
+            &logger)
           .get();
     }
 
@@ -73,8 +83,7 @@ struct conn_quota_fixture {
 
     void drop_shard_units() {
         for (ss::shard_id i = 0; i < ss::smp::count; ++i) {
-            scq
-              .invoke_on(i, [i, this](conn_quota& cq) { shard_units.erase(i); })
+            scq.invoke_on(i, [i, this](conn_quota&) { shard_units.erase(i); })
               .get();
         }
     }
@@ -113,7 +122,7 @@ struct conn_quota_fixture {
         scq
           .invoke_on(
             shard,
-            [shard, this, take_units](conn_quota& cq) {
+            [shard, this, take_units](conn_quota&) {
                 for (size_t i = 0; i < take_units; ++i) {
                     shard_units[shard].pop_back();
                 }
@@ -232,16 +241,14 @@ void conn_quota_fixture::test_borrows(
     // All shards should now see no units available
     vlog(logger.debug, "Check allowances used up");
     for (ss::shard_id i = 0; i < core_count; ++i) {
-        scq
-          .invoke_on(
-            i, [this](conn_quota& cq) { return expect_no_units(addr1); })
+        scq.invoke_on(i, [this](conn_quota&) { return expect_no_units(addr1); })
           .get();
     }
 
     // Release a unit, then try taking it on a different shard.  This triggers
     // a reclaim.
     vlog(logger.debug, "Trigger a reclaim");
-    scq.invoke_on(1, [this](conn_quota& cq) { shard_units.erase(1); }).get();
+    scq.invoke_on(1, [this](conn_quota&) { shard_units.erase(1); }).get();
     scq
       .invoke_on(
         2,

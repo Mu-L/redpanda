@@ -9,10 +9,16 @@
 
 #include "kafka/server/handlers/fetch.h"
 
+#include "base/likely.h"
+#include "base/vlog.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/partition_manager.h"
 #include "cluster/shard_table.h"
 #include "config/configuration.h"
+#include "container/fragmented_vector.h"
+#include "features/enterprise_feature_messages.h"
+#include "kafka/data/partition_proxy.h"
+#include "kafka/data/replicated_partition.h"
 #include "kafka/protocol/batch_consumer.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fetch.h"
@@ -22,13 +28,14 @@
 #include "kafka/server/handlers/fetch/fetch_plan_executor.h"
 #include "kafka/server/handlers/fetch/fetch_planner.h"
 #include "kafka/server/handlers/fetch/replica_selector.h"
-#include "kafka/server/partition_proxy.h"
-#include "kafka/server/replicated_partition.h"
-#include "likely.h"
+#include "kafka/server/latency_probe.h"
+#include "kafka/server/read_distribution_probe.h"
 #include "model/fundamental.h"
+#include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/record_utils.h"
 #include "model/timeout_clock.h"
+#include "net/connection.h"
 #include "random/generators.h"
 #include "resource_mgmt/io_priority.h"
 #include "ssx/semaphore.h"
@@ -40,6 +47,7 @@
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/core/timer.hh>
 #include <seastar/core/with_scheduling_group.hh>
 #include <seastar/util/log.hh>
 
@@ -47,6 +55,8 @@
 #include <fmt/ostream.h>
 
 #include <chrono>
+#include <exception>
+#include <ranges>
 #include <string_view>
 
 namespace kafka {
@@ -61,6 +71,7 @@ make_partition_response_error(model::partition_id p_id, error_code error) {
       .error_code = error,
       .high_watermark = model::offset(-1),
       .last_stable_offset = model::offset(-1),
+      .log_start_offset = model::offset(-1),
       .records = batch_reader(),
     };
 }
@@ -70,20 +81,17 @@ make_partition_response_error(model::partition_id p_id, error_code error) {
  */
 static ss::future<read_result> read_from_partition(
   kafka::partition_proxy part,
+  model::offset lso,
   fetch_config config,
   bool foreign_read,
   std::optional<model::timeout_clock::time_point> deadline) {
-    auto lso = part.last_stable_offset();
-    if (unlikely(!lso)) {
-        co_return read_result(lso.error());
-    }
     auto hw = part.high_watermark();
     auto start_o = part.start_offset();
     // if we have no data read, return fast
     if (
       hw < config.start_offset || config.skip_read
       || config.start_offset > config.max_offset) {
-        co_return read_result(start_o, hw, lso.value());
+        co_return read_result(start_o, hw, lso);
     }
 
     storage::log_reader_config reader_config(
@@ -94,20 +102,40 @@ static ss::future<read_result> read_from_partition(
       kafka_read_priority(),
       std::nullopt,
       std::nullopt,
-      std::nullopt);
+      config.abort_source.has_value()
+        ? config.abort_source.value().get().local()
+        : storage::opt_abort_source_t{},
+      config.client_address);
 
     reader_config.strict_max_bytes = config.strict_max_bytes;
     auto rdr = co_await part.make_reader(reader_config);
     std::exception_ptr e;
     std::unique_ptr<iobuf> data;
-    std::vector<cluster::rm_stm::tx_range> aborted_transactions;
+    std::vector<cluster::tx::tx_range> aborted_transactions;
+    std::optional<std::chrono::milliseconds> delta_from_tip_ms;
     try {
         auto result = co_await rdr.reader.consume(
           kafka_batch_serializer(), deadline ? *deadline : model::no_timeout);
         data = std::make_unique<iobuf>(std::move(result.data));
         part.probe().add_records_fetched(result.record_count);
         part.probe().add_bytes_fetched(data->size_bytes());
-        if (result.first_tx_batch_offset && result.record_count > 0) {
+        if (!part.is_leader() && config.read_from_follower) {
+            part.probe().add_bytes_fetched_from_follower(data->size_bytes());
+        }
+
+        if (data->size_bytes() > 0) {
+            auto curr_timestamp = model::timestamp::now();
+            if (curr_timestamp >= result.first_timestamp) {
+                delta_from_tip_ms = std::chrono::milliseconds{
+                  curr_timestamp() - result.first_timestamp()};
+            }
+        }
+        // Only return aborted transactions range if consumer is using
+        // read_committed isolation level and there are tx batches in the
+        // response
+        if (
+          config.isolation_level == model::isolation_level::read_committed
+          && result.first_tx_batch_offset && result.record_count > 0) {
             // Reader should live at least until this point to hold on to the
             // segment locks so that prefix truncation doesn't happen.
             aborted_transactions = co_await part.aborted_transactions(
@@ -124,7 +152,8 @@ static ss::future<read_result> read_from_partition(
                 co_return read_result(
                   error_code::offset_out_of_range,
                   start_o,
-                  part.high_watermark());
+                  part.high_watermark(),
+                  lso);
             }
         }
 
@@ -143,7 +172,8 @@ static ss::future<read_result> read_from_partition(
           ss::make_foreign<read_result::data_t>(std::move(data)),
           start_o,
           hw,
-          lso.value(),
+          lso,
+          delta_from_tip_ms,
           std::move(aborted_transactions));
     }
 
@@ -151,7 +181,8 @@ static ss::future<read_result> read_from_partition(
       std::move(data),
       start_o,
       hw,
-      lso.value(),
+      lso,
+      delta_from_tip_ms,
       std::move(aborted_transactions));
 }
 
@@ -313,36 +344,30 @@ static ss::future<read_result> do_read_from_ntp(
       ntp_config.cfg.read_from_follower,
       default_fetch_timeout + model::timeout_clock::now());
 
+    auto maybe_lso = kafka_partition->last_stable_offset();
+    if (unlikely(!maybe_lso)) {
+        // partition is still bootstrapping
+        co_return read_result(maybe_lso.error());
+    }
+
     if (config::shard_local_cfg().enable_transactions.value()) {
         if (
           ntp_config.cfg.isolation_level
           == model::isolation_level::read_committed) {
-            auto maybe_lso = kafka_partition->last_stable_offset();
-            if (unlikely(!maybe_lso)) {
-                // partition is still bootstrapping
-                co_return read_result(maybe_lso.error());
-            }
             ntp_config.cfg.max_offset = model::prev_offset(maybe_lso.value());
         }
     }
 
     if (offset_ec != error_code::none) {
-        vlog(
-          klog.warn,
-          "fetch offset out of range for {}, requested offset: {}, "
-          "partition start offset: {}, high watermark: {}, ec: {}",
-          ntp_config.ktp(),
-          ntp_config.cfg.start_offset,
-          kafka_partition->start_offset(),
-          kafka_partition->high_watermark(),
-          offset_ec);
-
         co_return read_result(
           offset_ec,
           kafka_partition->start_offset(),
-          kafka_partition->high_watermark());
+          kafka_partition->high_watermark(),
+          maybe_lso.value());
     }
-    if (ntp_config.cfg.consumer_rack_id && kafka_partition->is_leader()) {
+    if (
+      config::shard_local_cfg().enable_rack_awareness.value()
+      && ntp_config.cfg.consumer_rack_id && kafka_partition->is_leader()) {
         auto p_info_res = kafka_partition->get_partition_info();
         if (p_info_res.has_error()) {
             // TODO: add mapping here
@@ -350,10 +375,6 @@ static ss::future<read_result> do_read_from_ntp(
         }
         auto p_info = std::move(p_info_res.value());
 
-        auto lso = kafka_partition->last_stable_offset();
-        if (unlikely(!lso)) {
-            co_return read_result(lso.error());
-        }
         auto preferred_replica = replica_selector.select_replica(
           consumer_info{
             .fetch_offset = ntp_config.cfg.start_offset,
@@ -368,12 +389,16 @@ static ss::future<read_result> do_read_from_ntp(
             co_return read_result(
               kafka_partition->start_offset(),
               kafka_partition->high_watermark(),
-              lso.value(),
+              maybe_lso.value(),
               preferred_replica);
         }
     }
     read_result result = co_await read_from_partition(
-      std::move(*kafka_partition), ntp_config.cfg, foreign_read, deadline);
+      std::move(*kafka_partition),
+      maybe_lso.value(),
+      ntp_config.cfg,
+      foreign_read,
+      deadline);
 
     adjust_memory_units(
       memory_sem, memory_fetch_sem, memory_units, result.data_size_bytes());
@@ -418,8 +443,9 @@ read_result::memory_units_t reserve_memory_units(
 static void fill_fetch_responses(
   op_context& octx,
   std::vector<read_result> results,
-  std::vector<op_context::response_placeholder_ptr> responses,
-  op_context::latency_point start_time) {
+  const chunked_vector<op_context::response_placeholder_ptr>& responses,
+  op_context::latency_point start_time,
+  bool record_latency = true) {
     auto range = boost::irange<size_t>(0, results.size());
     if (unlikely(results.size() != responses.size())) {
         // soft assert & recovery attempt
@@ -439,12 +465,24 @@ static void fill_fetch_responses(
 
     for (auto idx : range) {
         auto& res = results[idx];
-        auto& resp_it = responses[idx];
+        const auto& resp_it = responses[idx];
+
+        fetch_response::partition_response resp;
+        resp.partition_index = res.partition;
+        resp.error_code = res.error;
+
+        // These are set to -1 in the general error case.
+        // Set to actual values in the success case or when the error is
+        // offset_out_of_range as the client can make use of the returned
+        // offsets.
+        resp.log_start_offset = res.start_offset;
+        resp.high_watermark = res.high_watermark;
+        resp.last_stable_offset = res.last_stable_offset;
 
         // error case
-        if (unlikely(res.error != error_code::none)) {
-            resp_it->set(
-              make_partition_response_error(res.partition, res.error));
+        if (unlikely(resp.error_code != error_code::none)) {
+            resp.records = batch_reader();
+            resp_it->set(std::move(resp));
             continue;
         }
 
@@ -460,12 +498,6 @@ static void fill_fetch_responses(
          * Over response budget, we will just waste this read, it will cause
          * data to be stored in the cache so next read is fast
          */
-        fetch_response::partition_response resp;
-        resp.partition_index = res.partition;
-        resp.error_code = error_code::none;
-        resp.log_start_offset = res.start_offset;
-        resp.high_watermark = res.high_watermark;
-        resp.last_stable_offset = res.last_stable_offset;
         if (res.preferred_replica) {
             resp.preferred_read_replica = *res.preferred_replica;
         }
@@ -495,13 +527,13 @@ static void fill_fetch_responses(
              * set aborted transactions if present
              */
             if (!res.aborted_transactions.empty()) {
-                std::vector<fetch_response::aborted_transaction> aborted;
+                chunked_vector<fetch_response::aborted_transaction> aborted;
                 aborted.reserve(res.aborted_transactions.size());
                 std::transform(
                   res.aborted_transactions.begin(),
                   res.aborted_transactions.end(),
                   std::back_inserter(aborted),
-                  [](cluster::rm_stm::tx_range range) {
+                  [](cluster::tx::tx_range range) {
                       return fetch_response::aborted_transaction{
                         .producer_id = kafka::producer_id(range.pid.id),
                         .first_offset = range.first};
@@ -515,17 +547,21 @@ static void fill_fetch_responses(
         }
 
         resp_it->set(std::move(resp));
-        std::chrono::microseconds fetch_latency
-          = std::chrono::duration_cast<std::chrono::microseconds>(
-            op_context::latency_clock::now() - start_time);
-        octx.rctx.probe().record_fetch_latency(fetch_latency);
+
+        if (record_latency) {
+            std::chrono::microseconds fetch_latency
+              = std::chrono::duration_cast<std::chrono::microseconds>(
+                op_context::latency_clock::now() - start_time);
+            octx.rctx.probe().record_fetch_latency(fetch_latency);
+        }
     }
 }
 
 static ss::future<std::vector<read_result>> fetch_ntps_in_parallel(
   cluster::partition_manager& cluster_pm,
   const replica_selector& replica_selector,
-  std::vector<ntp_fetch_config> ntp_fetch_configs,
+  chunked_vector<ntp_fetch_config> ntp_fetch_configs,
+  read_distribution_probe& read_probe,
   bool foreign_read,
   std::optional<model::timeout_clock::time_point> deadline,
   const size_t bytes_left,
@@ -583,6 +619,10 @@ static ss::future<std::vector<read_result>> fetch_ntps_in_parallel(
     size_t total_size = 0;
     for (const auto& r : results) {
         total_size += r.data_size_bytes();
+        if (r.delta_from_tip_ms.has_value()) {
+            read_probe.add_read_event_delta_from_tip(
+              r.delta_from_tip_ms.value());
+        }
     }
     vlog(
       klog.trace,
@@ -638,6 +678,7 @@ handle_shard_fetch(ss::shard_id shard, op_context& octx, shard_fetch fetch) {
               mgr,
               octx.rctx.server().local().get_replica_selector(),
               std::move(configs),
+              octx.rctx.server().local().read_probe(),
               foreign_read,
               octx.deadline,
               octx.bytes_left,
@@ -647,8 +688,7 @@ handle_shard_fetch(ss::shard_id shard, op_context& octx, shard_fetch fetch) {
       .then([responses = std::move(fetch.responses),
              start_time = fetch.start_time,
              &octx](std::vector<read_result> results) mutable {
-          fill_fetch_responses(
-            octx, std::move(results), std::move(responses), start_time);
+          fill_fetch_responses(octx, std::move(results), responses, start_time);
       });
 }
 
@@ -670,6 +710,570 @@ class parallel_fetch_plan_executor final : public fetch_plan_executor::impl {
 
         return ss::when_all_succeed(fetches.begin(), fetches.end());
     }
+};
+
+class fetch_worker {
+public:
+    // Passed from the coordinator shard to fetch workers.
+    // Contains either references to objects local to the fetch worker shard or
+    // copies of data from the coordinator shard.
+    struct shard_local_fetch_context {
+        // True if the results of this fetch will be read on a foreign shard.
+        bool foreign_read;
+        size_t bytes_left;
+        // Specifies the minimum number of bytes this sub-fetch should read
+        // before returning.
+        size_t min_bytes;
+        // If set then the sub-fetch should return by the specified time_point .
+        std::optional<model::timeout_clock::time_point> deadline;
+        // The fetch sub-requests of partitions local to the shard this worker
+        // is running on.
+        chunked_vector<ntp_fetch_config> requests;
+
+        // References to services local to the shard this worker is running on.
+        // They are protected from deletion by the coordinator.
+        server& srv;
+        cluster::partition_manager& mgr;
+        ss::abort_source& as;
+    };
+
+    explicit fetch_worker(shard_local_fetch_context ctx)
+      : _ctx(std::move(ctx)) {}
+
+    struct worker_result {
+        std::vector<read_result> read_results;
+        // The total amount of bytes read across all results in `read_results`.
+        size_t total_size;
+        // The time it took for the first `fetch_ntps_in_parallel` to complete
+        std::chrono::microseconds first_run_latency_result;
+    };
+
+    ss::future<worker_result> run() {
+        // Set the worker's abort source to be a child of the orchestrator's
+        // abort_source.
+        auto sub_opt = _ctx.as.subscribe([this]() noexcept {
+            _as.request_abort();
+            _completed_waiter_count.signal();
+        });
+
+        if (!sub_opt) {
+            // `_ctx.as` must've already been aborted. Query partitions once
+            // then return.
+            _as.request_abort();
+        }
+
+        co_return co_await do_run().finally([this] {
+            // Ensure all offset waiters have been removed before returning.
+            _as.request_abort();
+            return _waiter_gate.close();
+        });
+    }
+
+private:
+    shard_local_fetch_context _ctx;
+    ss::gate _waiter_gate;
+    ss::abort_source _as;
+
+    // This should roughly correspond to `_request_indexes.size()`. It's used to
+    // wait for partitions to have an offset change so that it's corresponding
+    // request in the fetch can be re-queried.
+    ssx::semaphore _completed_waiter_count{
+      0, "fetch_worker._completed_waiter_count"};
+    // This contains indexes into `_ctx.requests` and is populated by raft
+    // consensus waiters when an offset increases for a partition.
+    std::vector<size_t> _request_indexes;
+    // Contains the last observed value of `consensus->last_visible_index()` for
+    // every request in `_ctx.requests`. Its used to register waiters with
+    // `consensus->visible_offset_monitor()`.
+    std::vector<model::offset> _last_visible_indexes;
+
+    struct query_results {
+        std::vector<model::offset> last_visible_indexes;
+        // Indicates if any `read_result` in `results` has an error.
+        bool has_error;
+        std::vector<read_result> results;
+        size_t total_size;
+    };
+
+    ss::future<query_results>
+    query_requests(chunked_vector<ntp_fetch_config> requests) {
+        // The last visible indexes need to be populated before partitions
+        // are read. If they are populated afterwards then the
+        // last_visible_index could be updated after the partition is read,
+        // but before the index is queried. This leads to a race condition
+        // where we're waiting for the last_visible_index to change even
+        // though the partition has data we haven't read.
+        //
+        // Note that `last_visible_index` is used instead of the
+        // `commit_offset` as the commit offset won't change when partitions
+        // are produced to without acks=all. The `last_visible_index` more
+        // closely corresponds to the Kafka high watermark as well.
+        std::vector<model::offset> last_visible_indexes(requests.size());
+        std::vector<std::tuple<size_t, model::partition_id>> errored_partitions;
+        size_t total_size{0};
+        bool has_error{false};
+
+        for (size_t i = 0; i < requests.size(); i++) {
+            const auto& req = requests[i];
+            auto part = _ctx.mgr.get(req.ktp());
+            if (!part) {
+                errored_partitions.emplace_back(i, req.ktp().get_partition());
+                continue;
+            }
+            auto consensus = part->raft();
+            if (!consensus) {
+                errored_partitions.emplace_back(i, req.ktp().get_partition());
+                continue;
+            }
+            last_visible_indexes[i] = consensus->last_visible_index();
+        }
+
+        // A read_result needs to be returned for every partition. Hence,
+        // the function can't return before calling
+        // `fetch_ntps_in_parallel`.
+        std::vector<read_result> results = co_await fetch_ntps_in_parallel(
+          _ctx.mgr,
+          _ctx.srv.get_replica_selector(),
+          std::move(requests),
+          _ctx.srv.read_probe(),
+          _ctx.foreign_read,
+          _ctx.deadline,
+          _ctx.bytes_left,
+          _ctx.srv.memory(),
+          _ctx.srv.memory_fetch_sem());
+
+        // If we weren't able to read the last_visible_index for a partition
+        // before calling `fetch_ntps_in_parallel` then we need to
+        // return with an error for that partition.
+        for (auto [i, partition] : errored_partitions) {
+            results[i] = read_result(error_code::not_leader_for_partition);
+            results[i].partition = partition;
+        }
+
+        for (const auto& r : results) {
+            total_size += r.data_size_bytes();
+            if (r.error != error_code::none) {
+                has_error = true;
+            }
+        }
+
+        co_return query_results{
+          .last_visible_indexes = std::move(last_visible_indexes),
+          .has_error = has_error,
+          .results = std::move(results),
+          .total_size = total_size,
+        };
+    }
+
+    // Registers a `visible_offset_monitor` waiter for every index in
+    // `request_indexes`
+    //
+    // `request_indexes` should contain valid indexes into `_ctx.requests`
+    //
+    // If a registration fails for a given index then the function immediately
+    // returns with that index without registering any further waiters.
+    // Otherwise the function returns std::nullopt to indicate success.
+    std::optional<size_t> register_waiters(const auto& request_indexes) {
+        for (size_t i : request_indexes) {
+            auto part = _ctx.mgr.get(_ctx.requests[i].ktp());
+            // If the partition can't be found then it's since been moved
+            if (!part) {
+                return {i};
+            }
+
+            auto consensus = part->raft();
+            if (!consensus) {
+                return {i};
+            }
+
+            auto offset = model::next_offset(_last_visible_indexes[i]);
+            auto waiter = consensus->visible_offset_monitor()
+                            .wait(offset, model::no_timeout, _as)
+                            // All exceptions are ignored here as this is only
+                            // used to signal the worker that another attempt to
+                            // read the partition should be made.
+                            .handle_exception([](const std::exception_ptr&) {});
+
+            ssx::spawn_with_gate(
+              _waiter_gate, [this, w = std::move(waiter), i]() mutable {
+                  return w.finally([this, i] {
+                      _request_indexes.push_back(i);
+                      _completed_waiter_count.signal();
+                  });
+              });
+        }
+
+        return {};
+    }
+
+    ss::future<worker_result> do_run() {
+        bool first_run{true};
+        std::chrono::microseconds first_run_latency_result{0};
+        // A map of indexes in `requests` to their corresponding index in
+        // `_ctx.requests`.
+        std::vector<size_t> requests_map;
+
+        std::vector<read_result> results;
+        size_t total_size{0};
+
+        for (;;) {
+            chunked_vector<ntp_fetch_config> requests;
+
+            if (first_run) {
+                requests = _ctx.requests.copy();
+            } else {
+                requests_map.clear();
+
+                for (auto i : _request_indexes) {
+                    requests.push_back(_ctx.requests[i]);
+                    requests_map.push_back(i);
+                }
+
+                _request_indexes.clear();
+                // All `_request_indexes` have been read. Reset counter
+                _completed_waiter_count.consume(
+                  _completed_waiter_count.current());
+            }
+
+            std::optional<op_context::latency_point> start_time;
+            if (first_run) {
+                start_time = op_context::latency_clock::now();
+            }
+
+            auto q_results = co_await query_requests(std::move(requests));
+            if (first_run) {
+                results = std::move(q_results.results);
+                total_size = q_results.total_size;
+
+                _last_visible_indexes = std::move(
+                  q_results.last_visible_indexes);
+                first_run_latency_result
+                  = std::chrono::duration_cast<std::chrono::microseconds>(
+                    op_context::latency_clock::now() - *start_time);
+            } else {
+                // Override the older results of the partitions with the newly
+                // queried results.
+                for (size_t i = 0; i < requests_map.size(); i++) {
+                    auto r_i = requests_map[i];
+                    auto& r = results[r_i];
+                    total_size -= r.data_size_bytes();
+                    r = std::move(q_results.results[i]);
+                    total_size += r.data_size_bytes();
+
+                    _last_visible_indexes[r_i]
+                      = q_results.last_visible_indexes[i];
+                }
+            }
+
+            if (
+              total_size >= _ctx.min_bytes || q_results.has_error
+              || _as.abort_requested()) {
+                co_return worker_result{
+                  .read_results = std::move(results),
+                  .total_size = total_size,
+                  .first_run_latency_result = first_run_latency_result,
+                };
+            }
+
+            std::optional<size_t> has_errored_request;
+            if (first_run) {
+                has_errored_request = register_waiters(
+                  std::ranges::iota_view{0ull, _ctx.requests.size()});
+            } else {
+                has_errored_request = register_waiters(requests_map);
+            }
+
+            if (has_errored_request) {
+                auto r_i = has_errored_request.value();
+                total_size -= results[r_i].data_size_bytes();
+                results[r_i] = read_result(
+                  error_code::not_leader_for_partition);
+                results[r_i].partition
+                  = _ctx.requests[r_i].ktp().get_partition();
+                co_return worker_result{
+                  .read_results = std::move(results),
+                  .total_size = total_size,
+                  .first_run_latency_result = first_run_latency_result,
+                };
+            }
+
+            co_await _completed_waiter_count.wait();
+
+            if (_as.abort_requested()) {
+                co_return worker_result{
+                  .read_results = std::move(results),
+                  .total_size = total_size,
+                  .first_run_latency_result = first_run_latency_result,
+                };
+            }
+
+            first_run = false;
+        }
+    }
+};
+
+/*
+ * A fetch exeutor that relies on notifications from raft to determine when to
+ * query partitions rather than querying all partitions at a set polling
+ * interval like the `parallel_fetch_plan_executor`.
+ */
+class nonpolling_fetch_plan_executor final : public fetch_plan_executor::impl {
+public:
+    nonpolling_fetch_plan_executor()
+      : _last_result_size(ss::smp::count, 0)
+      , _fetch_timeout{[this] { _has_progress.signal(); }} {}
+
+    /**
+     * Executes the supplied `plan` until `octx.should_stop_fetch` returns true.
+     */
+    ss::future<> execute_plan(op_context& octx, fetch_plan plan) final {
+        auto fetch_read_strategy
+          = config::shard_local_cfg().fetch_read_strategy();
+        if (
+          fetch_read_strategy
+          == model::fetch_read_strategy::non_polling_with_debounce) {
+            co_await ss::sleep(std::min(
+              config::shard_local_cfg().fetch_reads_debounce_timeout(),
+              octx.request.data.max_wait_ms));
+        }
+        // Ensure both fetch debounce and the fetch scheduling group are enabled
+        // before trying to apply any delay.
+        if (
+          fetch_read_strategy
+            == model::fetch_read_strategy::non_polling_with_pid
+          && config::shard_local_cfg().use_fetch_scheduler_group()) {
+            auto& pid = octx.rctx.server().local().pid_controller();
+            auto delay = pid.current_delay();
+            if (delay > 0s) {
+                // Avoid unneeded scheduling points in cases where delay is
+                // zero.
+                co_await ss::sleep(
+                  std::min(delay, octx.request.data.max_wait_ms));
+            }
+        }
+
+        if (!initialize_progress_conditions(octx)) {
+            // if the progress conditions were unable to be initialized then
+            // either the fetch has been aborted or the deadline was reached.
+            co_return;
+        }
+
+        start_worker_aborts(plan);
+        co_await handle_exceptions(do_execute_plan(octx, std::move(plan)));
+
+        // Send abort signal to workers and wait for all workers to end before
+        // returning.
+        co_await abort_workers().finally(
+          [this] { return _workers_gate.close(); });
+
+        if (_thrown_exception) {
+            std::rethrow_exception(_thrown_exception);
+        }
+    }
+
+private:
+    ss::future<> do_execute_plan(op_context& octx, fetch_plan plan) {
+        // start fetching from a random shard to make sure that we fetch data
+        // from all the partitions even if we reach fetch message size limit
+        const ss::shard_id start_shard_idx = random_generators::get_int(
+          ss::smp::count - 1);
+        for (size_t i = 0; i < ss::smp::count; ++i) {
+            auto shard = (start_shard_idx + i) % ss::smp::count;
+
+            ssx::spawn_with_gate(_workers_gate, [&]() mutable {
+                return handle_exceptions(start_shard_fetch_worker(
+                  octx, std::move(plan.fetches_per_shard[shard]), 0));
+            });
+        }
+
+        for (;;) {
+            co_await wait_for_progress();
+
+            if (octx.should_stop_fetch() || _thrown_exception) {
+                co_return;
+            }
+
+            std::vector<shard_fetch> completed_shard_fetches = std::move(
+              _completed_shard_fetches);
+            _completed_shard_fetches.clear();
+
+            for (auto& sf : completed_shard_fetches) {
+                ssx::spawn_with_gate(
+                  _workers_gate, [this, &octx, sf = std::move(sf)]() mutable {
+                      auto shard = sf.shard;
+                      return handle_exceptions(start_shard_fetch_worker(
+                        octx,
+                        std::move(sf),
+                        // Require that a worker returns more data than before.
+                        // Otherwise it'll return right away with the previous
+                        // result.
+                        _last_result_size[shard] + 1));
+                  });
+            }
+        }
+    }
+
+    /**
+     * Creates abort sources for shards with non-empty sub-fetches
+     */
+    void start_worker_aborts(const fetch_plan& plan) {
+        for (const auto& fetch : plan.fetches_per_shard) {
+            if (!fetch.empty()) {
+                _worker_aborts[fetch.shard];
+            }
+        }
+    }
+
+    ss::future<> abort_workers() {
+        return seastar::parallel_for_each(_worker_aborts, [](auto& wa) {
+            auto& [shard, as] = wa;
+            return ss::smp::submit_to(shard, [&as] { as.request_abort(); });
+        });
+    }
+
+    /**
+     * Sets _has_progress to be signaled if;
+     * - octx.deadline has been reached.
+     * - _as has been aborted.
+     * returns true if this was successful
+     *         false otherwise
+     */
+    bool initialize_progress_conditions(op_context& octx) {
+        // A connection can close and stop the sharded abort source before we
+        // can subscribe to it. So we check here if that is the case and return
+        // if so.
+        if (!octx.rctx.abort_source().local_is_initialized()) {
+            return false;
+        }
+
+        _fetch_abort_sub = octx.rctx.abort_source().subscribe(
+          [this]() noexcept { _has_progress.signal(); });
+
+        if (!_fetch_abort_sub) {
+            return false;
+        }
+
+        if (octx.deadline) {
+            _fetch_timeout.arm(octx.deadline.value());
+        }
+
+        return true;
+    }
+
+    /**
+     * Waits until the should_stop_fetch() condition should be checked again.
+     * The return future is set if;
+     * - octx.deadline has been reached.
+     * - _as has been aborted.
+     * - one of the shard workers has returned results.
+     */
+    ss::future<> wait_for_progress() { return _has_progress.wait(); }
+
+    /*
+     * `start_shard_fetch_worker` executes on the coordinator shard. It builds
+     * the `shard_local_fetch_context` struct needed to start the
+     * shard_fetch_worker then makes a cross shard call to the shard fetch
+     * worker if needed.
+     *
+     * It then waits until the shard_fetch_worker completes
+     * and then notifies the fetch coordinator.
+     */
+    ss::future<> start_shard_fetch_worker(
+      op_context& octx, shard_fetch fetch, size_t min_fetch_bytes) {
+        // if over budget skip the fetch.
+        if (octx.bytes_left <= 0) {
+            co_return;
+        }
+        // no requests for this shard, do nothing
+        if (fetch.empty()) {
+            co_return;
+        }
+
+        const bool foreign_read = fetch.shard != ss::this_shard_id();
+
+        fetch_worker::worker_result results
+          = co_await octx.rctx.partition_manager().invoke_on(
+            fetch.shard,
+            [this,
+             shard = fetch.shard,
+             min_fetch_bytes,
+             foreign_read,
+             configs = fetch.requests.copy(),
+             &octx](cluster::partition_manager& mgr) mutable
+            -> ss::future<fetch_worker::worker_result> {
+                // Although this and octx are captured by reference across
+                // shards it is safe since they are not modified by any shard
+                // for the duration of the capture and they are protected from
+                // deletion for the duration of the capture by a gate. Both are
+                // used immediately on the foreign shard to access data local to
+                // that shard. This is meant to help avoiding unintended cross
+                // shard access.
+                return ss::do_with(
+                  fetch_worker(fetch_worker::shard_local_fetch_context{
+                    .foreign_read = foreign_read,
+                    .bytes_left = octx.bytes_left,
+                    .min_bytes = min_fetch_bytes,
+                    .deadline = octx.deadline,
+                    .requests = std::move(configs),
+                    .srv = octx.rctx.server().local(),
+                    .mgr = mgr,
+                    .as = _worker_aborts[shard],
+                  }),
+                  [](auto& worker) { return worker.run(); });
+            });
+
+        fill_fetch_responses(
+          octx,
+          std::move(results.read_results),
+          fetch.responses,
+          fetch.start_time,
+          false);
+
+        octx.rctx.probe().record_fetch_latency(
+          results.first_run_latency_result);
+
+        _last_result_size[fetch.shard] = results.total_size;
+        _completed_shard_fetches.push_back(std::move(fetch));
+        _has_progress.signal();
+    }
+
+    static ss::future<> ignore_exceptions(ss::future<> fut) {
+        return fut.handle_exception([](const std::exception_ptr&) {});
+    }
+
+    ss::future<> handle_exceptions(ss::future<> f) {
+        try {
+            co_await std::move(f);
+        } catch (const seastar::timed_out_error& e) {
+            // This exception can occur when the max allowable time for a fetch
+            // has passed.
+            vlog(klog.info, "timed out error: {}", e);
+        } catch (const std::system_error& e) {
+            if (net::is_reconnect_error(e)) {
+                // This exception commonly occurs when clients disconnect.
+                vlog(klog.info, "reconnect error: {}", e);
+            } else {
+                _thrown_exception = std::current_exception();
+            }
+        } catch (const seastar::named_semaphore_aborted& e) {
+            // This exception commonly occurs when the handler is aborted.
+            vlog(klog.info, "semaphore aborted error: {}", e);
+        } catch (...) {
+            _thrown_exception = std::current_exception();
+        }
+    }
+
+    ss::gate _workers_gate;
+    std::unordered_map<ss::shard_id, ss::abort_source> _worker_aborts;
+    ss::condition_variable _has_progress;
+    std::vector<shard_fetch> _completed_shard_fetches;
+    std::vector<size_t> _last_result_size;
+    // If any child task throws an exception this holds on to the exception
+    // until all child tasks have been stopped and its safe to rethrow the
+    // exception.
+    std::exception_ptr _thrown_exception;
+    ss::optimized_optional<ss::abort_source::subscription> _fetch_abort_sub;
+    ss::timer<model::timeout_clock> _fetch_timeout;
 };
 
 size_t op_context::fetch_partition_count() const {
@@ -700,12 +1304,7 @@ void op_context::for_each_fetch_partition(Func&& f) const {
           request.cend(),
           [f = std::forward<Func>(f)](
             const fetch_request::const_iterator::value_type& p) {
-              auto& part = *p.partition;
-              f(fetch_session_partition{
-                .topic_partition = {p.topic->name, part.partition_index},
-                .max_bytes = part.max_bytes,
-                .fetch_offset = part.fetch_offset,
-              });
+              f(fetch_session_partition(p.topic->name, *p.partition));
           });
     } else {
         std::for_each(
@@ -723,87 +1322,136 @@ class simple_fetch_planner final : public fetch_planner::impl {
 
         plan.reserve_from_partition_count(octx.fetch_partition_count());
 
+        const auto client_address = octx.rctx.connection()->local_address();
+
         /**
          * group fetch requests by shard
          */
-        octx.for_each_fetch_partition([&resp_it,
-                                       &octx,
-                                       &plan,
-                                       &bytes_left_in_plan](
-                                        const fetch_session_partition& fp) {
-            // if this is not an initial fetch we are allowed to skip
-            // partions that aleready have an error or we have enough data
-            if (!octx.initial_fetch) {
-                bool has_enough_data = !resp_it->empty()
-                                       && octx.over_min_bytes();
+        octx.for_each_fetch_partition(
+          [&resp_it, &octx, &plan, &bytes_left_in_plan, &client_address](
+            const fetch_session_partition& fp) {
+              // if this is not an initial fetch we are allowed to skip
+              // partions that aleready have an error or we have enough data
+              if (!octx.initial_fetch) {
+                  bool has_enough_data = !resp_it->empty()
+                                         && octx.over_min_bytes();
 
-                if (resp_it->has_error() || has_enough_data) {
-                    ++resp_it;
-                    return;
-                }
-            }
+                  if (resp_it->has_error() || has_enough_data) {
+                      ++resp_it;
+                      return;
+                  }
+              }
 
-            /**
-             * if not authorized do not include into a plan
-             */
-            if (!octx.rctx.authorized(
-                  security::acl_operation::read,
-                  fp.topic_partition.get_topic())) {
-                resp_it->set(make_partition_response_error(
-                  fp.topic_partition.get_partition(),
-                  error_code::topic_authorization_failed));
-                ++resp_it;
-                return;
-            }
+              // We audit successful messages only on the initial fetch
+              audit_on_success audit{octx.initial_fetch};
 
-            auto& tp = fp.topic_partition;
+              /**
+               * if not authorized do not include into a plan
+               */
+              if (!octx.rctx.authorized(
+                    security::acl_operation::read,
+                    fp.topic_partition.get_topic(),
+                    audit)) {
+                  resp_it->set(make_partition_response_error(
+                    fp.topic_partition.get_partition(),
+                    error_code::topic_authorization_failed));
+                  ++resp_it;
+                  return;
+              }
 
-            auto shard = octx.rctx.shards().shard_for(tp);
-            if (unlikely(!shard)) {
-                // there is given partition in topic metadata, return
-                // unknown_topic_or_partition error
+              /**
+               * in sanction mode (without an enterprise license), the audit log
+               * topic is not consumable
+               */
+              if (unlikely(
+                    octx.rctx.feature_table().local().should_sanction()
+                    && fp.topic_partition.get_topic()
+                         == model::kafka_audit_logging_topic)) {
+                  thread_local static ss::logger::rate_limit rate(1s);
+                  vloglr(
+                    klog,
+                    ss::log_level::warn,
+                    rate,
+                    "{}",
+                    features::enterprise_error_message::audit_log_fetch());
+                  resp_it->set(make_partition_response_error(
+                    fp.topic_partition.get_partition(),
+                    error_code::unknown_server_error));
+                  ++resp_it;
+                  return;
+              }
 
-                /**
-                 * no shard is found on current node, but topic exists in
-                 * cluster metadata, this mean that the partition was
-                 * moved but consumer has not updated its metadata yet. we
-                 * return not_leader_for_partition error to force metadata
-                 * update.
-                 */
-                auto ec = octx.rctx.metadata_cache().contains(tp.to_ntp())
-                            ? error_code::not_leader_for_partition
-                            : error_code::unknown_topic_or_partition;
-                resp_it->set(make_partition_response_error(
-                  fp.topic_partition.get_partition(), ec));
-                ++resp_it;
-                return;
-            }
+              auto& tp = fp.topic_partition;
+              auto tn_view = tp.as_tn_view();
+              const auto& metadata_cache = octx.rctx.metadata_cache();
+              auto partition_id = tp.get_partition();
 
-            auto fetch_md = octx.rctx.get_fetch_metadata_cache().get(tp);
-            auto max_bytes = std::min(bytes_left_in_plan, size_t(fp.max_bytes));
-            /**
-             * If offset is greater, assume that fetch will read max_bytes
-             */
-            if (fetch_md && fetch_md->high_watermark > fp.fetch_offset) {
-                bytes_left_in_plan -= max_bytes;
-            }
+              if (unlikely(metadata_cache.is_disabled(tn_view, partition_id))) {
+                  resp_it->set(make_partition_response_error(
+                    partition_id, error_code::replica_not_available));
+                  ++resp_it;
+                  return;
+              }
 
-            fetch_config config{
-              .start_offset = fp.fetch_offset,
-              .max_offset = model::model_limits<model::offset>::max(),
-              .max_bytes = max_bytes,
-              .timeout = octx.deadline.value_or(model::no_timeout),
-              .current_leader_epoch = fp.current_leader_epoch,
-              .isolation_level = octx.request.data.isolation_level,
-              .strict_max_bytes = octx.response_size > 0,
-              .skip_read = bytes_left_in_plan == 0 && max_bytes == 0,
-              .read_from_follower = octx.request.has_rack_id(),
-              .consumer_rack_id = octx.request.data.rack_id,
-            };
+              if (unlikely(metadata_cache.should_reject_reads(tn_view))) {
+                  resp_it->set(make_partition_response_error(
+                    partition_id, error_code::invalid_topic_exception));
+                  ++resp_it;
+                  return;
+              }
 
-            plan.fetches_per_shard[*shard].push_back({tp, config}, &(*resp_it));
-            ++resp_it;
-        });
+              auto shard = octx.rctx.shards().shard_for(tp);
+              if (unlikely(!shard)) {
+                  // there is given partition in topic metadata, return
+                  // unknown_topic_or_partition error
+
+                  /**
+                   * no shard is found on current node, but topic exists in
+                   * cluster metadata, this mean that the partition was
+                   * moved but consumer has not updated its metadata yet. we
+                   * return not_leader_for_partition error to force metadata
+                   * update.
+                   */
+                  auto ec = metadata_cache.contains(tp.to_ntp())
+                              ? error_code::not_leader_for_partition
+                              : error_code::unknown_topic_or_partition;
+                  resp_it->set(make_partition_response_error(partition_id, ec));
+                  ++resp_it;
+                  return;
+              }
+
+              auto fetch_md = octx.rctx.get_fetch_metadata_cache().get(tp);
+              auto max_bytes = std::min(
+                bytes_left_in_plan, size_t(fp.max_bytes));
+              /**
+               * If offset is greater, assume that fetch will read max_bytes
+               */
+              if (fetch_md && fetch_md->high_watermark > fp.fetch_offset) {
+                  bytes_left_in_plan -= max_bytes;
+              }
+
+              fetch_config config{
+                .start_offset = fp.fetch_offset,
+                .max_offset = model::model_limits<model::offset>::max(),
+                .max_bytes = max_bytes,
+                .timeout = octx.deadline.value_or(model::no_timeout),
+                .current_leader_epoch = fp.current_leader_epoch,
+                .isolation_level = octx.request.data.isolation_level,
+                .strict_max_bytes = octx.response_size > 0,
+                .skip_read = bytes_left_in_plan == 0 && max_bytes == 0,
+                .read_from_follower = octx.request.has_rack_id(),
+                .consumer_rack_id = octx.request.has_rack_id()
+                                      ? std::make_optional(
+                                          octx.request.data.rack_id)
+                                      : std::nullopt,
+                .abort_source = octx.rctx.abort_source(),
+                .client_address = model::client_address_t{client_address},
+              };
+
+              plan.fetches_per_shard[*shard].push_back(
+                {tp, std::move(config)}, &(*resp_it));
+              ++resp_it;
+          });
         return plan;
     }
 };
@@ -831,7 +1479,6 @@ class simple_fetch_planner final : public fetch_planner::impl {
  * response must be reassembled such that the responses appear in these
  * order as the partitions in the request.
  */
-
 static ss::future<> fetch_topic_partitions(op_context& octx) {
     auto planner = make_fetch_planner<simple_fetch_planner>();
 
@@ -859,6 +1506,37 @@ kafka::fetch_plan make_simple_fetch_plan(op_context& octx) {
 }
 } // namespace testing
 
+namespace {
+ss::future<> do_fetch(op_context& octx) {
+    switch (config::shard_local_cfg().fetch_read_strategy) {
+    case model::fetch_read_strategy::polling: {
+        // first fetch, do not wait
+        co_await fetch_topic_partitions(octx).then([&octx] {
+            return ss::do_until(
+              [&octx] { return octx.should_stop_fetch(); },
+              [&octx] { return fetch_topic_partitions(octx); });
+        });
+    } break;
+    case model::fetch_read_strategy::non_polling:
+    case model::fetch_read_strategy::non_polling_with_pid:
+    case model::fetch_read_strategy::non_polling_with_debounce: {
+        auto planner = make_fetch_planner<simple_fetch_planner>();
+        auto fetch_plan = planner.create_plan(octx);
+
+        nonpolling_fetch_plan_executor executor;
+        co_await executor.execute_plan(octx, std::move(fetch_plan));
+    } break;
+    default: {
+        vassert(false, "not implemented");
+    } break;
+    }
+}
+} // namespace
+
+namespace testing {
+ss::future<> do_fetch(op_context& octx) { return ::kafka::do_fetch(octx); }
+} // namespace testing
+
 template<>
 ss::future<response_ptr>
 fetch_handler::handle(request_context rctx, ss::smp_service_group ssg) {
@@ -876,15 +1554,21 @@ fetch_handler::handle(request_context rctx, ss::smp_service_group ssg) {
                   octx.response.data.error_code = octx.session_ctx.error();
                   return std::move(octx).send_response();
               }
+              if (unlikely(octx.rctx.recovery_mode_enabled())) {
+                  octx.response.data.error_code = error_code::policy_violation;
+                  return std::move(octx).send_response();
+              }
               octx.response.data.error_code = error_code::none;
-              // first fetch, do not wait
-              return fetch_topic_partitions(octx)
-                .then([&octx] {
-                    return ss::do_until(
-                      [&octx] { return octx.should_stop_fetch(); },
-                      [&octx] { return fetch_topic_partitions(octx); });
-                })
-                .then([&octx] { return std::move(octx).send_response(); });
+              return do_fetch(octx).then([&octx] {
+                  // NOTE: Audit call doesn't happen until _after_ the fetch
+                  // is done. This was done for the sake of simplicity and
+                  // because fetch doesn't alter the state of the broker
+                  if (!octx.rctx.audit()) {
+                      return std::move(octx).send_error_response(
+                        error_code::broker_not_available);
+                  }
+                  return std::move(octx).send_response();
+              });
           });
       });
 }
@@ -923,9 +1607,8 @@ op_context::op_context(request_context&& ctx, ss::smp_service_group ssg)
 
 // insert and reserve space for a new topic in the response
 void op_context::start_response_topic(const fetch_request::topic& topic) {
-    auto& p = response.data.topics.emplace_back(
+    response.data.topics.emplace_back(
       fetchable_topic_response{.name = topic.name});
-    p.partitions.reserve(topic.fetch_partitions.size());
 }
 
 void op_context::start_response_partition(const fetch_request::partition& p) {
@@ -1055,8 +1738,6 @@ ss::future<response_ptr> op_context::send_response() && {
         if (it->is_new_topic) {
             final_response.data.topics.emplace_back(
               fetchable_topic_response{.name = it->partition->name});
-            final_response.data.topics.back().partitions.reserve(
-              it->partition->partitions.size());
         }
 
         fetch_response::partition_response r{
@@ -1074,6 +1755,19 @@ ss::future<response_ptr> op_context::send_response() && {
     }
 
     return rctx.respond(std::move(final_response));
+}
+
+ss::future<response_ptr> op_context::send_error_response(error_code ec) && {
+    fetch_response resp;
+    resp.data.error_code = ec;
+
+    if (session_ctx.is_sessionless()) {
+        resp.data.session_id = invalid_fetch_session_id;
+    } else {
+        resp.data.session_id = session_ctx.session()->id();
+    }
+
+    return rctx.respond(std::move(resp));
 }
 
 op_context::response_placeholder::response_placeholder(
@@ -1167,8 +1861,21 @@ std::optional<model::node_id> rack_aware_replica_selector::select_replica(
         if (!replica.is_alive) {
             continue;
         }
+
+        const auto node_it = _md_cache.nodes().find(replica.id);
+        /**
+         * Skip nodes which are in maintenance mode or we do not have
+         * information about them
+         */
         if (
-          _md_cache.get_node_rack_id(replica.id) == c_info.rack_id
+          node_it == _md_cache.nodes().end()
+          || node_it->second.state.get_maintenance_state()
+               == model::maintenance_state::active) {
+            continue;
+        }
+
+        if (
+          node_it->second.broker.rack() == c_info.rack_id
           && replica.log_end_offset >= c_info.fetch_offset) {
             if (replica.high_watermark >= highest_hw) {
                 highest_hw = replica.high_watermark;
@@ -1186,7 +1893,7 @@ std::optional<model::node_id> rack_aware_replica_selector::select_replica(
 }
 
 std::ostream& operator<<(std::ostream& o, const consumer_info& ci) {
-    fmt::print(o, "rack_id: {}, fetch_offset: {}", ci);
+    fmt::print(o, "rack_id: {}, fetch_offset: {}", ci.rack_id, ci.fetch_offset);
     return o;
 }
 } // namespace kafka

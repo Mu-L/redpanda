@@ -11,7 +11,9 @@
 
 #pragma once
 
-#include "cluster/types.h"
+#include "cluster/version.h"
+
+#include <cstdint>
 
 namespace features {
 
@@ -106,7 +108,7 @@ public:
     const feature_spec& spec;
 
     feature_state(const feature_spec& spec_)
-      : spec(spec_){};
+      : spec(spec_) {};
 
     // External inputs
     void notify_version(cluster::cluster_version v);

@@ -29,7 +29,28 @@ formatter = logging.Formatter(fmt_string)
 for h in logging.getLogger().handlers:
     h.setFormatter(formatter)
 
-COMMON_TEST_ARGS = ["--blocked-reactor-notify-ms 2000000"]
+COMMON_TEST_ARGS = [
+    "--blocked-reactor-notify-ms 2000000",
+    "--abort-on-seastar-bad-alloc",
+]
+
+
+def find_vbuild_path_from_binary(binary_path, num_subdirs=1):
+    """
+    Return the absolute path to the vbuild directory by extracting it from a
+    binary's path.
+
+    Optionally also include num_subdirs subdirectory components.
+    """
+    path_parts = binary_path.split("/")
+    try:
+        vbuild = "/".join(path_parts[0:path_parts.index("vbuild") +
+                                     num_subdirs])
+    except (ValueError, IndexError):
+        sys.stderr.write(
+            f"Could not find vbuild in binary path {binary_path}\n")
+        return
+    return vbuild
 
 
 class BacktraceCapture(threading.Thread):
@@ -131,14 +152,8 @@ class BacktraceCapture(threading.Thread):
             return ci_location
 
         # Workstation: find our build directory by searching back from binary
-        path_parts = self.binary.split("/")
-        try:
-            vbuild = "/".join(path_parts[0:path_parts.index("vbuild") + 3])
-        except (ValueError, IndexError):
-            sys.stderr.write(
-                f"Could not find vbuild in binary path {self.binary}\n")
-            return
-        else:
+        vbuild = find_vbuild_path_from_binary(self.binary, 5)
+        if vbuild:
             location = os.path.join(
                 vbuild,
                 "v_deps_build/seastar-prefix/src/seastar/scripts/seastar-addr2line"
@@ -176,14 +191,15 @@ class BacktraceCapture(threading.Thread):
 
 
 class TestRunner():
-    def __init__(self, prepare_command, post_command, binary, repeat,
-                 copy_files, *args):
+    def __init__(self, root, prepare_command, post_command, binary, repeat,
+                 copy_files, gtest, *args):
         self.prepare_command = prepare_command
         self.post_command = post_command
         self.binary = binary
         self.repeat = repeat if repeat is not None else 1
         self.copy_files = copy_files
-        self.root = "/dev/shm/vectorized_io"
+        self.gtest = gtest
+        self.root = root
         os.makedirs(self.root, exist_ok=True)
 
         # make args a list
@@ -227,8 +243,22 @@ class TestRunner():
                 args = args + unit_args
             else:
                 args = args + ["--"] + unit_args
+
+            # gtest doesn't understand the `--` protocol
+            if self.gtest:
+                args = [arg for arg in args if arg != "--"]
+
         elif "rpbench" in binary:
-            args = args + COMMON_TEST_ARGS
+            json_output = []
+            vbuild = find_vbuild_path_from_binary(self.binary)
+            bench_name = os.path.basename(self.binary)
+            if vbuild:
+                json_output = [
+                    "--json-output",
+                    os.path.join(vbuild, f"microbench/{bench_name}.json")
+                ]
+
+            args = args + COMMON_TEST_ARGS + json_output
         # aggregated args for test
         self.test_args = " ".join(args)
 
@@ -268,7 +298,7 @@ class TestRunner():
         env["BOOST_TEST_CATCH_SYSTEM_ERRORS"] = "no"
         env["BOOST_TEST_REPORT_LEVEL"] = "no"
         env["BOOST_LOGGER"] = "HRF,test_suite"
-        env["UBSAN_OPTIONS"] = "halt_on_error=1:abort_on_error=1"
+        env["UBSAN_OPTIONS"] = "halt_on_error=1:abort_on_error=1:report_error_type=1"
         env["ASAN_OPTIONS"] = "disable_coredump=0:abort_on_error=1"
 
         # FIXME: workaround for https://app.clubhouse.io/vectorized/story/897
@@ -296,7 +326,6 @@ class TestRunner():
 
         # setup llvm symbolizer. first look for location in ci, then in redpanda
         # vbuild directory. if none, then asan will look in PATH
-        env = os.environ.copy()
         llvm_symbolizer = shutil.which("llvm-symbolizer",
                                        path="/vectorized/llvm/bin")
         if llvm_symbolizer is None:
@@ -312,10 +341,15 @@ class TestRunner():
         src_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                                "..")
         lsan_suppressions = os.path.join(src_dir, "lsan_suppressions.txt")
+        ubsan_suppressions = os.path.join(src_dir, "ubsan_suppressions.txt")
         assert os.path.isfile(
             lsan_suppressions
         ), f"cannot find lsan suppressions at {lsan_suppressions}"
+        assert os.path.isfile(
+            ubsan_suppressions
+        ), f"cannot find ubsan suppressions at {ubsan_suppressions}"
         env["LSAN_OPTIONS"] = f"suppressions={lsan_suppressions}"
+        env["UBSAN_OPTIONS"] += f":suppressions={ubsan_suppressions}"
 
         # We only capture stderr because that's where backtraces go
         # FIXME: avoid usage of the unsafe shell=True if possible, or sanitized the cmd input
@@ -374,10 +408,18 @@ def main():
                             type=str,
                             action="append",
                             help='copy file to test execution directory')
+        parser.add_argument('--gtest', action='store_true')
+        parser.add_argument('--root',
+                            type=str,
+                            default=None,
+                            help="Working directory (default = cwd)")
         return parser
 
     parser = generate_options()
     options, program_options = parser.parse_known_args()
+
+    if options.root is None:
+        options.root = os.getcwd()
 
     if not options.binary:
         parser.print_help()
@@ -388,8 +430,9 @@ def main():
     logger.setLevel(getattr(logging, options.log.upper()))
     logger.info("%s *args=%s" % (options, program_options))
 
-    runner = TestRunner(options.pre, options.post, options.binary,
-                        options.repeat, options.copy_file, *program_options)
+    runner = TestRunner(options.root, options.pre, options.post,
+                        options.binary, options.repeat, options.copy_file,
+                        options.gtest, *program_options)
     runner.run()
     return 0
 

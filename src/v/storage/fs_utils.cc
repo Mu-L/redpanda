@@ -57,7 +57,7 @@ partition_path::partition_path(const ntp_config& ntpc)
 }
 
 std::optional<segment_full_path> segment_full_path::parse(
-  partition_path const& dir_part, const ss::sstring& filename) noexcept {
+  const partition_path& dir_part, const ss::sstring& filename) noexcept {
     std::optional<segment_path::metadata> file_part_opt;
     try {
         file_part_opt = segment_path::parse_segment_filename(filename);
@@ -106,7 +106,7 @@ segment_full_path segment_full_path::to_compacted_index() const {
     if (extension == ".log") {
         return with_extension(".compaction_index");
     } else if (extension == ".log.compaction.staging") {
-        return with_extension("log.compaction.compaction_index");
+        return with_extension(".log.compaction.compaction_index");
     } else {
         vassert(false, "Unexpected extension {}", extension);
     }

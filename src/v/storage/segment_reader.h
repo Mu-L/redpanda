@@ -11,13 +11,14 @@
 
 #pragma once
 
+#include "base/seastarx.h"
+#include "container/intrusive_list_helpers.h"
 #include "model/fundamental.h"
-#include "seastarx.h"
 #include "storage/file_sanitizer_types.h"
 #include "storage/fs_utils.h"
 #include "storage/types.h"
-#include "utils/intrusive_list_helpers.h"
 #include "utils/mutex.h"
+#include "utils/stream_provider.h"
 
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
@@ -32,12 +33,6 @@
 namespace storage {
 
 class segment_reader;
-
-struct stream_provider {
-    virtual ss::input_stream<char> take_stream() = 0;
-    virtual ss::future<> close() = 0;
-    virtual ~stream_provider() = default;
-};
 
 /**
  * A segment reader handle confers the right to use a file descriptor
@@ -155,7 +150,7 @@ private:
 
     // Protects open/close of _data_file, to avoid double-opening on
     // concurrent calls to get()
-    mutex _open_lock;
+    mutex _open_lock{"segment_reader::open_lock"};
 
     // This is only initialized if _data_file_refcount is greater than zero
     ss::file _data_file;

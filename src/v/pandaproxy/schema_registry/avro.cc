@@ -11,16 +11,19 @@
 
 #include "pandaproxy/schema_registry/avro.h"
 
+#include "bytes/streambuf.h"
 #include "json/allocator.h"
+#include "json/chunked_input_stream.h"
 #include "json/document.h"
-#include "json/encodings.h"
-#include "json/stringbuffer.h"
+#include "json/json.h"
 #include "json/types.h"
-#include "json/writer.h"
+#include "pandaproxy/schema_registry/compatibility.h"
 #include "pandaproxy/schema_registry/error.h"
 #include "pandaproxy/schema_registry/errors.h"
+#include "pandaproxy/schema_registry/schema_getter.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
-#include "utils/string_switch.h"
+#include "pandaproxy/schema_registry/types.h"
+#include "strings/string_switch.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/exception.hh>
@@ -30,6 +33,7 @@
 #include <avro/Compiler.hh>
 #include <avro/Exception.hh>
 #include <avro/GenericDatum.hh>
+#include <avro/Stream.hh>
 #include <avro/Types.hh>
 #include <avro/ValidSchema.hh>
 #include <boost/outcome/std_result.hpp>
@@ -40,58 +44,127 @@
 #include <rapidjson/error/en.h>
 
 #include <exception>
+#include <stack>
 #include <string_view>
+
+namespace pandaproxy::json {
+using namespace ::json;
+}
 
 namespace pandaproxy::schema_registry {
 
 namespace {
 
-bool check_compatible(avro::Node& reader, avro::Node& writer) {
+using avro_compatibility_result = raw_compatibility_result;
+
+avro_compatibility_result check_compatible(
+  avro::Node& reader, avro::Node& writer, std::filesystem::path p = {}) {
+    auto type_to_upper = [](avro::Type t) {
+        auto s = toString(t);
+        std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+        return s;
+    };
+    avro_compatibility_result compat_result;
     if (reader.type() == writer.type()) {
-        // Do a quick check first
-        if (!writer.resolve(reader)) {
-            return false;
+        // Do some quick checks first
+        // These are detectable by the blunt `resolve` check below, but we want
+        // to extract as much error info as possible.
+        if (reader.type() == avro::Type::AVRO_ARRAY) {
+            compat_result.merge(check_compatible(
+              *reader.leafAt(0), *writer.leafAt(0), p / "items"));
+        } else if (reader.hasName() && reader.name() != writer.name()) {
+            // The Avro library doesn't fully support handling schema resolution
+            // with name aliases yet. While `equalOrAliasedBy` is available,
+            // `writer.resolve(reader)` doesn't take into account the aliases.
+            // Once Avro supports name alias resolution, we should only return a
+            // name_mismatch when
+            // `!writer.name().equalOrAliasedBy(reader.name())`, however, in the
+            // meantime it is best to return a more specific error.
+            auto suffix = writer.name().equalOrAliasedBy(reader.name())
+                            ? " (alias resolution is not yet fully supported)"
+                            : "";
+            compat_result.emplace<avro_incompatibility>(
+              p / "name",
+              avro_incompatibility::Type::name_mismatch,
+              fmt::format("expected: {}{}", writer.name(), suffix));
+        } else if (
+          reader.type() == avro::Type::AVRO_FIXED
+          && reader.fixedSize() != writer.fixedSize()) {
+            compat_result.emplace<avro_incompatibility>(
+              p / "size",
+              avro_incompatibility::Type::fixed_size_mismatch,
+              fmt::format(
+                "expected: {}, found: {}",
+                writer.fixedSize(),
+                reader.fixedSize()));
+        } else if (!writer.resolve(reader)) {
+            // Everything else is an UNKNOWN error with the current path
+            compat_result.emplace<avro_incompatibility>(
+              std::move(p), avro_incompatibility::Type::unknown);
+            return compat_result;
         }
+
         if (reader.type() == avro::Type::AVRO_RECORD) {
             // Recursively check fields
+            auto fields_p = p / "fields";
             for (size_t r_idx = 0; r_idx < reader.names(); ++r_idx) {
                 size_t w_idx{0};
                 if (writer.nameIndex(reader.nameAt(int(r_idx)), w_idx)) {
-                    // schemas for fields with the same name in both records are
-                    // resolved recursively.
-                    if (!check_compatible(
-                          *reader.leafAt(int(r_idx)),
-                          *writer.leafAt(int(w_idx)))) {
-                        return false;
-                    }
-                } else if (
-                  reader.defaultValueAt(int(r_idx)).type() == avro::AVRO_NULL) {
-                    // if the reader's record schema has a field with no default
-                    // value, and writer's schema does not have a field with the
-                    // same name, an error is signalled.
+                    // schemas for fields with the same name in both records
+                    // are resolved recursively.
+                    compat_result.merge(check_compatible(
+                      *reader.leafAt(int(r_idx)),
+                      *writer.leafAt(int(w_idx)),
+                      fields_p / std::to_string(r_idx) / "type"));
+                } else {
+                    // if the reader's record schema has a field with no
+                    // default value, and writer's schema does not have a
+                    // field with the same name, an error is signalled.
+                    // For union, the default must correspond to the first
+                    // type.
+                    const auto& def = reader.defaultValueAt(int(r_idx));
 
-                    // For union, the default must correspond to the first type.
-                    // The default may be null.
-                    const auto& r_leaf = reader.leafAt(int(r_idx));
-                    if (
-                      r_leaf->type() != avro::Type::AVRO_UNION
-                      || r_leaf->leafAt(0)->type() != avro::Type::AVRO_NULL) {
-                        return false;
+                    // Note: this code is overly restrictive for null-type
+                    // fields with null defaults. This is because the Avro API
+                    // is not expressive enough to differentiate the two.
+                    // Union type field's default set to null:
+                    //   def=GenericDatum(Union(Null))
+                    // Union type field's default missing:
+                    //   def=GenericDatum(Null)
+                    // Null type field's default set to null:
+                    //   def=GenericDatum(Null)
+                    // Null type field's default missing:
+                    //   def=GenericDatum(Null)
+                    auto default_unset = !def.isUnion()
+                                         && def.type() == avro::AVRO_NULL;
+
+                    if (default_unset) {
+                        compat_result.emplace<avro_incompatibility>(
+                          fields_p / std::to_string(r_idx),
+                          avro_incompatibility::Type::
+                            reader_field_missing_default_value,
+                          reader.nameAt(r_idx));
                     }
                 }
             }
-            return true;
         } else if (reader.type() == avro::AVRO_ENUM) {
             // if the writer's symbol is not present in the reader's enum and
             // the reader has a default value, then that value is used,
             // otherwise an error is signalled.
-            if (reader.defaultValueAt(0).type() != avro::AVRO_NULL) {
-                return true;
-            }
-            for (size_t w_idx = 0; w_idx < writer.names(); ++w_idx) {
-                size_t r_idx{0};
-                if (!reader.nameIndex(writer.nameAt(int(w_idx)), r_idx)) {
-                    return false;
+            if (reader.defaultValueAt(0).type() == avro::AVRO_NULL) {
+                std::vector<std::string_view> missing;
+                for (size_t w_idx = 0; w_idx < writer.names(); ++w_idx) {
+                    size_t r_idx{0};
+                    if (const auto& n = writer.nameAt(int(w_idx));
+                        !reader.nameIndex(n, r_idx)) {
+                        missing.emplace_back(n);
+                    }
+                }
+                if (!missing.empty()) {
+                    compat_result.emplace<avro_incompatibility>(
+                      p / "symbols",
+                      avro_incompatibility::Type::missing_enum_symbols,
+                      fmt::format("[{}]", fmt::join(missing, ", ")));
                 }
             }
         } else if (reader.type() == avro::AVRO_UNION) {
@@ -103,17 +176,22 @@ bool check_compatible(avro::Node& reader, avro::Node& writer) {
             for (size_t w_idx = 0; w_idx < writer.leaves(); ++w_idx) {
                 bool is_compat = false;
                 for (size_t r_idx = 0; r_idx < reader.leaves(); ++r_idx) {
-                    if (check_compatible(
-                          *reader.leafAt(int(r_idx)),
-                          *writer.leafAt(int(w_idx)))) {
+                    if (!check_compatible(
+                           *reader.leafAt(int(r_idx)),
+                           *writer.leafAt(int(w_idx)))
+                           .has_error()) {
                         is_compat = true;
                     }
                 }
                 if (!is_compat) {
-                    return false;
+                    compat_result.emplace<avro_incompatibility>(
+                      p / std::to_string(w_idx),
+                      avro_incompatibility::Type::missing_union_branch,
+                      fmt::format(
+                        "reader union lacking writer type: {}",
+                        type_to_upper(writer.leafAt(w_idx)->type())));
                 }
             }
-            return true;
         }
     } else if (reader.type() == avro::AVRO_UNION) {
         // The first schema in the reader's union that matches the writer's
@@ -121,12 +199,21 @@ bool check_compatible(avro::Node& reader, avro::Node& writer) {
         // signalled.
         //
         // Alternatively, any schema in the reader union must match writer.
+        bool is_compat = false;
         for (size_t r_idx = 0; r_idx < reader.leaves(); ++r_idx) {
-            if (check_compatible(*reader.leafAt(int(r_idx)), writer)) {
-                return true;
+            if (!check_compatible(*reader.leafAt(int(r_idx)), writer)
+                   .has_error()) {
+                is_compat = true;
             }
         }
-        return false;
+        if (!is_compat) {
+            compat_result.emplace<avro_incompatibility>(
+              std::move(p),
+              avro_incompatibility::Type::missing_union_branch,
+              fmt::format(
+                "reader union lacking writer type: {}",
+                type_to_upper(writer.type())));
+        }
     } else if (writer.type() == avro::AVRO_UNION) {
         // If the reader's schema matches the selected writer's schema, it is
         // recursively resolved against it. If they do not match, an error is
@@ -134,13 +221,20 @@ bool check_compatible(avro::Node& reader, avro::Node& writer) {
         //
         // Alternatively, reader must match all schema in writer union.
         for (size_t w_idx = 0; w_idx < writer.leaves(); ++w_idx) {
-            if (!check_compatible(reader, *writer.leafAt(int(w_idx)))) {
-                return false;
-            }
+            compat_result.merge(
+              check_compatible(reader, *writer.leafAt(int(w_idx)), p));
         }
-        return true;
+    } else if (writer.resolve(reader) == avro::RESOLVE_NO_MATCH) {
+        compat_result.emplace<avro_incompatibility>(
+          std::move(p),
+          avro_incompatibility::Type::type_mismatch,
+          fmt::format(
+            "reader type: {} not compatible with writer type: {}",
+            type_to_upper(reader.type()),
+            type_to_upper(writer.type())));
     }
-    return writer.resolve(reader) != avro::RESOLVE_NO_MATCH;
+
+    return compat_result;
 }
 
 enum class object_type { complex, field };
@@ -148,7 +242,7 @@ enum class object_type { complex, field };
 template<object_type type>
 struct member_sorter {
     bool operator()(
-      json::Document::Member const& lhs, json::Document::Member const& rhs) {
+      const json::Document::Member& lhs, const json::Document::Member& rhs) {
         constexpr auto order = [](std::string_view name) {
             auto val = string_switch<char>(name)
                          .match("type", type == object_type::complex ? 0 : 1)
@@ -166,7 +260,7 @@ struct member_sorter {
                          .default_match(std::numeric_limits<char>::max());
             return val;
         };
-        constexpr auto as_string_view = [](json::Value const& v) {
+        constexpr auto as_string_view = [](const json::Value& v) {
             return std::string_view{v.GetString(), v.GetStringLength()};
         };
         return order(as_string_view(lhs.name))
@@ -238,6 +332,11 @@ result<void> sanitize_avro_type(
     case avro::AVRO_FIXED:
     case avro::AVRO_MAP:
         std::sort(o.begin(), o.end(), member_sorter<object_type::complex>{});
+        for (auto& i : o) {
+            if (auto res = sanitize(i.value, ctx); !res.has_value()) {
+                return res;
+            }
+        }
         break;
     case avro::AVRO_RECORD: {
         auto res = sanitize_record(o, ctx);
@@ -420,7 +519,10 @@ std::ostream& operator<<(std::ostream& os, const avro_schema_definition& def) {
 }
 
 canonical_schema_definition::raw_string avro_schema_definition::raw() const {
-    return canonical_schema_definition::raw_string{_impl.toJson(false)};
+    iobuf_ostream os;
+    _impl.toJson(os.ostream());
+    return canonical_schema_definition::raw_string{
+      json::minify(std::move(os).buf())};
 }
 
 ss::sstring avro_schema_definition::name() const {
@@ -435,52 +537,52 @@ public:
     bool insert(ss::sstring name, canonical_schema_definition def) {
         bool inserted = _names.insert(std::move(name)).second;
         if (inserted) {
-            _schemas.push_back(std::move(def).raw()());
+            _schemas.push_back(std::move(def).raw());
         }
         return inserted;
     }
-    ss::sstring flatten() {
-        return fmt::format("{}", fmt::join(_schemas, "\n"));
+    canonical_schema_definition::raw_string flatten() && {
+        iobuf out;
+        for (auto& s : _schemas) {
+            out.append(std::move(s));
+            out.append("\n", 1);
+        }
+        return canonical_schema_definition::raw_string{std::move(out)};
     }
 
 private:
     absl::flat_hash_set<ss::sstring> _names;
-    std::vector<ss::sstring> _schemas;
+    std::vector<canonical_schema_definition::raw_string> _schemas;
 };
 
 ss::future<collected_schema> collect_schema(
-  sharded_store& store,
+  schema_getter& store,
   collected_schema collected,
   ss::sstring name,
   canonical_schema schema) {
-    for (auto& ref : schema.def().refs()) {
+    for (const auto& ref : schema.def().refs()) {
         if (!collected.contains(ref.name)) {
             auto ss = co_await store.get_subject_schema(
-              std::move(ref.sub), ref.version, include_deleted::no);
+              ref.sub, ref.version, include_deleted::no);
             collected = co_await collect_schema(
-              store,
-              std::move(collected),
-              std::move(ref.name),
-              std::move(ss.schema));
+              store, std::move(collected), ref.name, std::move(ss.schema));
         }
     }
-    // NOLINTNEXTLINE(bugprone-use-after-move)
     collected.insert(std::move(name), std::move(schema).def());
     co_return std::move(collected);
 }
 
 ss::future<avro_schema_definition>
-make_avro_schema_definition(sharded_store& store, canonical_schema schema) {
+make_avro_schema_definition(schema_getter& store, canonical_schema schema) {
     std::optional<avro::Exception> ex;
     try {
         auto name = schema.sub()();
         auto schema_refs = schema.def().refs();
         auto refs = co_await collect_schema(store, {}, name, std::move(schema));
-        auto def = refs.flatten();
+        iobuf_istream sis{std::move(refs).flatten()()};
+        auto is = avro::istreamInputStream(sis.istream());
         co_return avro_schema_definition{
-          avro::compileJsonSchemaFromMemory(
-            reinterpret_cast<const uint8_t*>(def.data()), def.length()),
-          std::move(schema_refs)};
+          avro::compileJsonSchemaFromStream(*is), std::move(schema_refs)};
     } catch (const avro::Exception& e) {
         ex = e;
     }
@@ -495,12 +597,12 @@ sanitize_avro_schema_definition(unparsed_schema_definition def) {
     json::Document doc;
     constexpr auto flags = rapidjson::kParseDefaultFlags
                            | rapidjson::kParseStopWhenDoneFlag;
-    const auto& raw = def.raw()();
-    if (raw.empty()) {
+    if (def.raw()().empty()) {
         auto ec = error_code::schema_empty;
         return error_info{ec, make_error_code(ec).message()};
     }
-    doc.Parse<flags>(raw.data(), raw.size());
+    json::chunked_input_stream is{def.shared_raw()()};
+    doc.ParseStream<flags>(is);
     if (doc.HasParseError()) {
         return error_info{
           error_code::schema_invalid,
@@ -512,28 +614,35 @@ sanitize_avro_schema_definition(unparsed_schema_definition def) {
     sanitize_context ctx{.alloc = doc.GetAllocator()};
     auto res = sanitize(doc, ctx);
     if (res.has_error()) {
+        // TODO BP: Prevent this linearizaton
+        iobuf_parser p(std::move(def).raw()());
         return error_info{
           res.assume_error().code(),
-          fmt::format("{} {}", res.assume_error().message(), raw)};
+          fmt::format(
+            "{} {}",
+            res.assume_error().message(),
+            p.read_string(p.bytes_left()))};
     }
 
-    json::StringBuffer str_buf;
-    str_buf.Reserve(raw.size());
-    json::Writer<json::StringBuffer> w{str_buf};
+    json::chunked_buffer buf;
+    json::Writer<json::chunked_buffer> w{buf};
 
     if (!doc.Accept(w)) {
         return error_info{error_code::schema_invalid, "Invalid schema"};
     }
 
     return canonical_schema_definition{
-      std::string_view{str_buf.GetString(), str_buf.GetSize()},
+      canonical_schema_definition::raw_string{std::move(buf).as_iobuf()},
       schema_type::avro,
       def.refs()};
 }
 
-bool check_compatible(
-  const avro_schema_definition& reader, const avro_schema_definition& writer) {
-    return check_compatible(*reader().root(), *writer().root());
+compatibility_result check_compatible(
+  const avro_schema_definition& reader,
+  const avro_schema_definition& writer,
+  verbose is_verbose) {
+    return check_compatible(
+      *reader().root(), *writer().root(), "/")(is_verbose);
 }
 
 } // namespace pandaproxy::schema_registry

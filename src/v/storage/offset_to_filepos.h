@@ -11,12 +11,11 @@
 
 #pragma once
 
+#include "base/outcome.h"
+#include "base/seastarx.h"
 #include "model/fundamental.h"
 #include "model/record.h"
-#include "outcome.h"
-#include "seastarx.h"
 #include "storage/fwd.h"
-#include "storage/logger.h"
 
 #include <seastar/core/future-util.hh>
 #include <seastar/core/io_priority_class.hh>
@@ -42,6 +41,8 @@ public:
 
     ss::future<ss::stop_iteration> operator()(::model::record_batch batch);
 
+    // Returns the offsets corresponding to the batch end offset strictly below
+    // the target offset.
     type end_of_stream();
 
 private:
@@ -49,8 +50,7 @@ private:
     model::offset _target_last_offset;
     model::offset _prev_batch_last_offset;
     model::timestamp _prev_batch_max_timestamp;
-    size_t _accumulator;
-    size_t _prev;
+    size_t _prev_end_pos;
 };
 
 } // namespace internal
@@ -67,6 +67,10 @@ struct offset_to_file_pos_result {
 using should_fail_on_missing_offset
   = ss::bool_class<struct should_fail_on_missing_offset_tag>;
 
+// Returns the highest batch start offset that is <= the target offset.
+// The batch corresponding to this start offset may not actually exist, e.g. if
+// it was compacted away. This method may return a lower offset than the target
+// offset.
 ss::future<result<offset_to_file_pos_result>> convert_begin_offset_to_file_pos(
   model::offset begin_inclusive,
   ss::lw_shared_ptr<storage::segment> segment,
@@ -75,6 +79,7 @@ ss::future<result<offset_to_file_pos_result>> convert_begin_offset_to_file_pos(
   should_fail_on_missing_offset fail_on_missing_offset
   = should_fail_on_missing_offset::yes);
 
+// Returns the highest batch end offset that is <= the target offset.
 ss::future<result<offset_to_file_pos_result>> convert_end_offset_to_file_pos(
   model::offset end_inclusive,
   ss::lw_shared_ptr<storage::segment> segment,

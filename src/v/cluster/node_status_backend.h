@@ -10,16 +10,16 @@
  */
 #pragma once
 
-#include "cluster/members_table.h"
-#include "cluster/node_status_rpc_service.h"
+#include "base/seastarx.h"
+#include "cluster/fwd.h"
+#include "cluster/node_status_rpc_types.h"
 #include "cluster/node_status_table.h"
+#include "cluster/notification.h"
 #include "config/property.h"
-#include "features/feature_table.h"
+#include "features/fwd.h"
+#include "metrics/metrics.h"
 #include "model/metadata.h"
-#include "rpc/connection_cache.h"
-#include "rpc/types.h"
-#include "seastarx.h"
-#include "ssx/metrics.h"
+#include "rpc/connection_set.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/condition-variable.hh>
@@ -60,6 +60,11 @@ public:
 
     ss::future<> start();
     ss::future<> stop();
+    /**
+     * Resets node connection backoff. This method is called when current node
+     * receives hello request.
+     */
+    void reset_node_backoff(model::node_id id);
 
 private:
     ss::future<> drain_notifications_queue();
@@ -71,16 +76,16 @@ private:
     ss::future<> collect_and_store_updates();
     ss::future<std::vector<node_status>> collect_updates_from_peers();
 
-    result<node_status> process_reply(result<node_status_reply>);
+    result<node_status> process_reply(
+      model::node_id target_node_id, result<node_status_reply> reply);
     ss::future<node_status_reply> process_request(node_status_request);
 
     ss::future<result<node_status>>
       send_node_status_request(model::node_id, node_status_request);
 
-    ss::future<ss::shard_id>
-      maybe_create_client(model::node_id, net::unresolved_address);
+    ss::future<> maybe_create_client(model::node_id, net::unresolved_address);
 
-    void setup_metrics(ssx::metrics::metric_groups&);
+    void setup_metrics(metrics::metric_groups_base&);
 
     struct statistics {
         int64_t rpcs_sent;
@@ -107,7 +112,7 @@ private:
     config::binding<std::chrono::milliseconds> _period;
     config::binding<std::chrono::milliseconds> _max_reconnect_backoff;
     config::tls_config _rpc_tls_config;
-    ss::sharded<rpc::connection_cache> _node_connection_cache;
+    rpc::connection_set _node_connection_set;
 
     absl::flat_hash_set<model::node_id> _discovered_peers;
     ss::gate _gate;
@@ -115,12 +120,10 @@ private:
     notification_id_type _members_table_notification_handle;
 
     statistics _stats{};
-    ssx::metrics::metric_groups _metrics
-      = ssx::metrics::metric_groups::make_internal();
-    ssx::metrics::metric_groups _public_metrics
-      = ssx::metrics::metric_groups::make_public();
+    metrics::internal_metric_groups _metrics;
+    metrics::public_metric_groups _public_metrics;
 
-    ss::sharded<ss::abort_source>& _as;
+    ss::optimized_optional<ss::abort_source::subscription> _as_subscription;
     struct member_notification {
         member_notification(model::node_id id, model::membership_state state)
           : id(id)

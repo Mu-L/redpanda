@@ -11,20 +11,18 @@
 
 #pragma once
 
+#include "base/seastarx.h"
 #include "cluster/fwd.h"
 #include "pandaproxy/fwd.h"
 #include "pandaproxy/rest/configuration.h"
 #include "pandaproxy/server.h"
 #include "pandaproxy/util.h"
-#include "seastarx.h"
-#include "utils/request_auth.h"
+#include "utils/adjustable_semaphore.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/net/socket_defs.hh>
-
-#include <vector>
 
 namespace pandaproxy::rest {
 
@@ -56,6 +54,8 @@ private:
 
     configuration _config;
     ssx::semaphore _mem_sem;
+    adjustable_semaphore _inflight_sem;
+    config::binding<size_t> _inflight_config_binding;
     ss::gate _gate;
     ss::sharded<kafka::client::client>& _client;
     ss::sharded<kafka_client_cache>& _client_cache;

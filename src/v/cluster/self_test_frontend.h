@@ -10,12 +10,9 @@
  */
 
 #pragma once
-#include "cluster/errc.h"
 #include "cluster/fwd.h"
-#include "cluster/members_table.h"
 #include "cluster/self_test_rpc_service.h"
 #include "cluster/self_test_rpc_types.h"
-#include "config/node_config.h"
 #include "rpc/connection_cache.h"
 #include "rpc/fwd.h"
 
@@ -39,6 +36,7 @@ public:
     struct node_test_state {
         std::optional<get_status_response> response;
         self_test_status status() const;
+        self_test_stage stage() const;
     };
 
     /// Holds reported self_test results aquired from all brokers in a test

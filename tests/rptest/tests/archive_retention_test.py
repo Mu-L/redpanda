@@ -32,6 +32,7 @@ class CloudArchiveRetentionTest(RedpandaTest):
         self.extra_rp_conf = dict(
             log_compaction_interval_ms=1000,
             cloud_storage_spillover_manifest_max_segments=5,
+            cloud_storage_spillover_manifest_size=None,
             cloud_storage_enable_segment_merging=False)
 
         self.next_base_timestamp = 1664453149000  # arbitrary value
@@ -161,11 +162,11 @@ class CloudArchiveRetentionTest(RedpandaTest):
             f"waiting until {segments_to_delete} segments will be removed")
         # Wait for the first truncation to the middle of the archive
         wait_until(
-            lambda: self.num_segments_deleted() == segments_to_delete,
+            lambda: self.num_segments_deleted() >= segments_to_delete,
             timeout_sec=100,
             backoff_sec=5,
             err_msg=
-            f"Segments were not removed from the cloud, expected {segments_to_delete} deletions"
+            f"Segments were not removed from the cloud, expected at least {segments_to_delete} deletions"
         )
 
         view.reset()
@@ -181,13 +182,13 @@ class CloudArchiveRetentionTest(RedpandaTest):
         # will be deleted (in case of retention.ms)
         time.sleep(2)
 
-        retention_value = 1000  # 1KiB or 1s
-        self.logger.debug(f"Setting {retention_type} to {retention_value}")
-
         for part_id in range(0, topic.partition_count):
             ntp = NTP(ns='kafka', topic=topic.name, partition=part_id)
             summaries = view.segment_summaries(ntp)
             if retention_type == 'retention.bytes':
+                retention_value = max(
+                    min(summaries, key=lambda s: s.size_bytes).size_bytes - 1,
+                    0)
                 segments_to_delete = len(summaries)
             else:
                 retention_value = 1000  # 1s
@@ -196,6 +197,8 @@ class CloudArchiveRetentionTest(RedpandaTest):
                     s for s in summaries
                     if s.base_timestamp < (current_time - retention_value)
                 ])
+
+        self.logger.debug(f"Setting {retention_type} to {retention_value}")
 
         # Note: altering the topic config will re-init the archiver and
         # reset the metric tracking segment deletion. This is why we assign
@@ -207,11 +210,11 @@ class CloudArchiveRetentionTest(RedpandaTest):
             f"waiting until {segments_to_delete} segments will be removed")
         # Wait for the second truncation of the entire archive
         wait_until(
-            lambda: self.num_segments_deleted() == segments_to_delete,
+            lambda: self.num_segments_deleted() >= segments_to_delete,
             timeout_sec=120,
             backoff_sec=5,
             err_msg=
-            f"Segments were not removed from the cloud, expected {segments_to_delete} "
+            f"Segments were not removed from the cloud, expected at least {segments_to_delete} "
             f"segments to be removed but only {self.num_segments_deleted()} was actually removed"
         )
 

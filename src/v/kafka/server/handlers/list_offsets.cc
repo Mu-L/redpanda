@@ -12,15 +12,18 @@
 #include "cluster/metadata_cache.h"
 #include "cluster/partition_manager.h"
 #include "cluster/shard_table.h"
+#include "container/fragmented_vector.h"
+#include "kafka/data/partition_proxy.h"
+#include "kafka/data/replicated_partition.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/server/errors.h"
 #include "kafka/server/handlers/details/leader_epoch.h"
-#include "kafka/server/partition_proxy.h"
-#include "kafka/server/replicated_partition.h"
 #include "kafka/server/request_context.h"
 #include "kafka/server/response.h"
+#include "model/fundamental.h"
 #include "model/namespace.h"
 #include "resource_mgmt/io_priority.h"
+#include "ssx/when_all.h"
 
 namespace kafka {
 
@@ -128,11 +131,25 @@ static ss::future<list_offset_partition_response> list_offsets_partition(
           offset,
           kafka_partition->leader_epoch());
     }
+    auto min_offset = kafka_partition->start_offset();
+    auto max_offset = model::prev_offset(offset);
+
+    // Empty partition.
+    if (max_offset < min_offset) {
+        co_return list_offsets_response::make_partition(
+          ktp.get_partition(),
+          model::timestamp(-1),
+          model::offset(-1),
+          kafka_partition->leader_epoch());
+    }
+
     auto res = co_await kafka_partition->timequery(storage::timequery_config{
+      min_offset,
       timestamp,
-      offset,
+      max_offset,
       kafka_read_priority(),
-      {model::record_batch_type::raft_data}});
+      {model::record_batch_type::raft_data},
+      octx.rctx.abort_source().local()});
     auto id = ktp.get_partition();
     if (res) {
         co_return list_offsets_response::make_partition(
@@ -177,8 +194,12 @@ static ss::future<list_offset_partition_response> list_offsets_partition(
 
 static ss::future<list_offset_topic_response>
 list_offsets_topic(list_offsets_ctx& octx, list_offset_topic& topic) {
-    std::vector<ss::future<list_offset_partition_response>> partitions;
+    chunked_vector<ss::future<list_offset_partition_response>> partitions;
     partitions.reserve(topic.partitions.size());
+
+    const auto* disabled_set
+      = octx.rctx.metadata_cache().get_topic_disabled_set(
+        model::topic_namespace_view{model::kafka_namespace, topic.name});
 
     for (auto& part : topic.partitions) {
         if (octx.request.duplicate_tp(topic.name, part.partition_index)) {
@@ -200,23 +221,34 @@ list_offsets_topic(list_offsets_ctx& octx, list_offset_topic& topic) {
             continue;
         }
 
+        if (disabled_set && disabled_set->is_disabled(part.partition_index)) {
+            partitions.push_back(
+              ss::make_ready_future<list_offset_partition_response>(
+                list_offsets_response::make_partition(
+                  part.partition_index, error_code::replica_not_available)));
+            continue;
+        }
+
         auto pr = list_offsets_partition(octx, part.timestamp, topic, part);
         partitions.push_back(std::move(pr));
     }
 
-    return when_all_succeed(partitions.begin(), partitions.end())
+    return ssx::when_all_succeed<
+             chunked_vector<list_offset_partition_response>>(
+             std::move(partitions))
       .then([name = std::move(topic.name)](
-              std::vector<list_offset_partition_response> parts) mutable {
+              chunked_vector<list_offset_partition_response> parts) mutable {
           return list_offset_topic_response{
             .name = std::move(name),
-            .partitions = std::move(parts),
-          };
+            .partitions = chunked_vector<list_offset_partition_response>{
+              std::make_move_iterator(parts.begin()),
+              std::make_move_iterator(parts.end())}};
       });
 }
 
-static std::vector<ss::future<list_offset_topic_response>>
+static chunked_vector<ss::future<list_offset_topic_response>>
 list_offsets_topics(list_offsets_ctx& octx) {
-    std::vector<ss::future<list_offset_topic_response>> topics;
+    chunked_vector<ss::future<list_offset_topic_response>> topics;
     topics.reserve(octx.request.data.topics.size());
 
     for (auto& topic : octx.request.data.topics) {
@@ -234,7 +266,7 @@ static void handle_unauthorized(list_offsets_ctx& octx) {
     octx.response.data.topics.reserve(
       octx.response.data.topics.size() + octx.unauthorized_topics.size());
     for (auto& topic : octx.unauthorized_topics) {
-        std::vector<list_offset_partition_response> partitions;
+        chunked_vector<list_offset_partition_response> partitions;
         partitions.reserve(topic.partitions.size());
         for (auto& partition : topic.partitions) {
             partitions.push_back(list_offset_partition_response(
@@ -257,6 +289,22 @@ list_offsets_handler::handle(request_context ctx, ss::smp_service_group ssg) {
     request.compute_duplicate_topics();
     log_request(ctx.header(), request);
 
+    if (unlikely(ctx.recovery_mode_enabled())) {
+        list_offsets_response response;
+        response.data.topics.reserve(request.data.topics.size());
+        for (const auto& t : request.data.topics) {
+            chunked_vector<list_offset_partition_response> partitions;
+            partitions.reserve(t.partitions.size());
+            for (const auto& p : t.partitions) {
+                partitions.push_back(list_offsets_response::make_partition(
+                  p.partition_index, error_code::policy_violation));
+            }
+            response.data.topics.push_back(list_offset_topic_response{
+              .name = t.name, .partitions = std::move(partitions)});
+        }
+        return ctx.respond(std::move(response));
+    }
+
     auto unauthorized_it = std::partition(
       request.data.topics.begin(),
       request.data.topics.end(),
@@ -264,20 +312,44 @@ list_offsets_handler::handle(request_context ctx, ss::smp_service_group ssg) {
           return ctx.authorized(security::acl_operation::describe, topic.name);
       });
 
+    if (!ctx.audit()) {
+        list_offsets_response resp;
+        std::transform(
+          request.data.topics.begin(),
+          request.data.topics.end(),
+          std::back_inserter(resp.data.topics),
+          [](const list_offset_topic& t) {
+              chunked_vector<list_offset_partition_response> resp;
+              resp.reserve(t.partitions.size());
+              for (const auto& p : t.partitions) {
+                  resp.emplace_back(list_offset_partition_response{
+                    .partition_index = p.partition_index,
+                    .error_code = error_code::broker_not_available});
+              }
+
+              return list_offset_topic_response{
+                .name = t.name, .partitions = std::move(resp)};
+          });
+        return ctx.respond(std::move(resp));
+    }
+
     std::vector<list_offset_topic> unauthorized_topics(
       std::make_move_iterator(unauthorized_it),
       std::make_move_iterator(request.data.topics.end()));
 
-    request.data.topics.erase(unauthorized_it, request.data.topics.end());
+    request.data.topics.erase_to_end(unauthorized_it);
 
     list_offsets_ctx octx(
       std::move(ctx), std::move(request), ssg, std::move(unauthorized_topics));
 
     return ss::do_with(std::move(octx), [](list_offsets_ctx& octx) {
         auto topics = list_offsets_topics(octx);
-        return when_all_succeed(topics.begin(), topics.end())
-          .then([&octx](std::vector<list_offset_topic_response> topics) {
-              octx.response.data.topics = std::move(topics);
+        return ssx::when_all_succeed<
+                 chunked_vector<list_offset_topic_response>>(std::move(topics))
+          .then([&octx](chunked_vector<list_offset_topic_response> topics) {
+              octx.response.data.topics = {
+                std::make_move_iterator(topics.begin()),
+                std::make_move_iterator(topics.end())};
               handle_unauthorized(octx);
               return octx.rctx.respond(std::move(octx.response));
           });

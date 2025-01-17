@@ -9,15 +9,15 @@
 
 #include "storage/log_replayer.h"
 
+#include "base/likely.h"
+#include "base/vlog.h"
 #include "hashing/crc32c.h"
-#include "likely.h"
 #include "model/record.h"
 #include "model/record_utils.h"
 #include "storage/logger.h"
 #include "storage/parser.h"
 #include "storage/segment.h"
 #include "utils/vint.h"
-#include "vlog.h"
 
 #include <limits>
 #include <type_traits>
@@ -66,7 +66,11 @@ public:
               _header.first_timestamp, _header.max_timestamp);
             const auto physical_base_offset = _file_pos_to_end_of_batch
                                               - _header.size_bytes;
-            _seg->index().maybe_track(_header, physical_base_offset);
+            // new_broker_ts is nullopt, in the happy case the index was
+            // recovered and it's not use to set it to now, in the bad case we
+            // have no good way to recover it so just fallback to max_timestamp
+            _seg->index().maybe_track(
+              _header, std::nullopt, physical_base_offset);
             _header = {};
             co_return stop_parser::no;
         }

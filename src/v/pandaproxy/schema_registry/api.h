@@ -11,11 +11,11 @@
 
 #pragma once
 
-#include "cluster/controller_api.h"
+#include "base/seastarx.h"
 #include "kafka/client/fwd.h"
 #include "model/metadata.h"
 #include "pandaproxy/schema_registry/fwd.h"
-#include "seastarx.h"
+#include "security/fwd.h"
 
 #include <seastar/core/sharded.hh>
 
@@ -25,6 +25,10 @@ class Node;
 
 namespace cluster {
 class controller;
+}
+
+namespace schema {
+class registry;
 }
 
 namespace pandaproxy::schema_registry {
@@ -37,7 +41,8 @@ public:
       size_t max_memory,
       kafka::client::configuration& client_cfg,
       configuration& cfg,
-      std::unique_ptr<cluster::controller>&) noexcept;
+      std::unique_ptr<cluster::controller>&,
+      ss::sharded<security::audit::audit_log_manager>&) noexcept;
     ~api() noexcept;
 
     ss::future<> start();
@@ -46,6 +51,7 @@ public:
 
 private:
     friend class schema_id_validator;
+    friend class schema::registry;
     model::node_id _node_id;
     ss::smp_service_group _sg;
     size_t _max_memory;
@@ -59,6 +65,7 @@ private:
     ss::sharded<schema_id_cache> _schema_id_cache;
     ss::sharded<pandaproxy::schema_registry::service> _service;
     ss::sharded<pandaproxy::schema_registry::seq_writer> _sequencer;
+    ss::sharded<security::audit::audit_log_manager>& _audit_mgr;
 };
 
 } // namespace pandaproxy::schema_registry

@@ -26,6 +26,7 @@ public class TxUniqueKeysWorkload extends GatedWorkload {
     public String brokers;
     public String topic;
     public int partitions;
+    public float abort_probability;
   }
 
   static class Partition {
@@ -177,7 +178,8 @@ public class TxUniqueKeysWorkload extends GatedWorkload {
       boolean shouldAbort = false;
 
       if (!shouldRetry) {
-        shouldAbort = random.nextInt(3) == 0;
+        shouldAbort
+            = random.nextInt(100) < Math.round(args.abort_probability * 100);
       }
 
       var txOpId = id;
@@ -223,6 +225,7 @@ public class TxUniqueKeysWorkload extends GatedWorkload {
       try {
         if (shouldAbort) {
           log(pid, "abort");
+          producer.flush();
           producer.abortTransaction();
         } else {
           log(pid, "commit");
@@ -310,18 +313,14 @@ public class TxUniqueKeysWorkload extends GatedWorkload {
     consumer.assign(tps);
     consumer.seekToEnd(tps);
     long end = consumer.position(tp);
-    long written = -1;
-    synchronized (this) {
-      partition.endOffset = end;
-      written = partition.writtenOffset;
-    }
+    synchronized (this) { partition.endOffset = end; }
     consumer.seekToBeginning(tps);
 
     long lastOffset = -1;
     long lastOpId = -1;
     long lastTxId = -1;
 
-    while (consumer.position(tp) < end && consumer.position(tp) <= written) {
+    while (consumer.position(tp) < end) {
       synchronized (this) { partition.readPosition = consumer.position(tp); }
       ConsumerRecords<String, String> records
           = consumer.poll(Duration.ofMillis(10000));

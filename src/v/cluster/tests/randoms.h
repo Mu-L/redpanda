@@ -12,11 +12,17 @@
 #pragma once
 
 #include "cluster/health_monitor_types.h"
-#include "cluster/rm_stm.h"
+#include "cluster/partition_balancer_state.h"
+#include "cluster/partition_balancer_types.h"
+#include "cluster/producer_state.h"
+#include "cluster/rm_stm_types.h"
 #include "model/tests/randoms.h"
 #include "random/generators.h"
 #include "storage/tests/randoms.h"
 #include "test_utils/randoms.h"
+#include "utils/prefix_logger.h"
+
+#include <iterator>
 
 namespace cluster::node {
 
@@ -41,8 +47,7 @@ inline errc random_failed_errc() {
 }
 
 inline node_state random_node_state() {
-    return node_state{
-      {},
+    return {
       tests::random_named_int<model::node_id>(),
       model::random_membership_state(),
       cluster::alive(tests::random_bool())};
@@ -60,9 +65,10 @@ inline partition_status random_partition_status() {
 }
 
 inline topic_status random_topic_status() {
-    return topic_status(
-      model::random_topic_namespace(),
-      tests::random_chunked_fifo(random_partition_status));
+    auto d = tests::random_vector(random_partition_status);
+    cluster::partition_statuses_t partitions;
+    std::move(d.begin(), d.end(), std::back_inserter(partitions));
+    return {model::random_topic_namespace(), std::move(partitions)};
 }
 
 inline drain_manager::drain_status random_drain_status() {
@@ -87,8 +93,7 @@ inline node_health_report random_node_health_report() {
     return {
       tests::random_named_int<model::node_id>(),
       node::random_local_state(),
-      tests::random_chunked_fifo(random_topic_status),
-      random_ds.has_value(),
+      tests::random_chunked_vector(random_topic_status),
       random_ds};
 }
 
@@ -98,7 +103,11 @@ inline cluster_health_report random_cluster_health_report() {
       tests::random_optional(
         [] { return tests::random_named_int<model::node_id>(); }),
       tests::random_vector(random_node_state),
-      tests::random_vector(random_node_health_report)};
+      tests::random_vector([] {
+          return ss::make_foreign(
+            ss::make_lw_shared<const cluster::node_health_report>(
+              random_node_health_report()));
+      })};
 }
 
 inline partitions_filter random_partitions_filter() {
@@ -142,71 +151,91 @@ inline cluster_report_filter random_cluster_report_filter() {
       })};
 }
 
-inline rm_stm::tx_snapshot::tx_data_snapshot random_tx_data_snapshot() {
-    return rm_stm::tx_snapshot::tx_data_snapshot{
+inline cluster::tx::tx_data_snapshot random_tx_data_snapshot() {
+    return {
       model::random_producer_identity(),
       tests::random_named_int<model::tx_seq>(),
       tests::random_named_int<model::partition_id>()};
 }
 
-inline rm_stm::tx_snapshot::expiration_snapshot random_expiration_snapshot() {
-    return rm_stm::tx_snapshot::expiration_snapshot{
+inline cluster::tx::expiration_snapshot random_expiration_snapshot() {
+    return {
       model::random_producer_identity(),
-      tests::random_duration<rm_stm::duration_type>()};
+      tests::random_duration<cluster::tx::duration_type>()};
 }
 
-inline rm_stm::prepare_marker random_prepare_marker() {
+inline cluster::tx::prepare_marker random_prepare_marker() {
     return {
       tests::random_named_int<model::partition_id>(),
       tests::random_named_int<model::tx_seq>(),
       model::random_producer_identity()};
 }
 
-inline rm_stm::abort_index random_abort_index() {
-    return {model::random_offset(), model::random_offset()};
+inline cluster::tx::abort_index random_abort_index() {
+    return tx::abort_index{model::random_offset(), model::random_offset()};
 }
 
-inline rm_stm::seq_cache_entry random_seq_cache_entry() {
+inline cluster::tx::deprecated_seq_entry::deprecated_seq_cache_entry
+random_seq_cache_entry() {
     return {
       random_generators::get_int<int32_t>(),
       tests::random_named_int<kafka::offset>()};
 }
 
-inline rm_stm::seq_cache_entry_v1 random_seq_cache_entry_v1() {
-    return {
-      random_generators::get_int<int32_t>(),
-      tests::random_named_int<model::offset>()};
-}
-
-inline rm_stm::seq_entry_v0 random_seq_entry_v0() {
-    return {
-      model::random_producer_identity(),
-      random_generators::get_int<int32_t>(),
-      random_generators::get_int<int64_t>()};
-}
-
-inline rm_stm::seq_entry_v1 random_seq_entry_v1() {
-    return {
-      model::random_producer_identity(),
-      random_generators::get_int<int32_t>(),
-      tests::random_named_int<model::offset>(),
-      tests::random_circular_buffer(random_seq_cache_entry_v1),
-      random_generators::get_int<int64_t>()};
-}
-
-inline rm_stm::seq_entry random_seq_entry() {
-    return {
-      model::random_producer_identity(),
-      random_generators::get_int<int32_t>(),
-      tests::random_named_int<kafka::offset>(),
-      tests::random_circular_buffer(random_seq_cache_entry),
-      random_generators::get_int<int64_t>()};
-}
-
-inline rm_stm::tx_snapshot_v3::tx_seqs_snapshot random_tx_seqs_snapshot() {
-    return {
-      model::random_producer_identity(),
-      tests::random_named_int<model::tx_seq>()};
+inline cluster::tx::deprecated_seq_entry random_seq_entry() {
+    cluster::tx::deprecated_seq_entry entry;
+    entry.pid = model::random_producer_identity(),
+    entry.seq = random_generators::get_int<int32_t>(),
+    entry.last_offset = tests::random_named_int<kafka::offset>(),
+    entry.seq_cache = tests::random_circular_buffer(random_seq_cache_entry),
+    entry.last_write_timestamp = random_generators::get_int<int64_t>();
+    return entry;
 }
 
 } // namespace cluster
+
+namespace tests {
+
+inline cluster::tx::producer_ptr random_producer_state(prefix_logger& logger) {
+    return ss::make_lw_shared<cluster::tx::producer_state>(
+      logger,
+      model::producer_identity{
+        random_generators::get_int<int64_t>(),
+        random_generators::get_int<int16_t>()},
+      random_named_int<raft::group_id>(),
+      ss::noncopyable_function<void()>{});
+}
+
+inline cluster::partition_balancer_status random_balancer_status() {
+    return random_generators::random_choice({
+      cluster::partition_balancer_status::off,
+      cluster::partition_balancer_status::starting,
+      cluster::partition_balancer_status::ready,
+      cluster::partition_balancer_status::in_progress,
+      cluster::partition_balancer_status::stalled,
+    });
+}
+
+inline cluster::partition_balancer_violations::unavailable_node
+random_unavailable_node() {
+    return {
+      tests::random_named_int<model::node_id>(),
+      model::timestamp(random_generators::get_int<int64_t>())};
+}
+
+inline cluster::partition_balancer_violations::full_node random_full_node() {
+    return {
+      tests::random_named_int<model::node_id>(),
+      random_generators::get_int<uint32_t>()};
+}
+
+inline cluster::partition_balancer_violations
+random_partition_balancer_violations() {
+    auto random_un_gen = tests::random_vector(
+      []() { return random_unavailable_node(); });
+    auto random_fn_gen = tests::random_vector(
+      []() { return random_full_node(); });
+    return {std::move(random_un_gen), std::move(random_fn_gen)};
+}
+
+} // namespace tests

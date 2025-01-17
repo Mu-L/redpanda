@@ -47,21 +47,21 @@ struct foreign_entry_fixture {
 
     foreign_entry_fixture()
       : _storage(
-        [this]() {
-            return storage::kvstore_config(
-              1_MiB,
-              config::mock_binding(10ms),
-              test_dir,
-              storage::make_sanitized_file_config());
-        },
-        [this]() {
-            return storage::log_config(
-              test_dir,
-              1_GiB,
-              ss::default_priority_class(),
-              storage::make_sanitized_file_config());
-        },
-        _feature_table) {
+          [this]() {
+              return storage::kvstore_config(
+                1_MiB,
+                config::mock_binding(10ms),
+                test_dir,
+                storage::make_sanitized_file_config());
+          },
+          [this]() {
+              return storage::log_config(
+                test_dir,
+                1_GiB,
+                ss::default_priority_class(),
+                storage::make_sanitized_file_config());
+          },
+          _feature_table) {
         _feature_table.start().get();
         _feature_table
           .invoke_on_all(
@@ -70,7 +70,7 @@ struct foreign_entry_fixture {
         _storage.start().get();
         (void)_storage.log_mgr()
           .manage(storage::ntp_config(_ntp, "test.dir"))
-          .get0();
+          .get();
     }
 
     std::vector<storage::append_result> write_n(const std::size_t n) {
@@ -82,11 +82,11 @@ struct foreign_entry_fixture {
         res.push_back(
           gen_data_record_batch_reader(n)
             .for_each_ref(get_log()->make_appender(cfg), cfg.timeout)
-            .get0());
+            .get());
         res.push_back(
           gen_config_record_batch_reader(n)
             .for_each_ref(get_log()->make_appender(cfg), cfg.timeout)
-            .get0());
+            .get());
         get_log()->flush().get();
         return res;
     }
@@ -155,25 +155,24 @@ struct foreign_entry_fixture {
 
 ss::future<raft::group_configuration>
 extract_configuration(model::record_batch_reader&& rdr) {
-    using cfgs_t = std::vector<raft::offset_configuration>;
-    return ss::do_with(cfgs_t{}, [rdr = std::move(rdr)](cfgs_t& cfgs) mutable {
-        auto wrapping_rdr = raft::details::make_config_extracting_reader(
-          model::offset(0), cfgs, std::move(rdr));
+    struct noop_consumer {
+        ss::future<ss::stop_iteration> operator()(model::record_batch&) {
+            co_return ss::stop_iteration::no;
+        }
+        int end_of_stream() { return 0; }
+    };
 
-        return model::consume_reader_to_memory(
-                 std::move(wrapping_rdr), model::no_timeout)
-          .then([&cfgs](ss::circular_buffer<model::record_batch>) {
-              BOOST_REQUIRE(!cfgs.empty());
-              return cfgs.begin()->cfg;
-          });
-    });
+    auto [_, cfgs] = co_await raft::details::for_each_ref_extract_configuration(
+      model::offset(0), std::move(rdr), noop_consumer{}, model::no_timeout);
+    BOOST_REQUIRE(!cfgs.empty());
+    co_return cfgs.begin()->cfg;
 }
 
 FIXTURE_TEST(sharing_one_reader, foreign_entry_fixture) {
     std::vector<model::record_batch_reader> copies =
       // clang-format off
       raft::details::foreign_share_n(gen_config_record_batch_reader(3),
-        ss::smp::count).get0();
+        ss::smp::count).get();
     // clang-format on
 
     BOOST_REQUIRE_EQUAL(copies.size(), ss::smp::count);
@@ -184,7 +183,7 @@ FIXTURE_TEST(sharing_one_reader, foreign_entry_fixture) {
           ss::smp::submit_to(shard, [e = std::move(copies[shard])]() mutable {
               info("extracting configuration");
               return extract_configuration(std::move(e));
-          }).get0();
+          }).get();
 
         for (auto& rni : cfg.current_config().voters) {
             BOOST_REQUIRE(
@@ -197,23 +196,24 @@ FIXTURE_TEST(sharing_one_reader, foreign_entry_fixture) {
 }
 
 FIXTURE_TEST(sharing_correcteness_test, foreign_entry_fixture) {
-    auto batches = model::test::make_random_batches(model::offset(0), 50, true);
+    auto batches
+      = model::test::make_random_batches(model::offset(0), 50, true).get();
     auto rdr = model::make_memory_record_batch_reader(std::move(batches));
-    auto refs = raft::details::share_n(std::move(rdr), 2).get0();
+    auto refs = raft::details::share_n(std::move(rdr), 2).get();
     auto shared = raft::details::foreign_share_n(
                     std::move(refs.back()), ss::smp::count)
-                    .get0();
+                    .get();
     refs.pop_back();
     auto reference_batches = model::consume_reader_to_memory(
                                std::move(refs.back()), model::no_timeout)
-                               .get0();
+                               .get();
 
     BOOST_REQUIRE_EQUAL(shared.size(), ss::smp::count);
     for (auto& copy : shared) {
         auto shared = model::consume_reader_to_memory(
                         std::move(copy), model::no_timeout)
-                        .get0();
-        for (int i = 0; i < reference_batches.size(); ++i) {
+                        .get();
+        for (size_t i = 0; i < reference_batches.size(); ++i) {
             BOOST_REQUIRE_EQUAL(shared[i], reference_batches[i]);
         }
     }
@@ -225,7 +225,7 @@ FIXTURE_TEST(copy_lots_of_readers, foreign_entry_fixture) {
         auto rdr = gen_config_record_batch_reader(1);
         share_copies = raft::details::foreign_share_n(
                          std::move(rdr), ss::smp::count)
-                         .get0();
+                         .get();
     }
     BOOST_REQUIRE_EQUAL(share_copies.size(), ss::smp::count);
 
@@ -239,7 +239,7 @@ FIXTURE_TEST(copy_lots_of_readers, foreign_entry_fixture) {
                                return extract_configuration(std::move(es));
                            });
                      })
-                     .get0();
+                     .get();
 
         cfg.for_each_voter([](const raft::vnode& rni) {
             BOOST_REQUIRE(

@@ -15,8 +15,7 @@
 #include "seastar/core/weak_ptr.hh"
 #include "ssx/semaphore.h"
 #include "storage/fwd.h"
-
-class retry_chain_logger;
+#include "utils/retry_chain_node.h"
 
 namespace cloud_storage {
 
@@ -25,6 +24,7 @@ class remote_partition;
 struct materialized_segment_state;
 class remote_segment_batch_reader;
 class partition_probe;
+class ts_read_path_probe;
 
 /// State with materialized segment and cached reader
 ///
@@ -45,7 +45,9 @@ struct materialized_segment_state {
     std::unique_ptr<remote_segment_batch_reader> borrow_reader(
       const storage::log_reader_config& cfg,
       retry_chain_logger& ctxlog,
-      partition_probe& probe);
+      partition_probe& probe,
+      ts_read_path_probe& ts_probe,
+      segment_reader_units unit);
 
     ss::future<> stop();
 
@@ -63,6 +65,8 @@ struct materialized_segment_state {
     ss::lowres_clock::time_point atime;
     /// List hook for the list of all materalized segments
     intrusive_list_hook _hook;
+    /// Set to true if the memory allocation overshot the threshold
+    bool overcommit{false};
 
     /// Removes object from list that it is part of. Used to isolate the object
     /// before stopping it, so that the stop method is only called from one

@@ -10,12 +10,17 @@
 import subprocess
 import time
 
+from rptest.clients.types import TopicSpec
+from rptest.services.admin import Admin
 from rptest.services.cluster import cluster
+from rptest.services.redpanda import SchemaRegistryConfig
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.clients.rpk import RpkTool, RpkException
 from rptest.clients.kafka_cli_tools import KafkaCliTools
 from rptest.clients.kafka_cat import KafkaCat
-from rptest.util import expect_exception
+from rptest.tests.cluster_config_test import wait_for_version_sync
+from rptest.util import expect_exception, wait_until_result
+from rptest.utils.schema_registry_utils import get_subjects
 
 from ducktape.mark import parametrize
 from ducktape.utils.util import wait_until
@@ -114,7 +119,7 @@ class InternalTopicProtectionTest(RedpandaTest):
             assert False, "Unknown client type"
 
         test_topic = "noproduce_topic"
-        self.kafka_tools.create_topic_with_config(test_topic, 1, 3, {})
+        self.kafka_tools.create_topic(TopicSpec(name=test_topic))
         partition_id = 0
 
         wait_until(lambda: test_topic in self.rpk.list_topics(),
@@ -159,7 +164,8 @@ class InternalTopicProtectionTest(RedpandaTest):
             assert False, "Unknown client type"
 
         test_topic = "nodelete_topic"
-        self.kafka_tools.create_topic_with_config(test_topic, 3, 3, {})
+        self.kafka_tools.create_topic(
+            TopicSpec(name=test_topic, partition_count=3))
 
         wait_until(lambda: test_topic in client.list_topics(),
                    timeout_sec=90,
@@ -189,3 +195,77 @@ class InternalTopicProtectionTest(RedpandaTest):
         wait_until(lambda: test_topic not in client.list_topics(),
                    timeout_sec=90,
                    backoff_sec=3)
+
+
+class InternalTopicProtectionLargeClusterTest(RedpandaTest):
+    """
+    Verifies that constraints against minimum RF do not apply against
+    internally created topics
+    """
+    def __init__(self, *args, **kwargs):
+        kwargs['num_brokers'] = 5
+        kwargs['schema_registry_config'] = SchemaRegistryConfig()
+        super().__init__(*args, extra_rp_conf={}, **kwargs)
+
+        self.rpk = RpkTool(self.redpanda)
+        self.admin = Admin(self.redpanda)
+
+    def _modify_cluster_config(self, upsert):
+        patch_result = self.admin.patch_cluster_config(upsert=upsert)
+        wait_for_version_sync(self.admin, self.redpanda,
+                              patch_result['config_version'])
+
+    def setUp(self):
+        super().setUp()
+        # Set default RF to 5
+        # Set minimum Rf to 5
+        self._modify_cluster_config({'default_topic_replications': 5})
+        self._modify_cluster_config({'minimum_topic_replications': 5})
+
+    @cluster(num_nodes=5)
+    def test_schemas_topic(self):
+        # Now access the SR, which should result in an RF of 3
+        _ = get_subjects(self.redpanda.nodes, self.logger)
+
+        topics = self.rpk.list_topics()
+        assert "_schemas" in topics, f'_schemas not in topics {topics}'
+
+        def schemas_topic_ready():
+            partitions = list(self.rpk.describe_topic('_schemas'))
+            return (len(partitions) > 0, partitions)
+
+        partitions = wait_until_result(
+            schemas_topic_ready,
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg='_schemas topic never became ready')
+        config = partitions[0]
+        assert len(
+            config.replicas
+        ) == 3, f'Expected RF of 3 for _schemas but got {len(config.replicas)}'
+
+        self.redpanda.restart_nodes(nodes=self.redpanda.nodes)
+
+        num_found = self.redpanda.count_log_node(
+            self.redpanda.nodes[0],
+            "Topic {kafka/_schemas} has a replication factor less than specified"
+        )
+        assert num_found == 0, f'Expected to find 0 messages about _schemas but found {num_found}'
+
+    @cluster(num_nodes=5)
+    def test_consumer_offset_topic(self):
+        self.rpk.create_topic("test")
+        self.rpk.produce("test", key="key1", msg="Hi there")
+        self.rpk.consume("test", group="TestGroup", n=1)
+        config = list(self.rpk.describe_topic('__consumer_offsets'))[0]
+        assert len(
+            config.replicas
+        ) == 3, f'Expected RF of 3 for __consumer_offsets but got {len(config.replicas)}'
+
+        self.redpanda.restart_nodes(nodes=self.redpanda.nodes)
+
+        num_found = self.redpanda.count_log_node(
+            self.redpanda.nodes[0],
+            "Topic {kafka/__consumer_offsets} has a replication factor less than specified"
+        )
+        assert num_found == 0, f'Expected to find 0 messages about _schemas but found {num_found}'

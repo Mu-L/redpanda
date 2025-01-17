@@ -18,12 +18,12 @@
 #include "features/fwd.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "net/unresolved_address.h"
-#include "raft/group_manager.h"
-#include "raft/types.h"
+#include "raft/fwd.h"
+#include "raft/notification.h"
 #include "rpc/fwd.h"
 #include "utils/mutex.h"
 #include "utils/retry.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/sharded.hh>
@@ -156,11 +156,11 @@ private:
     ss::chunked_fifo<ntp_leader_revision> _requests;
     std::vector<net::unresolved_address> _seed_servers;
     broker_updates_t _pending_updates;
-    mutex _lock;
+    mutex _lock{"metadata_dissemination_service"};
     ss::timer<> _dispatch_timer;
     ss::abort_source _as;
     ss::gate _bg;
-    cluster::notification_id_type _notification_handle;
+    raft::group_manager_notification_id _notification_handle;
 };
 
 } // namespace cluster

@@ -6,6 +6,7 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
+from collections import namedtuple
 import json
 import logging
 import pprint
@@ -13,7 +14,7 @@ import random
 import re
 import tempfile
 import time
-from typing import Any, NamedTuple, Protocol
+from typing import Any, List, NamedTuple, Protocol
 
 import requests
 import yaml
@@ -26,8 +27,12 @@ from rptest.clients.rpk_remote import RpkRemoteTool
 from rptest.clients.types import TopicSpec
 from rptest.services.admin import Admin
 from rptest.services.cluster import cluster
-from rptest.services.redpanda import CloudStorageType, SISettings, RESTART_LOG_ALLOW_LIST, IAM_ROLES_API_CALL_ALLOW_LIST, get_cloud_storage_type, RedpandaService
-from rptest.services.redpanda_installer import RedpandaInstaller
+from rptest.services.redpanda import (CloudStorageType, SISettings,
+                                      RESTART_LOG_ALLOW_LIST,
+                                      IAM_ROLES_API_CALL_ALLOW_LIST,
+                                      OIDC_ALLOW_LIST, get_cloud_storage_type,
+                                      RedpandaService)
+from rptest.services.redpanda_installer import RedpandaInstaller, RedpandaVersion, RedpandaVersionTriple
 from rptest.services.metrics_check import MetricCheck
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.util import expect_http_error, expect_exception, produce_until_segments
@@ -38,8 +43,12 @@ BOOTSTRAP_CONFIG = {
     'enable_idempotence': False,
 }
 
-SECRET_CONFIG_NAMES = frozenset(
-    ["cloud_storage_secret_key", "cloud_storage_azure_shared_key"])
+SECRET_CONFIG_NAMES = frozenset([
+    "cloud_storage_secret_key",
+    "cloud_storage_azure_shared_key",
+    "iceberg_rest_catalog_client_secret",
+    "iceberg_rest_catalog_token",
+])
 
 
 def check_restart_clears(admin, redpanda, nodes=None):
@@ -138,37 +147,68 @@ class ClusterConfigUpgradeTest(RedpandaTest):
         # Start node outside of the usual RedpandaService.start, so that we
         # skip writing out bootstrap.yaml files (the presence of which disables
         # the upgrade import of values from redpanda.yaml)
+        # NOTE: due to https://github.com/redpanda-data/redpanda/issues/13362
+        # only the proper name works here
         self.redpanda.start_node(
-            node, override_cfg_params={'delete_retention_ms': '9876'})
+            node, override_cfg_params={"log_retention_ms": '9876'})
 
         # On first startup, redpanda should notice the value in
         # redpanda.yaml and import it into central config store
-        assert admin.get_cluster_config()['delete_retention_ms'] == 9876
+        assert admin.get_cluster_config(
+        )["log_retention_ms"] == 9876, f"trouble with the value for log_retention_ms at first start"
 
         # On second startup, central config is already initialized,
         # so the modified value in redpanda.yaml should be ignored.
+        # NOTE: same issue as above
         self.redpanda.restart_nodes(
-            [node], override_cfg_params={'delete_retention_ms': '1234'})
-        assert admin.get_cluster_config()['delete_retention_ms'] == 9876
+            [node], override_cfg_params={"log_retention_ms": '1234'})
+
+        assert admin.get_cluster_config(
+        )["log_retention_ms"] == 9876, f"trouble with the value for log_retention_ms after restart"
         assert self.redpanda.search_log_any(
-            "Ignoring value for 'delete_retention_ms'")
+            f"Ignoring value for 'log_retention_ms'")
 
 
 class HasRedpandaAndAdmin(Protocol):
     redpanda: RedpandaService
     admin: Admin
-    logger: logging.Logger
+
+    @property
+    def logger(self) -> logging.Logger:
+        pass
+
+    def _check_value_everywhere(self, key, expect_value):
+        pass
 
 
 class ClusterConfigHelpersMixin:
     def _check_value_everywhere(self: HasRedpandaAndAdmin, key, expect_value):
-        for node in self.redpanda.nodes:
-            actual_value = self.admin.get_cluster_config(node)[key]
-            if actual_value != expect_value:
-                self.logger.error(
-                    f"Wrong value on node {node.account.hostname}: {key}={actual_value} (!={expect_value})"
-                )
-            assert self.admin.get_cluster_config(node)[key] == expect_value
+        config_versions: dict[str, int] = {}
+
+        def _check_version():
+            nonlocal config_versions
+            config_versions = {
+                status["node_id"]: status["config_version"]
+                for status in self.admin.get_cluster_config_status()
+            }
+            self.logger.debug(f"config statuses: {config_versions}")
+            # all the node have the same version iff the set contains only one element
+            return len(set(config_versions.values())) == 1
+
+        def _assert_version_msg():
+            return f"Not all the nodes are at the same config_version: {config_versions}"
+
+        # wait for config_version to be the same on all the nodes
+        wait_until(_check_version, timeout_sec=5, err_msg=_assert_version_msg)
+
+        # we expect that key is at expect_value by now
+        values = {
+            node.account.hostname: self.admin.get_cluster_config(node)[key]
+            for node in self.redpanda.nodes
+        }
+        assert all(
+            actual_value == expect_value for actual_value in values.values()
+        ), f"Wrong value on some nodes: {key}!={expect_value} in {values}"
 
     def _check_propagated_and_persistent(self: HasRedpandaAndAdmin, key,
                                          expect_value):
@@ -192,6 +232,10 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
         # it, and thereby prevents it doing a background write of a new
         # config version that would disrupt our tests.
         rp_conf['cluster_id'] = "placeholder"
+
+        # Explicitly disable metadata uploads, since some tests may mess around
+        # with cloud configs and prevent uploads from succeeding.
+        rp_conf['enable_cluster_metadata_upload_loop'] = False
 
         super(ClusterConfigTest, self).__init__(*args,
                                                 extra_rp_conf=rp_conf,
@@ -528,7 +572,7 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 # Should not succeed!
                 assert False
 
-    @cluster(num_nodes=3)
+    @cluster(num_nodes=3, log_allow_list=OIDC_ALLOW_LIST)
     def test_valid_settings(self):
         """
         Bulk exercise of all config settings & the schema endpoint:
@@ -550,20 +594,30 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
         # using the cluster
         exclude_settings = {
             'enable_sasl', 'kafka_enable_authorization',
-            'kafka_mtls_principal_mapping_rules'
+            'kafka_mtls_principal_mapping_rules', 'audit_enabled'
         }
-
-        # Don't enable coproc: it generates log errors if its companion service isn't running
-        exclude_settings.add('enable_coproc')
 
         # Don't enable schema id validation: the interdepedencies are too complex and are tested elsewhere.
         exclude_settings.add('enable_schema_id_validation')
+
+        # Don't modify oidc_discovery_url, if it's invalid, logging will break the test.
+        exclude_settings.add('oidc_discovery_url')
+
+        # Don't modify oidc_principal mapping, the value is complex and tested elsewhere.
+        exclude_settings.add('oidc_principal_mapping')
+
+        # List of settings that must be odd
+        odd_settings = [
+            'default_topic_replications', 'minimum_topic_replications'
+        ]
 
         initial_config = self.admin.get_cluster_config()
 
         for name, p in schema_properties.items():
             if name in exclude_settings:
                 continue
+
+            must_be_odd = name in odd_settings
 
             properties_require_restart |= p['needs_restart']
 
@@ -574,9 +628,15 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                     valid_value = yaml.full_load(valid_value)
             elif p['type'] == 'integer':
                 if initial_value:
-                    valid_value = initial_value * 2
+                    if must_be_odd:
+                        valid_value = initial_value * 3
+                    else:
+                        valid_value = initial_value * 2
                 else:
-                    valid_value = 100
+                    if must_be_odd:
+                        valid_value = 101
+                    else:
+                        valid_value = 100
             elif p['type'] == 'number':
                 if initial_value:
                     valid_value = float(initial_value * 2)
@@ -591,13 +651,21 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 valid_value = not initial_config[name]
             elif p['type'] == "array" and p['items']['type'] == 'string':
                 valid_value = ["custard", "cream"]
+            elif p['type'] == "leaders_preference":
+                valid_value = "racks:rack1,rack2"
             else:
                 raise NotImplementedError(f"{p['type']} in {name}")
 
             if name == 'sasl_mechanisms':
                 # The default value is ['SCRAM'], but the array cannot contain
                 # arbitrary strings because the config system validates them.
-                valid_value = ['SCRAM', 'GSSAPI']
+                valid_value = ['SCRAM', 'GSSAPI', 'OAUTHBEARER']
+
+            if name == 'http_authentication':
+                # The default value is ['BASIC'], but the array cannot contain
+                # arbitrary strings because the config system validates them.
+                # Removing BASIC breaks tests that use the admin API.
+                valid_value = ['BASIC', 'OIDC']
 
             if name == 'sasl_kerberos_principal_mapping':
                 # The default value is ['DEFAULT'], but the array must contain
@@ -605,10 +673,6 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 valid_value = [
                     'RULE:[1:$1]/L', 'RULE:[2:$1](Test.*)s/ABC///L', 'DEFAULT'
                 ]
-
-            if name == 'enable_coproc':
-                # Don't try enabling coproc, it has external dependencies
-                continue
 
             if name == 'admin_api_require_auth':
                 # Don't lock ourselves out of the admin API!
@@ -623,7 +687,24 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 # to RP's data dir for it to start
                 continue
 
+            if name == 'tombstone_retention_ms':
+                # Don't modify tombstone_retention_ms, leave it as nullopt in case of
+                # cloud storage read/write properties.
+                continue
+
             if name == 'record_key_subject_name_strategy' or name == 'record_value_subject_name_strategy':
+                valid_value = random.choice(
+                    [e for e in p['enum_values'] if e != initial_value])
+
+            if name == 'cloud_storage_recovery_topic_validation_mode':
+                valid_value = random.choice(
+                    [e for e in p['enum_values'] if e != initial_value])
+
+            if name == "tls_min_version":
+                valid_value = random.choice(
+                    [e for e in p['enum_values'] if e != initial_value])
+
+            if name == "iceberg_catalog_type":
                 valid_value = random.choice(
                     [e for e in p['enum_values'] if e != initial_value])
 
@@ -1027,11 +1108,29 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
             strval: str
             yamlval: Any
 
+        class AliasedExample(NamedTuple):
+            key: str
+            alias: str
+            strval: str
+            yamlval: Any
+
         valid_examples = [
             Example("kafka_qdc_enable", "true", True),
             Example("append_chunk_size", "32768", 32768),
             Example("superusers", "['bob','alice']", ["bob", "alice"]),
-            Example("storage_min_free_bytes", "1234567890", 1234567890)
+            Example("storage_min_free_bytes", "1234567890", 1234567890),
+            Example("kafka_memory_share_for_fetch", "0.6", 0.6)
+        ]
+
+        valid_aliased_examples = [
+            AliasedExample("data_transforms_per_core_memory_reservation",
+                           "wasm_per_core_memory_reservation", "123456789",
+                           123456789),
+            AliasedExample("cloud_storage_graceful_transfer_timeout_ms",
+                           "cloud_storage_graceful_transfer_timeout", "1024",
+                           1024),
+            AliasedExample("cloud_storage_max_segment_readers_per_shard",
+                           "cloud_storage_max_readers_per_shard", "128", 128)
         ]
 
         def yamlize(input) -> str:
@@ -1064,6 +1163,72 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
             self.logger.info(f"API readback for {e.key} '{api_readback}'")
             assert api_readback == e.yamlval
 
+        # Check that valid changes are accepted when config is set by key,
+        # and both alias and key are used for get.
+        for e in valid_aliased_examples:
+            self.logger.info(
+                f"Checking aliased {e.key}={e.alias}={e.strval} ({e.yamlval})")
+            self.rpk.cluster_config_set(e.key, e.strval)
+
+            # CLI readback should give same as we set
+            cli_readback_key = self.rpk.cluster_config_get(e.key)
+            cli_readback_alias = self.rpk.cluster_config_get(e.alias)
+
+            expect_cli_readback = yamlize(e.yamlval)
+
+            self.logger.info(
+                f"CLI readback for key '{cli_readback_key}', for alias '{cli_readback_alias}', expect '{expect_cli_readback}'"
+            )
+            assert cli_readback_key == cli_readback_alias == expect_cli_readback
+
+            # API readback should give properly structured+typed value
+            api_readback_key = self.admin.get_cluster_config(key=e.key)[e.key]
+            api_readback_alias = self.admin.get_cluster_config(
+                key=e.alias)[e.alias]
+            self.logger.info(
+                f"API readback for {e.key} '{api_readback_key}', for {e.alias} '{api_readback_alias}'"
+            )
+            assert api_readback_key == api_readback_alias == e.yamlval
+
+        #Reset valid_aliased_examples before we attempt to repeat tests by setting with alias.
+        valid_aliased_examples = [
+            AliasedExample("data_transforms_per_core_memory_reservation",
+                           "wasm_per_core_memory_reservation", "987654321",
+                           987654321),
+            AliasedExample("cloud_storage_graceful_transfer_timeout_ms",
+                           "cloud_storage_graceful_transfer_timeout", "4096",
+                           4096),
+            AliasedExample("cloud_storage_max_segment_readers_per_shard",
+                           "cloud_storage_max_readers_per_shard", "512", 512)
+        ]
+
+        # Check that valid changes are accepted when config is set by alias,
+        # and both alias and key are used for get.
+        for e in valid_aliased_examples:
+            self.logger.info(
+                f"Checking aliased {e.key}={e.alias}={e.strval} ({e.yamlval})")
+            self.rpk.cluster_config_set(e.alias, e.strval)
+
+            # CLI readback should give same as we set
+            cli_readback_key = self.rpk.cluster_config_get(e.key)
+            cli_readback_alias = self.rpk.cluster_config_get(e.alias)
+
+            expect_cli_readback = yamlize(e.yamlval)
+
+            self.logger.info(
+                f"CLI readback for key '{cli_readback_key}', for alias '{cli_readback_alias}', expect '{expect_cli_readback}'"
+            )
+            assert cli_readback_key == cli_readback_alias == expect_cli_readback
+
+            # API readback should give properly structured+typed value
+            api_readback_key = self.admin.get_cluster_config(key=e.key)[e.key]
+            api_readback_alias = self.admin.get_cluster_config(
+                key=e.alias)[e.alias]
+            self.logger.info(
+                f"API readback for {e.key} '{api_readback_key}', for {e.alias} '{api_readback_alias}'"
+            )
+            assert api_readback_key == api_readback_alias == e.yamlval
+
         # Check that the `set` command hits proper validation paths
         invalid_examples = [
             ("kafka_qdc_enable", "rhubarb"),
@@ -1079,6 +1244,21 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 self.logger.error(
                     f"Config setting {key}={strval} should have been rejected")
                 assert False
+
+        # Check that the `get` command hits proper validation paths
+        unknown_examples = [
+            "panda_size", "panda_retention_ms", "panda_mutation_rate"
+        ]
+
+        for key in unknown_examples:
+            with expect_exception(RpkException,
+                                  lambda e: "Unknown property" in str(e)):
+                self.rpk.cluster_config_get(key)
+
+        for key in unknown_examples:
+            with expect_exception(requests.exceptions.HTTPError,
+                                  lambda e: e.response.status_code == 400):
+                self.admin.get_cluster_config(key=key)
 
         # Check that resetting properties to their default via `set` works
         default_examples = [
@@ -1122,7 +1302,7 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
         # but on a non-secret property, thereby validating that our log scanning procedure
         # would have detected the secret if it had been printed
         unsecret_key = "cloud_storage_api_endpoint"
-        unsecret_value = "http://nowhere"
+        unsecret_value = "nowhere"
         set_and_search(unsecret_key, unsecret_value, True)
 
     @cluster(num_nodes=3)
@@ -1204,6 +1384,84 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 {"log_message_timestamp_type": "CreateTime"},
                 incremental=False)
 
+    ABS_STATIC_CFG = {
+        'cloud_storage_enabled': 'true',
+        'cloud_storage_azure_storage_account': 'theazureaccount',
+        'cloud_storage_azure_container': 'theazurecontainer',
+        'cloud_storage_azure_shared_key': 'aGVsbG90aGVyZQ==',
+        'cloud_storage_credentials_source': 'config_file',
+    }
+    ABS_VM_INSTANCE_METADATA = {
+        'cloud_storage_enabled': 'true',
+        'cloud_storage_azure_storage_account': 'theazureaccount',
+        'cloud_storage_azure_container': 'theazurecontainer',
+        'cloud_storage_azure_managed_identity_id':
+        '00000000-0000-0000-0000-000000000000',
+        'cloud_storage_credentials_source': 'azure_vm_instance_metadata',
+    }
+    ABS_ASK_OIDC_FEDERATION = {
+        'cloud_storage_enabled': 'true',
+        'cloud_storage_azure_storage_account': 'theazureaccount',
+        'cloud_storage_azure_container': 'theazurecontainer',
+        'cloud_storage_credentials_source': 'azure_aks_oidc_federation',
+        '__env__': {
+            # Required for AKS to function correctly, the token file is just a placeholder
+            # to make the refresh credentials system boot up.
+            'AZURE_CLIENT_ID': 'client_id',
+            'AZURE_TENANT_ID': 'tenantid',
+            'AZURE_FEDERATED_TOKEN_FILE': '/etc/hosts',
+            'AZURE_AUTHORITY_HOST': 'authority.host.com'
+        }
+    }
+
+    # We need to use a string as the value for `update`, to not trigger
+    # `OSError: [Errno 36] File name too long`
+    # caused by ducktape creating a folder for the run + parameters.
+    @cluster(
+        num_nodes=1,
+        log_allow_list=IAM_ROLES_API_CALL_ALLOW_LIST + [
+            re.compile(
+                '.*Self configuration of the cloud storage client failed.*')
+        ])
+    @matrix(update_str=[
+        'ABS_STATIC_CFG',
+        'ABS_VM_INSTANCE_METADATA',
+        'ABS_ASK_OIDC_FEDERATION',
+    ])
+    def test_abs_cloud_validation(self, update_str: str):
+        """
+        Cloud storage configuration specific for ABS. this test is similar to test_cloud_validation,
+        but config differences between S3 and ABS makes it easier to have a specific test
+        """
+        update: dict[str, Any] = getattr(self, update_str)
+        self.logger.info(f"apply {update_str}: {update}")
+
+        # AKS requires some env variables to function correctly, set it here if the key '__env__' exists, and remove it from 'update'
+        if env := update.pop('__env__', None):
+            self.redpanda.set_environment(env)
+
+        # It is invalid to enable cloud storage without its accompanying properties
+        invalid_update = {'cloud_storage_enabled': True}
+        with expect_http_error(400):
+            self.admin.patch_cluster_config(upsert=invalid_update)
+
+        # The update should not fail validation, so this request should not fail
+        patch_result = self.admin.patch_cluster_config(upsert=update)
+
+        wait_for_version_sync(self.admin, self.redpanda,
+                              patch_result['config_version'])
+
+        # Check that redpanda is able to start with this configuration (ignore connection issues due to non-existant cloud storage instance)
+        self.redpanda.restart_nodes(self.redpanda.nodes)
+
+        # Switching off cloud storage is always valid, we can leave the other
+        # properties set
+        patch_result = self.admin.patch_cluster_config(
+            upsert={'cloud_storage_enabled': False})
+        wait_for_version_sync(self.admin, self.redpanda,
+                              patch_result['config_version'])
+        self.redpanda.restart_nodes(self.redpanda.nodes)
+
     @cluster(num_nodes=3, log_allow_list=IAM_ROLES_API_CALL_ALLOW_LIST)
     def test_cloud_validation(self):
         """
@@ -1231,19 +1489,22 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 'cloud_storage_enabled': True,
                 'cloud_storage_credentials_source': 'aws_instance_metadata',
                 'cloud_storage_region': 'us-east-1',
-                'cloud_storage_bucket': 'dearliza'
+                'cloud_storage_bucket': 'dearliza',
+                'cloud_storage_url_style': 'virtual_host'
             },
             {
                 'cloud_storage_enabled': True,
                 'cloud_storage_credentials_source': 'gcp_instance_metadata',
                 'cloud_storage_region': 'us-east-1',
-                'cloud_storage_bucket': 'dearliza'
+                'cloud_storage_bucket': 'dearliza',
+                'cloud_storage_url_style': 'virtual_host'
             },
             {
                 'cloud_storage_enabled': True,
                 'cloud_storage_credentials_source': 'sts',
                 'cloud_storage_region': 'us-east-1',
-                'cloud_storage_bucket': 'dearliza'
+                'cloud_storage_bucket': 'dearliza',
+                'cloud_storage_url_style': 'virtual_host'
             },
             {
                 'cloud_storage_enabled': True,
@@ -1251,7 +1512,8 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 'cloud_storage_access_key': 'sesame',
                 'cloud_storage_credentials_source': 'config_file',
                 'cloud_storage_region': 'us-east-1',
-                'cloud_storage_bucket': 'dearliza'
+                'cloud_storage_bucket': 'dearliza',
+                'cloud_storage_url_style': 'virtual_host'
             },
         ]
         for payload in valid_updates:
@@ -1280,7 +1542,8 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
             'cloud_storage_secret_key': 'open',
             'cloud_storage_access_key': 'sesame',
             'cloud_storage_region': 'us-east-1',
-            'cloud_storage_bucket': 'dearliza'
+            'cloud_storage_bucket': 'dearliza',
+            'cloud_storage_url_style': 'virtual_host'
         }
         patch_result = self.admin.patch_cluster_config(upsert=static_config,
                                                        remove=[])
@@ -1354,6 +1617,120 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 if s['node_id'] == self.redpanda.idx(controller_node))
             assert local_status['config_version'] == config_version
 
+    @cluster(num_nodes=3)
+    @parametrize(value="http://pandazone", valid=False)
+    @parametrize(value="https://securepandazone", valid=False)
+    @parametrize(value="pandazone", valid=True)
+    def test_validate_cloud_storage_api_endpoint(self, value, valid):
+        try:
+            self.admin.patch_cluster_config(
+                upsert={"cloud_storage_api_endpoint": value})
+        except requests.exceptions.HTTPError as e:
+            #Invalid api endpoint
+            assert not valid
+            assert e.response.status_code == 400
+        else:
+            #Valid api endpoint
+            assert valid
+
+    # None for pct_value is std::nullopt, which defaults to 0.0 in the cloud cache.
+    @cluster(num_nodes=1)
+    def test_validate_cloud_storage_cache_size_config(self):
+        CloudCacheConf = namedtuple('CloudCacheConf',
+                                    ['size_value', 'pct_value', 'valid'])
+        test_cases = [
+            CloudCacheConf(size_value=0, pct_value=None, valid=False),
+            CloudCacheConf(size_value=0, pct_value=0.0, valid=False),
+            CloudCacheConf(size_value=0, pct_value=-1.0, valid=False),
+            CloudCacheConf(size_value=0, pct_value=101.0, valid=False),
+            CloudCacheConf(size_value=-1, pct_value=None, valid=False),
+            CloudCacheConf(size_value=1024, pct_value=None, valid=True),
+            CloudCacheConf(size_value=10, pct_value=50.0, valid=True),
+            CloudCacheConf(size_value=0, pct_value=0.1, valid=True)
+        ]
+
+        for size_value, pct_value, valid in test_cases:
+            upsert = {}
+            upsert["cloud_storage_cache_size"] = size_value
+            upsert["cloud_storage_cache_size_percent"] = pct_value
+
+            if valid:
+                patch_result = self.admin.patch_cluster_config(upsert=upsert)
+                new_version = patch_result['config_version']
+                wait_for_version_status_sync(self.admin, self.redpanda,
+                                             new_version)
+                updated_config = self.admin.get_cluster_config()
+                assert updated_config["cloud_storage_cache_size"] == size_value
+                assert updated_config[
+                    "cloud_storage_cache_size_percent"] == pct_value
+            else:
+                with expect_exception(requests.exceptions.HTTPError,
+                                      lambda e: e.response.status_code == 400):
+                    self.admin.patch_cluster_config(upsert=upsert)
+
+    @cluster(num_nodes=1)
+    def test_disable_bounded_property_checks(self):
+        """
+        Test that the environmental variable __REDPANDA_TEST_DISABLE_BOUNDED_PROPERTY_CHECKS
+        being set disables bounded property checks for cluster properties.
+        """
+        out_of_bound_properties = {
+            "storage_compaction_key_map_memory": 1,
+            "log_segment_size": 2,
+            "log_segment_ms": 10
+        }
+
+        # Check that these out of bounds value updates for bounded properties are properly rejected
+        with expect_exception(requests.exceptions.HTTPError,
+                              lambda e: e.response.status_code == 400):
+            self.redpanda.set_cluster_config(out_of_bound_properties,
+                                             expect_restart=True)
+
+        environment = {"__REDPANDA_TEST_DISABLE_BOUNDED_PROPERTY_CHECKS": "ON"}
+        self.redpanda.set_environment(environment)
+        self.redpanda.restart_nodes(self.redpanda.nodes)
+
+        # Expect these out of bound value updates to succeed.
+        # expect_restart=True due to some of the properties used.
+        self.redpanda.set_cluster_config(out_of_bound_properties,
+                                         expect_restart=True)
+        for prop, value in out_of_bound_properties.items():
+            self._check_value_everywhere(prop, value)
+
+
+"""
+PropertyAliasData:
+    primary_name: str  # this is the primary name in the current version of redpanda
+    aliased_name: str  # this is the legacy name, retained as an alias for backward compat
+    redpanda_version: RedpandaVersionLine  # this is the first version to use primary_name
+    test_values: list[Any, Any, Any]  # values for this property to run the tests
+    expect_restart: bool # setting property will ask for a restart
+"""
+PropertyAliasData = namedtuple("PropertyAliasData", [
+    "primary_name", "aliased_name", "redpanda_version", "test_values",
+    "expect_restart"
+])
+
+cloud_storage_graceful_transfer_timeout = PropertyAliasData(
+    primary_name="cloud_storage_graceful_transfer_timeout_ms",
+    aliased_name="cloud_storage_graceful_transfer_timeout",
+    redpanda_version=(23, 2),
+    test_values=(1234, 1235, 1236),
+    expect_restart=False)
+log_retention_ms = PropertyAliasData(primary_name="log_retention_ms",
+                                     aliased_name="delete_retention_ms",
+                                     redpanda_version=(23, 3),
+                                     test_values=(1000000, 300000, 500000),
+                                     expect_restart=False)
+# NOTE due to https://github.com/redpanda-data/redpanda/issues/13432 ,
+# test_values can't be -1 (a valid value nonetheless to signal infinite value)
+data_transforms_per_core_memory_reservation = PropertyAliasData(
+    primary_name="data_transforms_per_core_memory_reservation",
+    aliased_name="wasm_per_core_memory_reservation",
+    redpanda_version=(23, 3),
+    test_values=(27000000, 37000000, 47000000),
+    expect_restart=True)
+
 
 class ClusterConfigAliasTest(RedpandaTest, ClusterConfigHelpersMixin):
     def __init__(self, *args, **kwargs):
@@ -1361,54 +1738,74 @@ class ClusterConfigAliasTest(RedpandaTest, ClusterConfigHelpersMixin):
 
         self.admin = Admin(self.redpanda)
         self.rpk = RpkTool(self.redpanda)
-        self.installer = self.redpanda._installer
-
-        # This became the name in 23.2
-        self.primary_name = "cloud_storage_graceful_transfer_timeout_ms"
-        # This is the 23.1 name, retained as an alias for backward compat
-        self.aliased_name = "cloud_storage_graceful_transfer_timeout"
-        # This is the version in which the alias name used to be the primary
-        self.legacy_version = (23, 1)
+        self.installer: RedpandaInstaller = self.redpanda._installer
 
     def setUp(self):
         pass  # Will start cluster in test
 
     @cluster(num_nodes=3)
-    def test_aliasing(self):
+    @matrix(prop_set=[
+        cloud_storage_graceful_transfer_timeout, log_retention_ms,
+        data_transforms_per_core_memory_reservation
+    ])
+    def test_aliasing(self, prop_set: PropertyAliasData):
         """
         Validate that configuration property aliases enable the various means
         of setting a property to accept the old name (alias) as well as the new one.
         """
         # Aliases should work when used in bootstrap
-        self.redpanda.set_extra_rp_conf({self.aliased_name: 1234})
+        self.redpanda.set_extra_rp_conf({
+            prop_set.aliased_name:
+            prop_set.test_values[0],
+        })
         self.redpanda.start()
+        self._check_value_everywhere(prop_set.primary_name,
+                                     prop_set.test_values[0])
 
         # The configuration schema should include aliases
         schema = self.admin.get_cluster_config_schema()['properties']
-        assert schema[self.primary_name]['aliases'] == [self.aliased_name]
-        assert self.aliased_name not in schema
+        assert schema[prop_set.primary_name]['aliases'] == [
+            prop_set.aliased_name
+        ]
+        assert prop_set.aliased_name not in schema
 
         # Config listing should not include aliases
         cluster_config = self.admin.get_cluster_config(include_defaults=True)
-        assert self.primary_name in cluster_config
-        assert self.aliased_name not in cluster_config
+        assert prop_set.primary_name in cluster_config
+        assert prop_set.aliased_name not in cluster_config
 
         # Aliases should work when used in API POST
-        self.redpanda.set_cluster_config({self.aliased_name: 1235})
-        self._check_value_everywhere(self.primary_name, 1235)
+        self.redpanda.set_cluster_config(
+            {prop_set.aliased_name: prop_set.test_values[1]},
+            expect_restart=prop_set.expect_restart)
+        self._check_value_everywhere(prop_set.primary_name,
+                                     prop_set.test_values[1])
 
         # Properties set via an alias should stay set after a restart
         self.redpanda.restart_nodes(self.redpanda.nodes)
-        self._check_value_everywhere(self.primary_name, 1235)
+        self._check_value_everywhere(prop_set.primary_name,
+                                     prop_set.test_values[1])
 
         # The rpk CLI should also accept aliased names
-        self.rpk.cluster_config_set(self.primary_name, "1236")
-        self._check_value_everywhere(self.primary_name, 1236)
+        rpk_output = self.rpk.cluster_config_set(prop_set.aliased_name,
+                                                 prop_set.test_values[2])
+        # extract new version from rpk_output, wait for this version to propagate
+        version_re = "New configuration version is (\\d+)"
+        new_version_match = re.search(version_re, rpk_output)
+        assert new_version_match is not None, f"expected {rpk_output=} to match {version_re=}"
+        wait_for_version_status_sync(self.admin, self.redpanda,
+                                     int(new_version_match.group(1)))
+
+        # perform a restart to satisfy need_restart::yes properties
+        self._check_propagated_and_persistent(prop_set.primary_name,
+                                              prop_set.test_values[2])
 
     @cluster(num_nodes=3)
-    @parametrize(wipe_cache=False)
-    @parametrize(wipe_cache=True)
-    def test_aliasing_with_upgrade(self, wipe_cache: bool):
+    @matrix(
+        wipe_cache=[False, True],
+        prop_set=[cloud_storage_graceful_transfer_timeout, log_retention_ms])
+    def test_aliasing_with_upgrade(self, wipe_cache: bool,
+                                   prop_set: PropertyAliasData):
         """
         Validate that a property written under an alias in a previous release
         is read correctly after upgrade.
@@ -1418,7 +1815,8 @@ class ClusterConfigAliasTest(RedpandaTest, ClusterConfigHelpersMixin):
                            than just cache.
         """
 
-        old_version, _ = self.installer.latest_for_line(self.legacy_version)
+        old_version = self.installer.highest_from_prior_feature_version(
+            prop_set.redpanda_version)
         self.installer.install(self.redpanda.nodes, old_version)
 
         self.redpanda.start()
@@ -1426,16 +1824,15 @@ class ClusterConfigAliasTest(RedpandaTest, ClusterConfigHelpersMixin):
         # Check we're running a version where the alias name is actually the primary
         # (i.e. older than when the alias was introduced)
         cluster_config = self.admin.get_cluster_config(include_defaults=True)
-        assert self.primary_name not in cluster_config
-        assert self.aliased_name in cluster_config
-
-        value_old_version = 1230
+        assert prop_set.primary_name not in cluster_config
+        assert prop_set.aliased_name in cluster_config
 
         self.redpanda.set_cluster_config(
-            {self.aliased_name: value_old_version})
-        self._check_value_everywhere(self.aliased_name, value_old_version)
+            {prop_set.aliased_name: prop_set.test_values[0]})
+        self._check_value_everywhere(prop_set.aliased_name,
+                                     prop_set.test_values[0])
 
-        self.installer.install(self.redpanda.nodes, RedpandaInstaller.HEAD)
+        self.installer.install(self.redpanda.nodes, prop_set.redpanda_version)
         for node in self.redpanda.nodes:
             self.redpanda.stop_node(node)
 
@@ -1451,15 +1848,20 @@ class ClusterConfigAliasTest(RedpandaTest, ClusterConfigHelpersMixin):
             self.redpanda.start_node(node)
 
         # The value we wrote under the old name should now be readable via the new name
-        self._check_value_everywhere(self.primary_name, value_old_version)
+        self._check_value_everywhere(prop_set.primary_name,
+                                     prop_set.test_values[0])
 
         # Setting via the new name works
-        self.redpanda.set_cluster_config({self.primary_name: 1231})
-        self._check_value_everywhere(self.primary_name, 1231)
+        self.redpanda.set_cluster_config(
+            {prop_set.primary_name: prop_set.test_values[1]})
+        self._check_value_everywhere(prop_set.primary_name,
+                                     prop_set.test_values[1])
 
         # Setting via the old name also still works
-        self.redpanda.set_cluster_config({self.primary_name: 1232})
-        self._check_value_everywhere(self.primary_name, 1232)
+        self.redpanda.set_cluster_config(
+            {prop_set.aliased_name: prop_set.test_values[2]})
+        self._check_value_everywhere(prop_set.primary_name,
+                                     prop_set.test_values[2])
 
 
 class ClusterConfigClusterIdTest(RedpandaTest):
@@ -1569,13 +1971,12 @@ class ClusterConfigAzureSharedKey(RedpandaTest):
     ), )
 
     def __init__(self, test_context):
-        self.si_settings = SISettings(test_context,
-                                      log_segment_size=self.segment_size,
-                                      fast_uploads=True)
         super().__init__(test_context,
                          log_level="trace",
-                         si_settings=self.si_settings,
-                         extra_rp_conf={})
+                         si_settings=SISettings(
+                             test_context,
+                             log_segment_size=self.segment_size,
+                             fast_uploads=True))
 
         self.kafka_cli = KafkaCliTools(self.redpanda)
 
@@ -1612,7 +2013,7 @@ class ClusterConfigAzureSharedKey(RedpandaTest):
         1. Begin with a key in-place
         2. Validate uploads work
         3. Replace the key with a bogus one
-        4. Validate uploads are failing 
+        4. Validate uploads are failing
         5. Set the key back to the initial value
         6. Validate uploads work again
         7. Try to unset the key
@@ -1755,6 +2156,9 @@ class ClusterConfigLegacyDefaultTest(RedpandaTest, ClusterConfigHelpersMixin):
 
         self.legacy_version = (23, 1)
 
+        # version where space_management legacy defaults are introduced
+        self.intermediate_version = (23, 2)
+
         # this is synchronized with configuration.cc
         self.key = 'topic_partitions_per_shard'
         self.legacy_default = 7000
@@ -1763,8 +2167,10 @@ class ClusterConfigLegacyDefaultTest(RedpandaTest, ClusterConfigHelpersMixin):
     def setUp(self):
         pass
 
-    def _upgrade(self, wipe_cache):
-        self.installer.install(self.redpanda.nodes, RedpandaInstaller.HEAD)
+    def _upgrade(self,
+                 wipe_cache,
+                 version: RedpandaVersion = RedpandaInstaller.HEAD):
+        self.installer.install(self.redpanda.nodes, version)
         for node in self.redpanda.nodes:
             self.redpanda.stop_node(node)
 
@@ -1779,45 +2185,263 @@ class ClusterConfigLegacyDefaultTest(RedpandaTest, ClusterConfigHelpersMixin):
 
             self.redpanda.start_node(node)
 
+        def all_versions_are_the_same():
+            admin = Admin(self.redpanda)
+            node_features = [
+                admin.get_features(n) for n in self.redpanda.nodes
+            ]
+
+            self.logger.info(
+                f"Current cluster versions: {[f['cluster_version']  for f in node_features]}"
+            )
+            return all(f['cluster_version'] == f['node_latest_version']
+                       for f in node_features)
+
+        wait_until(
+            all_versions_are_the_same, 30, 1,
+            "failed waiting for all brokers to report the same version")
+
     @cluster(num_nodes=3)
     @parametrize(wipe_cache=True)
     @parametrize(wipe_cache=False)
     def test_legacy_default(self, wipe_cache: bool):
-        old_version, _ = self.installer.latest_for_line(self.legacy_version)
-        self.installer.install(self.redpanda.nodes, old_version)
+        versions = self.load_version_range(self.legacy_version)
+        self.installer.install(self.redpanda.nodes, versions[0])
         self.redpanda.start()
-
         self._check_value_everywhere(self.key, self.legacy_default)
-        self._upgrade(wipe_cache)
-        self._check_value_everywhere(self.key, self.legacy_default)
+        self.logger.info(
+            f"Executing upgrade tests starting with version: {versions[0]} and upgrading through: {versions[1:]}"
+        )
+        for v in versions[1:]:
+            self._upgrade(wipe_cache, v)
+            self._check_value_everywhere(self.key, self.legacy_default)
 
     @cluster(num_nodes=3)
     @parametrize(wipe_cache=True)
     @parametrize(wipe_cache=False)
     def test_legacy_default_explicit_before_upgrade(self, wipe_cache: bool):
-        old_version, _ = self.installer.latest_for_line(self.legacy_version)
-        self.installer.install(self.redpanda.nodes, old_version)
+        versions = self.load_version_range(self.legacy_version)
+        self.installer.install(self.redpanda.nodes, versions[0])
 
         expected = self.legacy_default + 1
         self.redpanda.add_extra_rp_conf({self.key: expected})
         self.redpanda.start()
 
         self._check_value_everywhere(self.key, expected)
-        self._upgrade(wipe_cache)
-        self._check_value_everywhere(self.key, expected)
+        for v in versions[1:]:
+            self._upgrade(wipe_cache, v)
+            self._check_value_everywhere(self.key, expected)
 
     @cluster(num_nodes=3)
     @parametrize(wipe_cache=True)
     @parametrize(wipe_cache=False)
     def test_legacy_default_explicit_after_upgrade(self, wipe_cache: bool):
-        old_version, _ = self.installer.latest_for_line(self.legacy_version)
-        self.installer.install(self.redpanda.nodes, old_version)
+        versions = self.load_version_range(self.legacy_version)
+        self.installer.install(self.redpanda.nodes, versions[0])
         self.redpanda.start()
 
         self._check_value_everywhere(self.key, self.legacy_default)
+        for v in versions[1:]:
+            self._upgrade(wipe_cache, v)
+            self._check_value_everywhere(self.key, self.legacy_default)
 
-        self._upgrade(wipe_cache)
         expected = self.new_default + 1
         self.redpanda.set_cluster_config({self.key: expected})
 
         self._check_value_everywhere(self.key, expected)
+        self.redpanda.restart_nodes(self.redpanda.nodes)
+        self._check_value_everywhere(self.key, expected)
+
+    @cluster(num_nodes=3)
+    @parametrize(wipe_cache=True)
+    @parametrize(wipe_cache=False)
+    def test_removal_of_legacy_default_defaulted(self, wipe_cache: bool):
+        # in 23.1 space management feature does not exist
+        versions = self.load_version_range(self.legacy_version)
+        self.installer.install(self.redpanda.nodes, versions[0])
+        self.redpanda.start()
+
+        # in 23.2 space management exists, but is disabled by default for
+        # upgraded clusters.
+        for v in versions[1:]:
+            self._upgrade(wipe_cache, v)
+            if v[0] == 23 and v[1] == 2:
+                self._check_value_everywhere("space_management_enable", False)
+            else:
+                self._check_value_everywhere("space_management_enable", True)
+
+        # survives a restart
+        self.redpanda.restart_nodes(self.redpanda.nodes)
+        self._check_value_everywhere("space_management_enable", True)
+
+    @cluster(num_nodes=3)
+    @parametrize(wipe_cache=True)
+    @parametrize(wipe_cache=False)
+    def test_removal_of_legacy_default_overriden(self, wipe_cache: bool):
+        # in 23.1 space management feature does not exist
+        versions = self.load_version_range(self.legacy_version)
+        self.installer.install(self.redpanda.nodes, versions[0])
+        self.redpanda.start()
+
+        # in 23.2 space management exists, but is disabled by default for
+        # upgraded clusters.
+        for v in versions[1:]:
+            self._upgrade(wipe_cache, v)
+            self._check_value_everywhere("space_management_enable", False)
+            if v[0] == 23 and v[1] == 2:
+                # we need to toggle it to get it to stick since the api seems to not
+                # change the underlying value explicitly if its default is that value.
+                # the legacy default bits here are to blame for the weirdness i presume
+
+                self.redpanda.set_cluster_config(
+                    {"space_management_enable": True})
+                self.redpanda.set_cluster_config(
+                    {"space_management_enable": False})
+                self._check_value_everywhere("space_management_enable", False)
+
+        # survives a restart
+        self.redpanda.restart_nodes(self.redpanda.nodes)
+        self._check_value_everywhere("space_management_enable", False)
+
+
+class ClusterConfigUnknownTest(RedpandaTest):
+    def __init__(self, test_context):
+        super().__init__(test_context)
+
+        self.admin = Admin(self.redpanda)
+
+    @cluster(num_nodes=3)
+    def test_unknown_value(self):
+        """
+        Test that an unknown property saved in the log does not prevent a node from starting.
+        In this test we use a non existing property,
+        but it can be a property not yet introduced in the current version.
+        For example a property set in the middle of an upgrade followed up by a rollback.
+        see issues/15839
+        """
+        self.admin.patch_cluster_config(
+            upsert={"a_non_existing_property": "a_value_with_no_importance"},
+            force=True)
+
+        assert "a_non_existing_property" not in self.admin.get_cluster_config(
+        ), "unexpected property found in cluster config"
+
+        # issue would appear when reloading the property back
+        self.redpanda.restart_nodes(self.redpanda.nodes[0])
+
+
+class DevelopmentFeatureTest(RedpandaTest):
+    def __init__(self, test_context):
+        super().__init__(
+            test_context,
+            extra_rp_conf=dict(
+                # controls freq of nag
+                legacy_unsafe_log_warning_interval_sec=5, ))
+        self.admin = Admin(self.redpanda)
+        self._property_name = "development_feature_property_testing_only"
+
+    @cluster(num_nodes=3)
+    def test_reject_invalid_enable_key(self):
+        """
+        Test that enabling with an invalid key results in rejection.
+        """
+        # key must be within 1 hour
+        key = int(time.time() - (3600 * 1.5))
+        try:
+            self.redpanda.enable_development_feature_support(key=key)
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code != 400:
+                raise
+            errors = e.response.json()
+            assert f"Invalid key '{key}'. Must be within 1 hour" in errors[
+                "enable_developmental_unrecoverable_data_corrupting_features"], f"{errors}"
+        else:
+            assert False, "Expected error"
+
+    @cluster(num_nodes=3)
+    def test_accept_valid_enable_key(self):
+        """
+        Test that a valid key enables experimental feature property.
+        """
+        key = int(time.time() - 60)
+        self.redpanda.enable_development_feature_support(key=key)
+        config = self.admin.get_cluster_config()
+        value = config[
+            "enable_developmental_unrecoverable_data_corrupting_features"]
+        assert int(value) == key, f"{value} != {key}"
+
+    @cluster(num_nodes=3)
+    def test_cannot_disable(self):
+        """
+        Test that once experimental is enabled, it cannot be disabled.
+        """
+        # enable, then try to set the key to anything
+        self.redpanda.enable_development_feature_support()
+        for key in [int(time.time() - 60), ""]:
+            try:
+                self.redpanda.enable_development_feature_support(key=key)
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code != 400:
+                    raise
+                errors = e.response.json()
+                assert f"Development feature flag cannot be changed once enabled." in errors[
+                    "enable_developmental_unrecoverable_data_corrupting_features"], f"{errors}"
+            else:
+                assert False, "Expected error"
+
+    @cluster(num_nodes=3)
+    def test_development_feature_nag(self):
+        """
+        Test that nag is printed when experimental feature flag enabled.
+        """
+        self.redpanda.enable_development_feature_support()
+        wait_until(lambda: self.redpanda.search_log_all(
+            "WARNING: development features have been enabled"),
+                   timeout_sec=10,
+                   backoff_sec=1.0,
+                   err_msg=f"Expected to see experimental feature nag")
+
+    @cluster(num_nodes=3)
+    def test_development_property_visibility(self):
+        """
+        Test that a non-active experimental feature is hidden.
+        """
+        # experimental feature property is not visible
+        config = self.admin.get_cluster_config()
+        assert self._property_name not in config
+
+        self.redpanda.enable_development_feature_support()
+
+        # after enabling experimental features it is visible
+        config = self.admin.get_cluster_config()
+        assert self._property_name in config
+
+    @cluster(num_nodes=3)
+    def test_development_property_cannot_be_set(self):
+        """
+        Test that non-active experimental features cannot be set.
+        """
+        # cannot set
+        set_value = 43
+        try:
+            patch_result = self.admin.patch_cluster_config(
+                upsert={self._property_name: set_value})
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code != 400:
+                raise
+            errors = e.response.json()
+            assert f"Development feature support is not enabled." in errors[
+                self._property_name], f"{errors}"
+        else:
+            assert False, "Expected error"
+
+        self.redpanda.enable_development_feature_support()
+
+        # after enabling experimental features it can be set
+        patch_result = self.admin.patch_cluster_config(
+            upsert={self._property_name: set_value})
+        wait_for_version_sync(self.admin, self.redpanda,
+                              patch_result['config_version'])
+        config = self.admin.get_cluster_config()
+        value = config[self._property_name]
+        assert int(value) == set_value, f"{value} != {set_value}"

@@ -9,21 +9,20 @@
 
 #include "kafka/server/handlers/metadata.h"
 
+#include "base/likely.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/topics_frontend.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
 #include "config/node_config.h"
+#include "container/fragmented_vector.h"
 #include "kafka/protocol/schemata/metadata_response.h"
 #include "kafka/server/errors.h"
 #include "kafka/server/fwd.h"
-#include "kafka/server/handlers/details/isolated_node_utils.h"
 #include "kafka/server/handlers/details/leader_epoch.h"
 #include "kafka/server/handlers/details/security.h"
 #include "kafka/server/handlers/topics/topic_utils.h"
 #include "kafka/server/response.h"
-#include "kafka/types.h"
-#include "likely.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/timeout_clock.h"
@@ -39,6 +38,10 @@
 #include <iterator>
 #include <type_traits>
 
+namespace {
+using is_node_isolated_or_decommissioned
+  = ss::bool_class<struct is_node_isolated_or_decommissioned_tag>;
+}
 namespace kafka {
 
 static constexpr model::node_id no_leader(-1);
@@ -80,8 +83,15 @@ std::optional<cluster::leader_term> get_leader_term(
   const cluster::metadata_cache& md_cache,
   const std::vector<model::node_id>& replicas) {
     auto leader_term = md_cache.get_leader_term(tp_ns, p_id);
+    /**
+     * If current broker do not yet have any information about leadership we
+     * fallback to leader guesstimating. We return first replica from the
+     * replica set and term 0. (This is the same logic that has been a part of
+     * cluster::topic_dispatcher before)
+     */
     if (!leader_term) {
-        return std::nullopt;
+        leader_term.emplace(replicas[0], model::term_id(0));
+        return leader_term;
     }
     if (!leader_term->leader.has_value()) {
         const auto previous = md_cache.get_previous_leader_id(tp_ns, p_id);
@@ -106,7 +116,8 @@ bool is_internal(model::topic_namespace_view tp_ns) {
 metadata_response::topic make_topic_response_from_topic_metadata(
   const cluster::metadata_cache& md_cache,
   const cluster::topic_metadata& tp_md,
-  const is_node_isolated_or_decommissioned is_node_isolated) {
+  const is_node_isolated_or_decommissioned is_node_isolated,
+  bool recovery_mode_enabled) {
     metadata_response::topic tp;
     tp.error_code = error_code::none;
     model::topic_namespace_view tp_ns = tp_md.get_configuration().tp_ns;
@@ -114,7 +125,10 @@ metadata_response::topic make_topic_response_from_topic_metadata(
 
     tp.is_internal = is_internal(tp_ns);
 
-    for (const auto& p_as : tp_md.get_assignments()) {
+    const bool is_user_topic = model::is_user_topic(tp_ns);
+    const auto* disabled_set = md_cache.get_topic_disabled_set(tp_ns);
+
+    for (const auto& [_, p_as] : tp_md.get_assignments()) {
         std::vector<model::node_id> replicas{};
         replicas.reserve(p_as.replicas.size());
         // current replica set
@@ -125,14 +139,19 @@ metadata_response::topic make_topic_response_from_topic_metadata(
           [](const model::broker_shard& bs) { return bs.node_id; });
         metadata_response::partition p;
         p.error_code = error_code::none;
+        if (recovery_mode_enabled && is_user_topic) {
+            p.error_code = error_code::policy_violation;
+        } else if (disabled_set && disabled_set->is_disabled(p_as.id)) {
+            p.error_code = error_code::replica_not_available;
+        }
         p.partition_index = p_as.id;
         p.leader_id = no_leader;
         auto lt = get_leader_term(tp_ns, p_as.id, md_cache, replicas);
-        if (lt && !is_node_isolated) {
+        if (lt && !is_node_isolated && p.error_code == error_code::none) {
             p.leader_id = lt->leader.value_or(no_leader);
             p.leader_epoch = leader_epoch_from_term(lt->term);
         }
-        if (is_node_isolated) {
+        if (is_node_isolated && p.error_code == error_code::none) {
             auto replicas_for_sfuffle = replicas;
             std::shuffle(
               replicas_for_sfuffle.begin(),
@@ -210,7 +229,8 @@ static ss::future<metadata_response::topic> create_topic(
                 return make_topic_response_from_topic_metadata(
                   ctx.metadata_cache(),
                   tp_md.value(),
-                  is_node_isolated_or_decommissioned::no);
+                  is_node_isolated_or_decommissioned::no,
+                  ctx.recovery_mode_enabled());
             });
       })
       .handle_exception([topic = std::move(topic)](
@@ -232,33 +252,30 @@ static metadata_response::topic make_topic_response(
   metadata_request& rq,
   const cluster::topic_metadata& md,
   const is_node_isolated_or_decommissioned is_node_isolated) {
-    int32_t auth_operations = 0;
+    auto res = make_topic_response_from_topic_metadata(
+      ctx.metadata_cache(), md, is_node_isolated, ctx.recovery_mode_enabled());
+
     /**
      * if requested include topic authorized operations
      */
     if (rq.data.include_topic_authorized_operations) {
-        auth_operations = details::to_bit_field(
+        res.topic_authorized_operations = details::to_bit_field(
           details::authorized_operations(ctx, md.get_configuration().tp_ns.tp));
     }
 
-    auto res = make_topic_response_from_topic_metadata(
-      ctx.metadata_cache(), md, is_node_isolated);
-    res.topic_authorized_operations = auth_operations;
     return res;
 }
 
-static ss::future<std::vector<metadata_response::topic>> get_topic_metadata(
+static ss::future<small_fragment_vector<metadata_response::topic>>
+get_topic_metadata(
   request_context& ctx,
   metadata_request& request,
   const is_node_isolated_or_decommissioned is_node_isolated) {
-    std::vector<metadata_response::topic> res;
+    small_fragment_vector<metadata_response::topic> res;
 
     // request can be served from whatever happens to be in the cache
     if (request.list_all_topics) {
         auto& topics_md = ctx.metadata_cache().all_topics_metadata();
-        // reserve vector capacity to full size as there are only few topics
-        // outside of kafka namespace
-        res.reserve(topics_md.size());
         for (const auto& [tp_ns, md] : topics_md) {
             // only serve topics from the kafka namespace
             if (tp_ns.ns != model::kafka_namespace) {
@@ -278,10 +295,11 @@ static ss::future<std::vector<metadata_response::topic>> get_topic_metadata(
               make_topic_response(ctx, request, md.metadata, is_node_isolated));
         }
 
-        return ss::make_ready_future<std::vector<metadata_response::topic>>(
-          std::move(res));
+        return ss::make_ready_future<
+          small_fragment_vector<metadata_response::topic>>(std::move(res));
     }
 
+    std::vector<model::topic> topics_to_be_created;
     std::vector<ss::future<metadata_response::topic>> new_topics;
 
     for (auto& topic : *request.data.topics) {
@@ -319,17 +337,40 @@ static ss::future<std::vector<metadata_response::topic>> get_topic_metadata(
               std::move(topic.name), error_code::topic_authorization_failed));
             continue;
         }
-        new_topics.push_back(
-          create_topic(ctx, std::move(topic.name), is_node_isolated));
+        topics_to_be_created.emplace_back(std::move(topic.name));
     }
+
+    if (!ctx.audit()) {
+        std::for_each(res.begin(), res.end(), [](metadata_response::topic& t) {
+            t.error_code = error_code::broker_not_available;
+        });
+
+        std::transform(
+          topics_to_be_created.begin(),
+          topics_to_be_created.end(),
+          std::back_inserter(res),
+          [](model::topic& t) {
+              return metadata_response::topic{
+                .error_code = error_code::broker_not_available,
+                .name = std::move(t)};
+          });
+
+        return ss::make_ready_future<
+          small_fragment_vector<metadata_response::topic>>(std::move(res));
+    }
+
+    std::for_each(
+      topics_to_be_created.begin(),
+      topics_to_be_created.end(),
+      [&new_topics, &ctx, is_node_isolated](model::topic& t) {
+          new_topics.emplace_back(
+            create_topic(ctx, std::move(t), is_node_isolated));
+      });
 
     return ss::when_all_succeed(new_topics.begin(), new_topics.end())
       .then([res = std::move(res)](
               std::vector<metadata_response::topic> topics) mutable {
-          res.insert(
-            res.end(),
-            std::make_move_iterator(topics.begin()),
-            std::make_move_iterator(topics.end()));
+          std::move(topics.begin(), topics.end(), std::back_inserter(res));
           return std::move(res);
       });
 }
@@ -471,7 +512,8 @@ static ss::future<metadata_response> fill_info_about_brokers_and_controller_id(
 template<>
 ss::future<response_ptr> metadata_handler::handle(
   request_context ctx, [[maybe_unused]] ss::smp_service_group g) {
-    auto isolated_or_decommissioned = node_isolated_or_decommissioned(ctx);
+    is_node_isolated_or_decommissioned isolated_or_decommissioned{
+      ctx.metadata_cache().is_node_isolated()};
 
     auto reply = co_await fill_info_about_brokers_and_controller_id(
       ctx, isolated_or_decommissioned);
@@ -581,6 +623,7 @@ metadata_memory_estimator(size_t request_size, connection_context& conn_ctx) {
     // generally ~8000 bytes). Finally, we add max_frag_bytes to account for the
     // worse-cast overshoot during vector re-allocation.
     return default_memory_estimate(request_size) + size_estimate
-           + large_fragment_vector<metadata_response_partition>::max_frag_bytes;
+           + large_fragment_vector<
+             metadata_response_partition>::max_frag_bytes();
 }
 } // namespace kafka

@@ -11,7 +11,7 @@
 
 #include "kafka/client/transport.h"
 #include "kafka/protocol/errors.h"
-#include "kafka/protocol/list_offsets.h"
+#include "kafka/protocol/list_offset.h"
 #include "kafka/protocol/schemata/list_offset_request.h"
 #include "kafka/protocol/schemata/list_offset_response.h"
 
@@ -22,9 +22,9 @@ kafka_list_offsets_transport::list_offsets(
   model::topic topic_name, pid_to_timestamp_map_t ts_per_partition) {
     kafka::list_offsets_request req;
 
-    req.data.topics = {{
+    req.data.topics.emplace_back(kafka::list_offset_topic{
       .name = std::move(topic_name),
-    }};
+    });
     for (const auto& [pid, ts] : ts_per_partition) {
         req.data.topics[0].partitions.emplace_back(kafka::list_offset_partition{
           .partition_index = pid, .timestamp = ts});

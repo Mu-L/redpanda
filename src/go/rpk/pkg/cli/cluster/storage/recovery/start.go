@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -23,31 +24,31 @@ import (
 
 func newStartCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 	var (
-		topicNamePattern string
-		wait             bool
-		pollingInterval  time.Duration
+		wait            bool
+		pollingInterval time.Duration
 	)
 
 	cmd := &cobra.Command{
 		Use:   "start",
-		Short: "Start the topic recovery process",
-		Long: `Start the topic recovery process.
+		Short: "Start the topic restoration process",
+		Long: `Start the topic restoration process.
 		
 This command starts the process of restoring topics from the archival bucket.
 If the wait flag (--wait/-w) is set, the command will poll the status of the
 recovery process until it's finished.`,
-		Run: func(cmd *cobra.Command, args []string) {
+		Args: cobra.NoArgs,
+		Run: func(cmd *cobra.Command, _ []string) {
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
-			out.CheckExitCloudAdmin(p)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
+			config.CheckExitCloudAdmin(p)
 
-			client, err := adminapi.NewClient(fs, p)
+			client, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			ctx := cmd.Context()
 
-			_, err = client.StartAutomatedRecovery(ctx, topicNamePattern)
-			var he *adminapi.HTTPResponseError
+			_, err = client.StartAutomatedRecovery(ctx)
+			var he *rpadmin.HTTPResponseError
 			if errors.As(err, &he) {
 				if he.Response.StatusCode == 404 {
 					body, bodyErr := he.DecodeGenericErrorBody()
@@ -66,7 +67,7 @@ recovery process until it's finished.`,
 			fmt.Println("Successfully started topic recovery")
 
 			if !wait {
-				fmt.Println("To check the recovery status, run 'rpk cluster storage recovery status'")
+				fmt.Println("To check the recovery status, run 'rpk cluster storage restore status'")
 				return
 			}
 
@@ -109,7 +110,7 @@ recovery process until it's finished.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&topicNamePattern, "topic-name-pattern", ".*", "A regex pattern that restores any matching topics")
+	cmd.Flags().MarkDeprecated("topic-name-pattern", "Not supported")
 	cmd.Flags().BoolVarP(&wait, "wait", "w", false, "Wait until auto-restore is complete")
 	cmd.Flags().DurationVar(&pollingInterval, "polling-interval", 5*time.Second, "The status check interval (e.g. '30s', '1.5m'); ignored if --wait is not used")
 

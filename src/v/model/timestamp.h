@@ -11,9 +11,10 @@
 
 #pragma once
 
-#include "seastarx.h"
+#include "base/seastarx.h"
 
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/manual_clock.hh>
 
 #include <chrono>
 #include <compare>
@@ -80,7 +81,7 @@ public:
     // ADL helpers for interfacing with the serde library.
     friend void write(iobuf& out, timestamp ts);
     friend void
-    read_nested(iobuf_parser& in, timestamp& ts, size_t const bytes_left_limit);
+    read_nested(iobuf_parser& in, timestamp& ts, const size_t bytes_left_limit);
 
     static timestamp now();
 
@@ -95,7 +96,17 @@ inline timestamp_clock::duration duration_since_epoch(timestamp ts) {
       std::chrono::milliseconds{ts.value()});
 }
 
+inline timestamp_clock::time_point to_time_point(timestamp ts) {
+    return timestamp_clock::time_point(std::chrono::milliseconds(ts.value()));
+}
+
 inline timestamp to_timestamp(timestamp_clock::time_point ts) {
+    return timestamp(std::chrono::duration_cast<std::chrono::milliseconds>(
+                       ts.time_since_epoch())
+                       .count());
+}
+
+inline timestamp to_timestamp(ss::manual_clock::time_point ts) {
     return timestamp(std::chrono::duration_cast<std::chrono::milliseconds>(
                        ts.time_since_epoch())
                        .count());

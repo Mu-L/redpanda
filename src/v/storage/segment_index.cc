@@ -9,12 +9,12 @@
 
 #include "storage/segment_index.h"
 
+#include "base/vassert.h"
+#include "model/fundamental.h"
 #include "model/timestamp.h"
-#include "serde/serde.h"
 #include "storage/index_state.h"
 #include "storage/logger.h"
 #include "storage/segment_utils.h"
-#include "vassert.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/fstream.hh>
@@ -29,23 +29,15 @@
 
 namespace storage {
 
-static inline segment_index::entry translate_index_entry(
-  const index_state& s,
-  std::tuple<uint32_t, offset_time_index, uint64_t> entry) {
-    auto [relative_offset, relative_time, filepos] = entry;
-    return segment_index::entry{
-      .offset = model::offset(relative_offset + s.base_offset()),
-      .timestamp = model::timestamp(relative_time() + s.base_timestamp()),
-      .filepos = filepos,
-    };
-}
-
 segment_index::segment_index(
   segment_full_path path,
   model::offset base,
   size_t step,
   ss::sharded<features::feature_table>& feature_table,
-  std::optional<ntp_sanitizer_config> sanitizer_config)
+  std::optional<ntp_sanitizer_config> sanitizer_config,
+  std::optional<model::timestamp> broker_timestamp,
+  std::optional<model::timestamp> clean_compact_timestamp,
+  bool may_have_tombstone_records)
   : _path(std::move(path))
   , _step(step)
   , _feature_table(std::ref(feature_table))
@@ -53,6 +45,9 @@ segment_index::segment_index(
       storage::internal::should_apply_delta_time_offset(_feature_table)))
   , _sanitizer_config(std::move(sanitizer_config)) {
     _state.base_offset = base;
+    _state.broker_timestamp = broker_timestamp;
+    _state.clean_compact_timestamp = clean_compact_timestamp;
+    _state.may_have_tombstone_records = may_have_tombstone_records;
 }
 
 segment_index::segment_index(
@@ -84,10 +79,18 @@ ss::future<ss::file> segment_index::open() {
 }
 
 void segment_index::reset() {
+    // Persist the base offset, clean compaction timestamp, and tombstones
+    // identifier through a reset.
     auto base = _state.base_offset;
+    auto clean_compact_timestamp = _state.clean_compact_timestamp;
+    auto may_have_tombstone_records = _state.may_have_tombstone_records;
+
     _state = index_state::make_empty_index(
       storage::internal::should_apply_delta_time_offset(_feature_table));
+
     _state.base_offset = base;
+    _state.clean_compact_timestamp = clean_compact_timestamp;
+    _state.may_have_tombstone_records = may_have_tombstone_records;
 
     _acc = 0;
 }
@@ -98,8 +101,23 @@ void segment_index::swap_index_state(index_state&& o) {
     std::swap(_state, o);
 }
 
+// helper for segment_index::maybe_track, converts betwen optional-wrapped
+// broker_timestamp_t and model::timestamp
+constexpr auto to_optional_model_timestamp(std::optional<broker_timestamp_t> in)
+  -> std::optional<model::timestamp> {
+    if (unlikely(!in.has_value())) {
+        return std::nullopt;
+    }
+    // conversion from broker_timestamp_t to system_clock in this way it's
+    // possible because they share the same epoch
+    return model::to_timestamp(
+      std::chrono::system_clock::time_point{in->time_since_epoch()});
+}
+
 void segment_index::maybe_track(
-  const model::record_batch_header& hdr, size_t filepos) {
+  const model::record_batch_header& hdr,
+  std::optional<broker_timestamp_t> new_broker_ts,
+  size_t filepos) {
     _acc += hdr.size_bytes;
 
     _state.update_batch_timestamps_are_monotonic(
@@ -115,8 +133,10 @@ void segment_index::maybe_track(
           hdr.last_offset(),
           hdr.first_timestamp,
           hdr.max_timestamp,
+          to_optional_model_timestamp(new_broker_ts),
           path().is_internal_topic()
-            || hdr.type == model::record_batch_type::raft_data)) {
+            || hdr.type == model::record_batch_type::raft_data,
+          internal::is_compactible(hdr) ? hdr.record_count : 0)) {
         _acc = 0;
     }
     _needs_persistence = true;
@@ -124,80 +144,30 @@ void segment_index::maybe_track(
 
 std::optional<segment_index::entry>
 segment_index::find_nearest(model::timestamp t) {
-    if (t < _state.base_timestamp) {
-        return std::nullopt;
-    }
-    if (_state.empty()) {
-        return std::nullopt;
-    }
+    return _state.find_nearest(t);
+}
 
-    const auto delta = t - _state.base_timestamp;
-    const auto entry = _state.find_entry(delta);
-    if (!entry) {
-        return std::nullopt;
-    }
+std::optional<segment_index::entry>
+segment_index::find_above_size_bytes(size_t distance) {
+    return _state.find_above_size_bytes(distance);
+}
 
-    return translate_index_entry(_state, *entry);
+std::optional<segment_index::entry>
+segment_index::find_below_size_bytes(size_t distance) {
+    return _state.find_below_size_bytes(distance);
 }
 
 std::optional<segment_index::entry>
 segment_index::find_nearest(model::offset o) {
-    if (o < _state.base_offset || _state.empty()) {
-        return std::nullopt;
-    }
-    const uint32_t needle = o() - _state.base_offset();
-    auto it = std::lower_bound(
-      std::begin(_state.relative_offset_index),
-      std::end(_state.relative_offset_index),
-      needle,
-      std::less<uint32_t>{});
-    if (it == _state.relative_offset_index.end()) {
-        it = std::prev(it);
-    }
-    // make it signed so it can be negative
-    int i = std::distance(_state.relative_offset_index.begin(), it);
-    do {
-        if (_state.relative_offset_index[i] <= needle) {
-            return translate_index_entry(_state, _state.get_entry(i));
-        }
-    } while (i-- > 0);
-
-    return std::nullopt;
+    return _state.find_nearest(o);
 }
 
-ss::future<>
-segment_index::truncate(model::offset o, model::timestamp new_max_timestamp) {
-    if (o < _state.base_offset) {
-        co_return;
+ss::future<> segment_index::truncate(
+  model::offset new_max_offset, model::timestamp new_max_timestamp) {
+    _needs_persistence = _state.truncate(new_max_offset, new_max_timestamp);
+    if (_needs_persistence) {
+        co_await flush();
     }
-    const uint32_t i = o() - _state.base_offset();
-    auto it = std::lower_bound(
-      std::begin(_state.relative_offset_index),
-      std::end(_state.relative_offset_index),
-      i,
-      std::less<uint32_t>{});
-
-    if (it != _state.relative_offset_index.end()) {
-        _needs_persistence = true;
-        int remove_back_elems = std::distance(
-          it, _state.relative_offset_index.end());
-        while (remove_back_elems-- > 0) {
-            _state.pop_back();
-        }
-    }
-
-    if (o < _state.max_offset) {
-        _needs_persistence = true;
-        if (_state.empty()) {
-            _state.max_timestamp = _state.base_timestamp;
-            _state.max_offset = _state.base_offset;
-        } else {
-            _state.max_timestamp = new_max_timestamp;
-            _state.max_offset = o;
-        }
-    }
-
-    co_return co_await flush();
 }
 
 /**
@@ -282,10 +252,6 @@ operator<<(std::ostream& o, const std::optional<segment_index::entry>& e) {
         return o << *e;
     }
     return o << "{empty segment_index::entry}";
-}
-std::ostream& operator<<(std::ostream& o, const segment_index::entry& e) {
-    return o << "{offset:" << e.offset << ", time:" << e.timestamp
-             << ", filepos:" << e.filepos << "}";
 }
 
 ss::future<size_t> segment_index::disk_usage() {

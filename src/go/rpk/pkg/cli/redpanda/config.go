@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cobraext"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
@@ -67,14 +68,28 @@ Indexing can be used to set specific items in an array. You can index one past
 the end of an array to extend it:
 
   rpk redpanda config set redpanda.advertised_kafka_api[1] '{address: 0.0.0.0, port: 9092}'
+
+You may also use <key>=<value> notation for setting configuration properties:
+
+  rpk redpanda config set redpanda.kafka_api[0].port=9092
 `,
-		Args: cobra.ExactArgs(2),
-		Run: func(cmd *cobra.Command, args []string) {
+		Args: cobra.MinimumNArgs(1),
+		Run: func(_ *cobra.Command, args []string) {
 			cfg, err := p.Load(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
+
+			var key, value string
+			if len(args) == 1 && strings.Contains(args[0], "=") {
+				kv := strings.SplitN(args[0], "=", 2)
+				key, value = kv[0], kv[1]
+			} else if len(args) == 2 {
+				key, value = args[0], args[1]
+			} else {
+				out.Die("invalid arguments: %v, please use one of 'rpk redpanda config set <key> <value>' or 'rpk redpanda config set <key>=<value>'", args)
+			}
 			y := cfg.ActualRedpandaYamlOrDefaults() // we set fields in the raw file without writing env / flag overrides
-			err = config.Set(y, args[0], args[1])
-			out.MaybeDie(err, "unable to set %q:%v", args[0], err)
+			err = config.Set(y, key, value)
+			out.MaybeDie(err, "unable to set %q: %v", key, err)
 			err = y.Write(fs)
 			out.MaybeDieErr(err)
 		},
@@ -86,9 +101,11 @@ the end of an array to extend it:
 
 func bootstrap(fs afero.Fs, p *config.Params) *cobra.Command {
 	var (
-		ips  []string
-		self string
-		id   int
+		advKafkaStr string
+		advRPCStr   string
+		id          int
+		ips         []string
+		self        string
 	)
 	c := &cobra.Command{
 		Use:   "bootstrap [--self <ip>] [--ips <ip1,ip2,...>]",
@@ -104,14 +121,19 @@ edits.
 The --ips flag specifies seed servers (ips, ip:ports, or hostnames) that this
 broker will use to form a cluster.
 
+The flags --advertised-kafka and --advertised-rpc specify the advertised
+addresses that this broker will use to advertise the corresponding listeners. 
+If not set, it will default to the private IP address or the one specified with
+the --self flag.
+
 By default, redpanda expects your machine to have one private IP address, and
 redpanda will listen on it. If your machine has multiple private IP addresses,
 you must use the --self flag to specify which ip redpanda should listen on.
 `,
 		Args: cobra.ExactArgs(0),
-		Run: func(cmd *cobra.Command, args []string) {
+		Run: func(_ *cobra.Command, _ []string) {
 			cfg, err := p.Load(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			y := cfg.ActualRedpandaYamlOrDefaults() // we modify fields in the raw file without writing env / flag overrides
 
 			seeds, err := parseSeedIPs(ips)
@@ -123,6 +145,11 @@ you must use the --self flag to specify which ip redpanda should listen on.
 			if id >= 0 {
 				y.Redpanda.ID = &id
 			}
+			advertisedKafka, err := parseAdvertisedKafka(advKafkaStr, selfIP)
+			out.MaybeDie(err, "unable to parse --advertised-kafka %v: %v", advKafkaStr, err)
+
+			advertisedRPC, err := parseAdvertisedRPC(advRPCStr, selfIP)
+			out.MaybeDie(err, "unable to parse --advertised-rpc %v: %v", advRPCStr, err)
 
 			// Defaults returns one RPC, one KafkaAPI, and one
 			// AdminAPI. We only override values in a configuration
@@ -148,6 +175,15 @@ you must use the --self flag to specify which ip redpanda should listen on.
 			if a := &y.Redpanda.RPCServer.Address; *a == config.DefaultListenAddress {
 				*a = selfIP
 			}
+			if a := y.Redpanda.AdvertisedRPCAPI; a != nil {
+				// Redpanda default configuration use localhost as the default
+				// advertised address.
+				if a.Address == config.LoopbackIP && a.Port == config.DefaultRPCPort {
+					y.Redpanda.AdvertisedRPCAPI = advertisedRPC
+				}
+			} else {
+				y.Redpanda.AdvertisedRPCAPI = advertisedRPC
+			}
 			if a := &y.Redpanda.KafkaAPI; len(*a) == 1 {
 				if first := &((*a)[0].Address); *first == config.DefaultListenAddress {
 					*first = selfIP
@@ -157,6 +193,13 @@ you must use the --self flag to specify which ip redpanda should listen on.
 					Address: selfIP,
 					Port:    config.DefaultKafkaPort,
 				}}
+			}
+			if a := &y.Redpanda.AdvertisedKafkaAPI; len(*a) == 1 {
+				if first := &((*a)[0]); first.Address == config.LoopbackIP && first.Port == config.DefaultKafkaPort {
+					*first = advertisedKafka
+				}
+			} else if len(*a) == 0 {
+				*a = []config.NamedSocketAddress{advertisedKafka}
 			}
 			if a := &y.Redpanda.AdminAPI; len(*a) == 1 {
 				if first := &((*a)[0]).Address; *first == config.DefaultListenAddress {
@@ -175,7 +218,9 @@ you must use the --self flag to specify which ip redpanda should listen on.
 		},
 	}
 	c.Flags().StringSliceVar(&ips, "ips", nil, "Comma-separated list of the seed node addresses or hostnames; at least three are recommended")
-	c.Flags().StringVar(&self, "self", "", "Optional IP address for redpanda to listen on; if empty, defaults to a private address")
+	c.Flags().StringVar(&self, "self", "", "Optional IP address for Redpanda to listen on; if empty, defaults to a private address")
+	c.Flags().StringVar(&advKafkaStr, "advertised-kafka", "", "Optional address:port for Redpanda to advertise the kafka listener; if empty, defaults to '--self'")
+	c.Flags().StringVar(&advRPCStr, "advertised-rpc", "", "Optional address:port for Redpanda to advertise the rpc listener; if empty, defaults to '--self'")
 	c.Flags().IntVar(&id, "id", -1, "This node's ID. If unset, redpanda will assign one automatically")
 	c.Flags().MarkHidden("id")
 	return c
@@ -236,4 +281,40 @@ func getSelfIP() (net.IP, error) {
 	default:
 		return nil, errors.New("multiple private v4 IPs found, please select one with --self")
 	}
+}
+
+func parseAdvertisedKafka(adv string, defHost string) (config.NamedSocketAddress, error) {
+	host, port := defHost, config.DefaultKafkaPort
+	if adv != "" {
+		_, hostport, err := vnet.ParseHostMaybeScheme(adv)
+		if err != nil {
+			return config.NamedSocketAddress{}, err
+		}
+		host, port = vnet.SplitHostPortDefault(hostport, config.DefaultKafkaPort)
+	}
+	if host == "0.0.0.0" {
+		return config.NamedSocketAddress{}, errors.New("unexpected kafka advertised address '0.0.0.0' this will cause the broker to fail during startup validation")
+	}
+	return config.NamedSocketAddress{
+		Address: host,
+		Port:    port,
+	}, nil
+}
+
+func parseAdvertisedRPC(adv string, defHost string) (*config.SocketAddress, error) {
+	host, port := defHost, config.DefaultRPCPort
+	if adv != "" {
+		_, hostport, err := vnet.ParseHostMaybeScheme(adv)
+		if err != nil {
+			return nil, err
+		}
+		host, port = vnet.SplitHostPortDefault(hostport, config.DefaultRPCPort)
+	}
+	if host == "0.0.0.0" {
+		return nil, errors.New("unexpected rpc advertised address '0.0.0.0' this will cause the broker to fail during startup validation")
+	}
+	return &config.SocketAddress{
+		Address: host,
+		Port:    port,
+	}, nil
 }

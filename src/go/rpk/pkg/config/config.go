@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
 	"github.com/spf13/afero"
 )
 
@@ -22,7 +23,9 @@ const (
 	DefaultProxyPort     = 8082
 	DefaultAdminPort     = 9644
 	DefaultRPCPort       = 33145
+	DefaultConsolePort   = 8080
 	DefaultListenAddress = "0.0.0.0"
+	LoopbackIP           = "127.0.0.1"
 
 	DefaultBallastFilePath = "/var/lib/redpanda/data/ballast"
 	DefaultBallastFileSize = "1GiB"
@@ -54,6 +57,8 @@ type DevOverrides struct {
 	// CloudToken bypasses the oauth.LoadFlow, allowing you to pass a cloud
 	// token instead of logging in.
 	CloudToken string `env:"RPK_CLOUD_TOKEN"`
+	// PublicAPIURL is used by `rpk cloud` to override the public API URL.
+	PublicAPIURL string `env:"RPK_PUBLIC_API_URL"`
 }
 
 // Config encapsulates a redpanda.yaml and/or an rpk.yaml. This is the
@@ -73,6 +78,30 @@ type Config struct {
 	rpkYamlInitd  bool    // if OrEmpty was returned to initialize a new "actual" file that has not yet been written
 
 	devOverrides DevOverrides
+}
+
+// CheckExitCloudAdmin exits if the profile has FromCloud=true and no
+// ALLOW_RPK_CLOUD_ADMIN override.
+func CheckExitCloudAdmin(p *RpkProfile) {
+	if p.FromCloud && !p.DevOverrides().AllowRpkCloudAdmin {
+		out.Die("This admin API based command is not supported on Redpanda Cloud clusters.")
+	}
+}
+
+// CheckExitServerlessAdmin exits if the profile has FromCloud=true and the
+// cluster is a Serverless cluster.
+func CheckExitServerlessAdmin(p *RpkProfile) {
+	if p.FromCloud && p.CloudCluster.IsServerless() {
+		out.Die("This admin API based command is not supported on Redpanda Cloud serverless clusters.")
+	}
+}
+
+// CheckExitNotServerlessAdmin exits if the profile has FromCloud=true and the
+// cluster is NOT a Serverless cluster.
+func CheckExitNotServerlessAdmin(p *RpkProfile) {
+	if p.FromCloud && !p.CloudCluster.IsServerless() {
+		out.Die("This admin API based command is not supported on Redpanda Cloud clusters.")
+	}
 }
 
 // VirtualRedpandaYaml returns a redpanda.yaml, starting with defaults,
@@ -115,6 +144,12 @@ func (c *Config) VirtualRpkYaml() *RpkYaml {
 // Params.Load.
 func (c *Config) VirtualProfile() *RpkProfile {
 	return c.rpkYaml.Profile(c.rpkYaml.CurrentProfile)
+}
+
+// ActualProfile returns an actual rpk.yaml's current profile.
+// This may return nil if there is no current profile.
+func (c *Config) ActualProfile() *RpkProfile {
+	return c.rpkYamlActual.Profile(c.rpkYamlActual.CurrentProfile)
 }
 
 // ActualRpkYaml returns an actual rpk.yaml if it exists, with no other
@@ -185,8 +220,9 @@ func (p *Params) LoadVirtualProfile(fs afero.Fs) (*RpkProfile, error) {
 ///////////
 
 const (
-	ModeDev  = "dev"
-	ModeProd = "prod"
+	ModeDev      = "dev"
+	ModeProd     = "prod"
+	ModeRecovery = "recovery"
 )
 
 func (c *Config) SetMode(fs afero.Fs, mode string) error {
@@ -196,6 +232,8 @@ func (c *Config) SetMode(fs afero.Fs, mode string) error {
 		yRedpanda.setDevMode()
 	case strings.HasPrefix("production", mode):
 		yRedpanda.setProdMode()
+	case strings.HasPrefix("recovery", mode):
+		yRedpanda.setRecoveryMode()
 	default:
 		return fmt.Errorf("unknown mode %q", mode)
 	}
@@ -204,10 +242,12 @@ func (c *Config) SetMode(fs afero.Fs, mode string) error {
 
 func (y *RedpandaYaml) setDevMode() {
 	y.Redpanda.DeveloperMode = true
+	y.Redpanda.RecoveryModeEnabled = false
 	// Defaults to setting all tuners to false
 	y.Rpk = RpkNodeConfig{
 		KafkaAPI:             y.Rpk.KafkaAPI,
 		AdminAPI:             y.Rpk.AdminAPI,
+		SR:                   y.Rpk.SR,
 		AdditionalStartFlags: y.Rpk.AdditionalStartFlags,
 		SMP:                  DevDefault().Rpk.SMP,
 		Overprovisioned:      true,
@@ -221,6 +261,7 @@ func (y *RedpandaYaml) setDevMode() {
 
 func (y *RedpandaYaml) setProdMode() {
 	y.Redpanda.DeveloperMode = false
+	y.Redpanda.RecoveryModeEnabled = false
 	y.Rpk.Overprovisioned = false
 	y.Rpk.Tuners.TuneNetwork = true
 	y.Rpk.Tuners.TuneDiskScheduler = true
@@ -233,4 +274,8 @@ func (y *RedpandaYaml) setProdMode() {
 	y.Rpk.Tuners.TuneSwappiness = true
 	y.Rpk.Tuners.TuneDiskWriteCache = true
 	y.Rpk.Tuners.TuneBallastFile = true
+}
+
+func (y *RedpandaYaml) setRecoveryMode() {
+	y.Redpanda.RecoveryModeEnabled = true
 }

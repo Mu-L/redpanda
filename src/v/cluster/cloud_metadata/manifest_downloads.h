@@ -9,18 +9,17 @@
  */
 #pragma once
 
+#include "base/outcome.h"
+#include "base/seastarx.h"
 #include "cluster/cloud_metadata/cluster_manifest.h"
 #include "cluster/cloud_metadata/error_outcome.h"
-#include "outcome.h"
-#include "seastarx.h"
+#include "utils/retry_chain_node.h"
 
 #include <seastar/core/future.hh>
 
 namespace cloud_storage {
 class remote;
 } // namespace cloud_storage
-
-class retry_chain_node;
 
 namespace cluster::cloud_metadata {
 
@@ -38,5 +37,26 @@ ss::future<cluster_manifest_result> download_highest_manifest_for_cluster(
   const model::cluster_uuid& cluster_uuid,
   const cloud_storage_clients::bucket_name& bucket,
   retry_chain_node& retry_node);
+
+// Returns keys with the cluster UUID prefix aren't referenced by the manifest
+// and can be safely deleted.
+ss::future<std::list<ss::sstring>> list_orphaned_by_manifest(
+  cloud_storage::remote& remote,
+  const model::cluster_uuid& cluster_uuid,
+  const cloud_storage_clients::bucket_name& bucket,
+  const cluster_metadata_manifest& manifest,
+  retry_chain_node& retry_node);
+
+// Looks through the given bucket for cluster metadata with the highest
+// metadata ID.
+// - list_failed/download_failed: there was a physical error sending requests
+//   to remote storage, preventing us from returning an accurate result.
+// - no_matching_metadata: we were able to list an sift through the bucket, but
+//   no cluster metadata manifest exists.
+ss::future<cluster_manifest_result> download_highest_manifest_in_bucket(
+  cloud_storage::remote& remote,
+  const cloud_storage_clients::bucket_name& bucket,
+  retry_chain_node& retry_node,
+  std::optional<model::cluster_uuid> ignore_uuid = std::nullopt);
 
 } // namespace cluster::cloud_metadata

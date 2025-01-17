@@ -37,16 +37,16 @@ namespace pandaproxy {
 class kafka_client_cache {
 public:
     kafka_client_cache(
-      YAML::Node const& cfg,
+      const YAML::Node& cfg,
       size_t max_size,
       std::chrono::milliseconds keep_alive);
 
     ~kafka_client_cache() = default;
 
     kafka_client_cache(kafka_client_cache&&) = default;
-    kafka_client_cache(kafka_client_cache const&) = delete;
+    kafka_client_cache(const kafka_client_cache&) = delete;
     kafka_client_cache& operator=(kafka_client_cache&&) = delete;
-    kafka_client_cache& operator=(kafka_client_cache const&) = delete;
+    kafka_client_cache& operator=(const kafka_client_cache&) = delete;
 
     ss::future<> start();
     ss::future<> stop();
@@ -101,6 +101,6 @@ private:
     std::list<timestamped_user> _evicted_items;
     ss::timer<ss::lowres_clock> _gc_timer;
     ss::gate _gc_gate;
-    mutex _gc_lock;
+    mutex _gc_lock{"kafka_client_cache::gc_lock"};
 };
 } // namespace pandaproxy

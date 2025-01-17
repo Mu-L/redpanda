@@ -7,7 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "seastarx.h"
+#include "base/seastarx.h"
 #include "ssx/sformat.h"
 
 #include <seastar/core/reactor.hh>
@@ -39,7 +39,7 @@ void run_test(Fun fun, size_t data_size) {
     std::vector<Val> vec;
     vec.reserve(data_size);
     perf_tests::start_measuring_time();
-    for (int i = 0; i < data_size; ++i) {
+    for (size_t i = 0; i < data_size; ++i) {
         vec.emplace_back(fun(fmt::runtime("{}"), identifier));
     }
     perf_tests::do_not_optimize(

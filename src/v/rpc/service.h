@@ -11,10 +11,11 @@
 
 #pragma once
 
+#include "base/seastarx.h"
+#include "net/types.h"
 #include "reflection/async_adl.h"
 #include "rpc/parse_utils.h"
 #include "rpc/types.h"
-#include "seastarx.h"
 #include "ssx/sformat.h"
 
 #include <seastar/core/future.hh>
@@ -39,11 +40,11 @@ struct service {
     virtual void setup_metrics() = 0;
 };
 
-class rpc_internal_body_parsing_exception : public std::exception {
+class rpc_internal_body_parsing_exception : public net::parsing_exception {
 public:
     explicit rpc_internal_body_parsing_exception(const std::exception_ptr& e)
-      : _what(
-        ssx::sformat("Unable to parse received RPC request payload - {}", e)) {}
+      : _what(ssx::sformat(
+          "Unable to parse received RPC request payload - {}", e)) {}
 
     const char* what() const noexcept final { return _what.c_str(); }
 
@@ -99,7 +100,7 @@ struct service::execution_helper {
                           input_f.get_exception());
                     }
                     ctx.signal_body_parse();
-                    auto input = input_f.get0();
+                    auto input = input_f.get();
                     return f(std::move(input), ctx);
                 })
                 .then([method, &ctx](Output out) mutable {

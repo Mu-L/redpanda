@@ -7,22 +7,26 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+from subprocess import CalledProcessError
 from ducktape.mark import matrix
+from ducktape.mark.resource import cluster as dt_cluster
 from ducktape.tests.test import Test
 
-from rptest.tests.redpanda_test import RedpandaTest
+from rptest.tests.redpanda_test import RedpandaMixedTest, RedpandaTest
 from rptest.services.cluster import cluster
+from rptest.clients.kubectl import is_redpanda_pod, SUPPORTED_PROVIDERS
 from rptest.clients.rpk import RpkTool
 from rptest.clients.types import TopicSpec
 from rptest.services.failure_injector import FailureSpec, make_failure_injector
 from rptest.services.openmessaging_benchmark import OpenMessagingBenchmark
 from rptest.services.kgo_repeater_service import repeater_traffic
 from rptest.services.kgo_verifier_services import KgoVerifierRandomConsumer, KgoVerifierSeqConsumer, KgoVerifierConsumerGroupConsumer, KgoVerifierProducer
-from rptest.services.redpanda import SISettings, CloudStorageType, get_cloud_storage_type, make_redpanda_service, RedpandaServiceBase, RedpandaServiceCloud
+from rptest.services.redpanda import RedpandaServiceCloud, SISettings, CloudStorageType, get_cloud_storage_type, make_redpanda_service, make_redpanda_mixed_service
 from rptest.tests.prealloc_nodes import PreallocNodesTest
 from rptest.utils.si_utils import BucketView
 from rptest.util import expect_exception
 from rptest.utils.mode_checks import skip_debug_mode
+from rptest.services.producer_swarm import ProducerSwarm
 
 
 class OpenBenchmarkSelfTest(RedpandaTest):
@@ -52,12 +56,63 @@ class OpenBenchmarkSelfTest(RedpandaTest):
         benchmark.check_succeed(validate_metrics=self.redpanda.dedicated_nodes)
 
 
-class KgoRepeaterSelfTest(RedpandaTest):
+class ProducerSwarmSelfTest(RedpandaTest):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, num_brokers=3, **kwargs)
 
     @skip_debug_mode  # Sends meaningful traffic, and not intended to test Redpanda
     @cluster(num_nodes=4)
+    def test_producer_swarm(self):
+        spec = TopicSpec(name="test_topic",
+                         partition_count=10,
+                         replication_factor=3)
+        self.client().create_topic(spec)
+        topic_name = spec.name
+
+        producer = ProducerSwarm(self.test_context,
+                                 self.redpanda,
+                                 topic_name,
+                                 producers=10,
+                                 records_per_producer=500,
+                                 messages_per_second_per_producer=10)
+        producer.start()
+        producer.await_progress(target_msg_rate=8, timeout_sec=40)
+        producer.wait()
+        producer.stop()
+
+    @cluster(num_nodes=4)
+    def test_wait_start_stop(self):
+        spec = TopicSpec(partition_count=10, replication_factor=1)
+        self.client().create_topic(spec)
+        topic_name = spec.name
+
+        producer = ProducerSwarm(self.test_context,
+                                 self.redpanda,
+                                 topic_name,
+                                 producers=10,
+                                 records_per_producer=500,
+                                 messages_per_second_per_producer=10)
+
+        producer.start()
+        assert producer.is_alive()
+        producer.wait_for_all_started()
+        producer.stop()
+
+        assert not producer.is_alive()
+
+        # check that a subsequent start/stop works
+        producer.start()
+        assert producer.is_alive()
+        producer.wait_for_all_started()
+        producer.stop()
+
+
+class KgoRepeaterSelfTest(RedpandaMixedTest):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, min_brokers=3, **kwargs)
+
+    @skip_debug_mode  # Sends meaningful traffic, and not intended to test Redpanda
+    @cluster(num_nodes=5)
     def test_kgo_repeater(self):
         topic = 'test'
         self.client().create_topic(
@@ -67,11 +122,23 @@ class KgoRepeaterSelfTest(RedpandaTest):
                       segment_bytes=1024 * 1024))
         with repeater_traffic(context=self.test_context,
                               redpanda=self.redpanda,
-                              topic=topic,
+                              num_nodes=2,
+                              topics=[topic],
                               msg_size=4096,
                               workers=1) as repeater:
             repeater.await_group_ready()
             repeater.await_progress(1024, timeout_sec=75)
+
+        # Assert clean service stop.
+        for service in self.test_context.services:
+            for node in service.nodes:
+                cmd = """ps ax | grep -i kgo-repeater | grep -v grep | awk '{print $1}'"""
+                pids = [
+                    pid
+                    for pid in node.account.ssh_capture(cmd, allow_fail=True)
+                ]
+                self.logger.debug(f"Running kgo-repeater: {pids}")
+                assert len(pids) == 0
 
 
 class KgoVerifierSelfTest(PreallocNodesTest):
@@ -155,7 +222,8 @@ class BucketScrubSelfTest(RedpandaTest):
     @skip_debug_mode  # We wait for a decent amount of traffic
     @cluster(num_nodes=4)
     #@matrix(cloud_storage_type=get_cloud_storage_type())
-    @matrix(cloud_storage_type=[CloudStorageType.S3])
+    @matrix(cloud_storage_type=get_cloud_storage_type(
+        applies_only_on=[CloudStorageType.S3]))
     def test_missing_segment(self, cloud_storage_type):
         topic = 'test'
 
@@ -173,7 +241,7 @@ class BucketScrubSelfTest(RedpandaTest):
 
         with repeater_traffic(context=self.test_context,
                               redpanda=self.redpanda,
-                              topic=topic,
+                              topics=[topic],
                               msg_size=msg_size,
                               workers=1) as repeater:
             repeater.await_group_ready()
@@ -205,7 +273,7 @@ class BucketScrubSelfTest(RedpandaTest):
         segment_key = None
         for o in self.redpanda.cloud_storage_client.list_objects(
                 self.si_settings.cloud_storage_bucket):
-            if ".log" in o.key and view.is_segment_part_of_a_manifest(o):
+            if ".log" in o.key and view.find_segment_in_manifests(o):
                 segment_key = o.key
                 break
 
@@ -243,7 +311,8 @@ class SimpleSelfTest(Test):
     """
     def __init__(self, test_context):
         super(SimpleSelfTest, self).__init__(test_context)
-        self.redpanda = make_redpanda_service(test_context, 3)
+        self.redpanda = make_redpanda_mixed_service(test_context,
+                                                    min_brokers=3)
 
     def setUp(self):
         self.redpanda.start()
@@ -269,6 +338,94 @@ class SimpleSelfTest(Test):
         rpk.create_topic(topic_name)
         self.logger.info(f'deleting topic {topic_name}')
         rpk.delete_topic(topic_name)
+
+
+class KubectlSelfTest(Test):
+    """
+    Verify that the kubectl test works. Only does anything when running
+    in the cloud.
+    """
+    def __init__(self, test_context):
+        super().__init__(test_context)
+        self.redpanda = make_redpanda_mixed_service(test_context)
+
+    def setUp(self):
+        self.redpanda.start()
+
+    @cluster(num_nodes=3)
+    def test_kubectl_tool(self):
+        rp = self.redpanda
+
+        if isinstance(rp, RedpandaServiceCloud):
+            version_out = rp.kubectl.cmd(['version', '--client'])
+            assert 'Client Version' in version_out, f'Did not find expceted output, output was: {version_out}'
+
+            try:
+                # foobar, of course, is not a valid kubectl command
+                rp.kubectl.cmd(['foobar'])
+                assert False, 'expected this command to throw'
+            except CalledProcessError:
+                pass
+
+
+class KubectlLocalOnlyTest(Test):
+    @dt_cluster(num_nodes=0)
+    def test_is_redpanda_pod(self):
+        test_cases = {
+            "regular_hit": {
+                "pod": {
+                    "metadata": {
+                        "generateName": "redpanda-broker-",
+                        "labels": {
+                            "app.kubernetes.io/component":
+                            "redpanda-statefulset"
+                        }
+                    }
+                },
+                "result": True
+            },
+            "miss_wrong_generate_name": {
+                "pod": {
+                    "metadata": {
+                        "generateName": "redpanda-broker-configuration-",
+                        "labels": {
+                            "app.kubernetes.io/component":
+                            "redpanda-statefulset"
+                        }
+                    }
+                },
+                "result": False
+            },
+            "miss_wrong_component": {
+                "pod": {
+                    "metadata": {
+                        "generateName": "redpanda-broker-configuration-",
+                        "labels": {
+                            "app.kubernetes.io/component":
+                            "redpanda-post-install"
+                        }
+                    },
+                },
+                "result": False
+            },
+            "hit_legacy_pod_name": {
+                "pod": {
+                    "metadata": {
+                        "name": "rp-CLUSTER_ID-4"
+                    }
+                },
+                "result": True
+            },
+        }
+        for test_name, test_case in test_cases.items():
+            pod_obj = test_case["pod"]
+            expected_result = test_case["result"]
+            try:
+                actual_result = is_redpanda_pod(pod_obj, "CLUSTER_ID")
+            except KeyError as err:
+                self.logger.error(f"KeyError from is_redpanda_pod: {err}")
+                actual_result = False
+            assert expected_result is actual_result, f"Failed for test case '{test_name}' (expected={expected_result}, actual={actual_result})"
 
 
 class FailureInjectorSelfTest(Test):

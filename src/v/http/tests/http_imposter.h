@@ -10,21 +10,23 @@
 
 #pragma once
 
+#include "base/seastarx.h"
+#include "base/vassert.h"
 #include "http/tests/registered_urls.h"
-#include "net/unresolved_address.h"
-#include "seastarx.h"
-#include "vassert.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/sstring.hh>
 #include <seastar/http/httpd.hh>
 
 class http_imposter_fixture {
 public:
-    static constexpr std::string_view httpd_host_name = "127.0.0.1";
+    static constexpr std::string_view httpd_host_name = "localhost";
+    static constexpr std::string_view httpd_host_ip = "127.0.0.1";
 
     uint16_t httpd_port_number();
 
 public:
+    static constexpr auto imdsv2_token_url = "/latest/api/token";
     using request_predicate
       = ss::noncopyable_function<bool(const ss::http::request&)>;
 
@@ -54,9 +56,17 @@ public:
     /// Access all http requests ordered by time
     const std::vector<http_test_utils::request_info>& get_requests() const;
 
+    using req_pred_t
+      = std::function<bool(const http_test_utils::request_info&)>;
+
+    /// Access http requests matching the given predicate
+    std::vector<http_test_utils::request_info>
+    get_requests(req_pred_t predicate) const;
+
     /// Get the latest request to a particular URL
     std::optional<std::reference_wrapper<const http_test_utils::request_info>>
-    get_latest_request(const ss::sstring& url) const;
+    get_latest_request(
+      const ss::sstring& url, bool ignore_url_params = false) const;
 
     /// Get the number of requests to a particular URL
     size_t get_request_count(const ss::sstring& url) const;
@@ -72,7 +82,7 @@ public:
     ///     .then_return("bar");
     http_test_utils::registered_urls& when() { return _urls; }
 
-    bool has_call(std::string_view url) const;
+    bool has_call(std::string_view url, bool ignore_url_params = false) const;
 
     /// Enables requests with a specific condition to fail. The failing
     /// request is also added to the set of calls stored by fixture.

@@ -10,14 +10,15 @@
  */
 #pragma once
 #include "cluster/rm_stm.h"
+#include "container/fragmented_vector.h"
+#include "container/intrusive_list_helpers.h"
 #include "kafka/protocol/fetch.h"
 #include "kafka/server/handlers/fetch/replica_selector.h"
 #include "kafka/server/handlers/handler.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
 #include "model/ktp.h"
 #include "model/metadata.h"
-#include "utils/intrusive_list_helpers.h"
+#include "ssx/abort_source.h"
 #include "utils/log_hist.h"
 
 #include <seastar/core/smp.hh>
@@ -109,7 +110,8 @@ struct op_context {
     bool should_stop_fetch() const {
         return !request.debounce_delay() || over_min_bytes()
                || is_empty_request() || contains_preferred_replica
-               || response_error || deadline <= model::timeout_clock::now();
+               || response_error || rctx.abort_requested()
+               || deadline <= model::timeout_clock::now();
     }
 
     bool over_min_bytes() const {
@@ -117,6 +119,8 @@ struct op_context {
     }
 
     ss::future<response_ptr> send_response() &&;
+
+    ss::future<response_ptr> send_error_response(error_code ec) &&;
 
     response_iterator response_begin() { return iteration_order.begin(); }
 
@@ -166,11 +170,14 @@ struct fetch_config {
     bool skip_read{false};
     bool read_from_follower{false};
     std::optional<model::rack_id> consumer_rack_id;
+    std::optional<std::reference_wrapper<ssx::sharded_abort_source>>
+      abort_source;
+    std::optional<model::client_address_t> client_address;
 
     friend std::ostream& operator<<(std::ostream& o, const fetch_config& cfg) {
         fmt::print(
           o,
-          R"({{"start_offset": {}, "max_offset": {}, "isolation_lvl": {}, "max_bytes": {}, "strict_max_bytes": {}, "skip_read": {}, "current_leader_epoch:" {}, "follower_read:" {}, "consumer_rack_id": {}}})",
+          R"({{"start_offset": {}, "max_offset": {}, "isolation_lvl": {}, "max_bytes": {}, "strict_max_bytes": {}, "skip_read": {}, "current_leader_epoch:" {}, "follower_read:" {}, "consumer_rack_id": {}, "abortable": {}, "aborted": {}, "client_address": {}}})",
           cfg.start_offset,
           cfg.max_offset,
           cfg.isolation_level,
@@ -179,7 +186,12 @@ struct fetch_config {
           cfg.skip_read,
           cfg.current_leader_epoch,
           cfg.read_from_follower,
-          cfg.consumer_rack_id);
+          cfg.consumer_rack_id,
+          cfg.abort_source.has_value(),
+          cfg.abort_source.has_value()
+            ? cfg.abort_source.value().get().abort_requested()
+            : false,
+          cfg.client_address.value_or(model::client_address_t{}));
         return o;
     }
 };
@@ -238,13 +250,20 @@ struct read_result {
     };
 
     explicit read_result(error_code e)
-      : error(e) {}
+      : start_offset(-1)
+      , high_watermark(-1)
+      , last_stable_offset(-1)
+      , error(e) {}
 
     // special case for offset_out_of_range_error
     read_result(
-      error_code e, model::offset start_offset, model::offset high_watermark)
+      error_code e,
+      model::offset start_offset,
+      model::offset hw,
+      model::offset lso)
       : start_offset(start_offset)
-      , high_watermark(high_watermark)
+      , high_watermark(hw)
+      , last_stable_offset(lso)
       , error(e) {}
 
     read_result(
@@ -252,11 +271,13 @@ struct read_result {
       model::offset start_offset,
       model::offset hw,
       model::offset lso,
-      std::vector<cluster::rm_stm::tx_range> aborted_transactions)
+      std::optional<std::chrono::milliseconds> delta,
+      std::vector<cluster::tx::tx_range> aborted_transactions)
       : data(std::move(data))
       , start_offset(start_offset)
       , high_watermark(hw)
       , last_stable_offset(lso)
+      , delta_from_tip_ms(delta)
       , error(error_code::none)
       , aborted_transactions(std::move(aborted_transactions)) {}
 
@@ -299,28 +320,27 @@ struct read_result {
         return ss::visit(
           data,
           [](data_t& d) { return std::move(*d); },
-          [](foreign_data_t& d) {
-              auto ret = d->copy();
-              d.reset();
-              return ret;
-          });
+          [](foreign_data_t& d) { return std::move(*d); });
     }
 
     variant_t data;
     model::offset start_offset;
     model::offset high_watermark;
     model::offset last_stable_offset;
+    std::optional<std::chrono::milliseconds> delta_from_tip_ms;
     std::optional<model::node_id> preferred_replica;
     error_code error;
     model::partition_id partition;
-    std::vector<cluster::rm_stm::tx_range> aborted_transactions;
+    std::vector<cluster::tx::tx_range> aborted_transactions;
     memory_units_t memory_units;
 };
 // struct aggregating fetch requests and corresponding response iterators for
 // the same shard
 struct shard_fetch {
-    explicit shard_fetch(op_context::latency_point start_time)
-      : start_time{start_time} {}
+    explicit shard_fetch(
+      ss::shard_id shard_id, op_context::latency_point start_time)
+      : shard(shard_id)
+      , start_time{start_time} {}
 
     void push_back(
       ntp_fetch_config config, op_context::response_placeholder_ptr r_ph) {
@@ -335,8 +355,8 @@ struct shard_fetch {
     }
 
     ss::shard_id shard;
-    std::vector<ntp_fetch_config> requests;
-    std::vector<op_context::response_placeholder_ptr> responses;
+    chunked_vector<ntp_fetch_config> requests;
+    chunked_vector<op_context::response_placeholder_ptr> responses;
     op_context::latency_point start_time;
 
     friend std::ostream& operator<<(std::ostream& o, const shard_fetch& sf) {
@@ -349,7 +369,12 @@ struct fetch_plan {
     explicit fetch_plan(
       size_t shards,
       op_context::latency_point start_time = op_context::latency_clock::now())
-      : fetches_per_shard(shards, shard_fetch(start_time)) {}
+      : fetches_per_shard() {
+        fetches_per_shard.reserve(shards);
+        for (size_t i = 0; i < shards; i++) {
+            fetches_per_shard.emplace_back(i, start_time);
+        }
+    }
 
     std::vector<shard_fetch> fetches_per_shard;
 
@@ -408,6 +433,8 @@ read_result::memory_units_t reserve_memory_units(
   ssx::semaphore& memory_fetch_sem,
   const size_t max_bytes,
   const bool obligatory_batch_read);
+
+ss::future<> do_fetch(op_context& octx);
 
 } // namespace testing
 } // namespace kafka

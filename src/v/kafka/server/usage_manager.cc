@@ -11,13 +11,13 @@
 
 #include "kafka/server/usage_manager.h"
 
+#include "base/vlog.h"
 #include "cluster/controller.h"
 #include "cluster/health_monitor_frontend.h"
 #include "config/configuration.h"
 #include "kafka/server/logger.h"
 #include "ssx/future-util.h"
 #include "storage/api.h"
-#include "vlog.h"
 
 namespace kafka {
 
@@ -30,10 +30,10 @@ usage_manager::usage_accounting_fiber::usage_accounting_fiber(
   std::chrono::seconds usage_window_width_interval,
   std::chrono::seconds usage_disk_persistance_interval)
   : usage_aggregator<>(
-    storage.local().kvs(),
-    usage_num_windows,
-    usage_window_width_interval,
-    usage_disk_persistance_interval)
+      storage.local().kvs(),
+      usage_num_windows,
+      usage_window_width_interval,
+      usage_disk_persistance_interval)
   , _controller(controller)
   , _health_monitor(health_monitor.local())
   , _um(um) {}

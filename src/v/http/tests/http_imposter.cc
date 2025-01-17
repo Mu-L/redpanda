@@ -10,8 +10,8 @@
 
 #include "http/tests/http_imposter.h"
 
+#include "base/vlog.h"
 #include "utils/uuid.h"
-#include "vlog.h"
 
 #include <seastar/http/function_handlers.hh>
 
@@ -21,7 +21,7 @@ static ss::logger http_imposter_log("http_imposter"); // NOLINT
 
 http_imposter_fixture::http_imposter_fixture(uint16_t port)
   : _port(port)
-  , _server_addr{ss::ipv4_addr{httpd_host_name.data(), httpd_port_number()}}
+  , _server_addr{ss::ipv4_addr{httpd_host_ip.data(), httpd_port_number()}}
   , _address{
       {httpd_host_name.data(), httpd_host_name.size()}, httpd_port_number()} {
     _id = fmt::format("{}", uuid_t::create());
@@ -43,9 +43,30 @@ http_imposter_fixture::get_requests() const {
     return _requests;
 }
 
+std::vector<http_test_utils::request_info> http_imposter_fixture::get_requests(
+  http_imposter_fixture::req_pred_t predicate) const {
+    std::vector<http_test_utils::request_info> matching_requests;
+    matching_requests.reserve(_requests.size());
+    std::copy_if(
+      _requests.cbegin(),
+      _requests.cend(),
+      std::back_inserter(matching_requests),
+      std::move(predicate));
+    return matching_requests;
+}
+
+static ss::sstring remove_query_params(std::string_view url) {
+    return ss::sstring{url.substr(0, url.find('?'))};
+}
+
 std::optional<std::reference_wrapper<const http_test_utils::request_info>>
-http_imposter_fixture::get_latest_request(const ss::sstring& url) const {
-    auto i = _targets.upper_bound(url);
+http_imposter_fixture::get_latest_request(
+  const ss::sstring& url, bool ignore_url_params) const {
+    auto i = std::ranges::upper_bound(
+      _targets, url, std::less<>{}, [=](const auto& url_ri) {
+          return ignore_url_params ? remove_query_params(url_ri.first)
+                                   : url_ri.first;
+      });
     if (i == _targets.begin()) {
         return std::nullopt;
     } else {
@@ -71,12 +92,6 @@ void http_imposter_fixture::listen() {
     vlog(http_imposter_log.trace, "HTTP imposter {} started", _id);
 }
 
-static ss::sstring remove_query_params(std::string_view url) {
-    auto q_pos = url.find('?');
-    return q_pos == std::string_view::npos ? ss::sstring{url.data(), url.size()}
-                                           : ss::sstring{url.substr(0, q_pos)};
-}
-
 void http_imposter_fixture::set_routes(ss::httpd::routes& r) {
     using namespace ss::httpd;
     _handler = std::make_unique<function_handler>(
@@ -93,6 +108,9 @@ void http_imposter_fixture::set_routes(ss::httpd::routes& r) {
           }
 
           http_test_utils::request_info ri(req);
+          for (const auto& [k, v] : req._headers) {
+              ri.headers[k] = v;
+          }
           _requests.push_back(ri);
           _targets.insert(std::make_pair(ri.url, ri));
 
@@ -122,7 +140,10 @@ void http_imposter_fixture::set_routes(ss::httpd::routes& r) {
             req.content_length,
             req._method);
 
-          if (req._method == "PUT") {
+          if (req._method == "PUT" && req._url == imdsv2_token_url) {
+              repl.set_status(ss::http::reply::status_type::ok);
+              return "IMDSv2-TOKEN";
+          } else if (req._method == "PUT") {
               when().request(req._url).then_reply_with(req.content);
               repl.set_status(ss::http::reply::status_type::ok);
               return "";
@@ -139,6 +160,10 @@ void http_imposter_fixture::set_routes(ss::httpd::routes& r) {
 
               auto response = lookup(lookup_r);
               repl.set_status(response.status);
+              for (const auto& [k, v] : response.headers) {
+                  repl.add_header(k, v);
+              }
+
               return response.body;
           }
       },
@@ -146,12 +171,15 @@ void http_imposter_fixture::set_routes(ss::httpd::routes& r) {
     r.add_default_handler(_handler.get());
 }
 
-bool http_imposter_fixture::has_call(std::string_view url) const {
-    return std::find_if(
-             _requests.cbegin(),
-             _requests.cend(),
-             [&url](const auto& r) { return r.url == url; })
-           != _requests.cend();
+bool http_imposter_fixture::has_call(
+  std::string_view url, bool ignore_params) const {
+    return std::ranges::find_if(
+             _requests,
+             [&](const http_test_utils::request_info& ri) {
+                 return url
+                        == (ignore_params ? remove_query_params(ri.url) : ri.url);
+             })
+           != _requests.end();
 }
 
 void http_imposter_fixture::fail_request_if(

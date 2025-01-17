@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "container/fragmented_vector.h"
 #include "kafka/client/assignment_plans.h"
 #include "kafka/client/broker.h"
 #include "kafka/client/brokers.h"
@@ -24,11 +25,10 @@
 #include "kafka/client/utils.h"
 #include "kafka/protocol/create_topics.h"
 #include "kafka/protocol/fetch.h"
-#include "kafka/protocol/list_offsets.h"
-#include "kafka/types.h"
-#include "net/unresolved_address.h"
+#include "kafka/protocol/list_offset.h"
 #include "ssx/semaphore.h"
 #include "utils/retry.h"
+#include "utils/unresolved_address.h"
 
 #include <seastar/core/condition-variable.hh>
 
@@ -70,14 +70,14 @@ constexpr auto default_external_mitigate = [](std::exception_ptr ex) {
     return ss::make_exception_future(ex);
 };
 
-}
+} // namespace impl
 
 class client {
 public:
     using external_mitigate
       = ss::noncopyable_function<ss::future<>(std::exception_ptr)>;
     explicit client(
-      YAML::Node const& cfg,
+      const YAML::Node& cfg,
       external_mitigate mitigater = impl::default_external_mitigate);
 
     /// \brief Connect to all brokers.
@@ -93,7 +93,8 @@ public:
           _config.retries(),
           _config.retry_base_backoff(),
           std::move(func),
-          [this](std::exception_ptr ex) { return mitigate_error(ex); });
+          [this](std::exception_ptr ex) { return mitigate_error(ex); },
+          _as);
     }
 
     /// \brief Dispatch a request to any broker.
@@ -116,7 +117,7 @@ public:
       model::topic_partition tp, model::record_batch&& batch);
 
     ss::future<produce_response>
-    produce_records(model::topic topic, std::vector<record_essence> batch);
+    produce_records(model::topic topic, chunked_vector<record_essence> batch);
 
     ss::future<list_offsets_response> list_offsets(model::topic_partition tp);
 
@@ -137,9 +138,9 @@ public:
     ss::future<> subscribe_consumer(
       const group_id& group_id,
       const member_id& member_id,
-      std::vector<model::topic> topics);
+      chunked_vector<model::topic> topics);
 
-    ss::future<std::vector<model::topic>>
+    ss::future<chunked_vector<model::topic>>
     consumer_topics(const group_id& g_id, const member_id& m_id);
 
     ss::future<assignment>
@@ -191,6 +192,14 @@ private:
     /// \brief Apply metadata update
     ss::future<> apply(metadata_response res);
 
+    /// \brief Log the client ID if it exists, otherwise don't log
+    friend std::ostream& operator<<(std::ostream& os, const client& c) {
+        if (c._config.client_identifier().has_value()) {
+            fmt::print(os, "{}: ", c._config.client_identifier().value());
+        }
+        return os;
+    }
+
     /// \brief Client holds a copy of its configuration
     configuration _config;
     /// \brief Seeds are used when no brokers are connected.
@@ -218,6 +227,7 @@ private:
 
     ss::noncopyable_function<ss::future<>(std::exception_ptr)>
       _external_mitigate;
+    ss::abort_source _as;
 };
 
 } // namespace kafka::client

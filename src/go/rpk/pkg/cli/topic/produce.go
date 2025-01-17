@@ -15,14 +15,21 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/kafka"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/schemaregistry"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/serde"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/sr"
 )
 
 func newProduceCommand(fs afero.Fs, p *config.Params) *cobra.Command {
@@ -39,6 +46,11 @@ func newProduceCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 
 		tombstone              bool
 		allowAutoTopicCreation bool
+
+		schemaIDFlag    string
+		keySchemaIDFLag string
+		protoFQN        string
+		protoKeyFQN     string
 
 		timeout time.Duration
 	)
@@ -91,12 +103,14 @@ func newProduceCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 				out.Die("invalid --delivery-timeout less than 1s")
 			default:
 				opts = append(opts, kgo.RecordDeliveryTimeout(timeout))
+				opts = append(opts, kgo.ProduceRequestTimeout(timeout+5*time.Second))
 			}
 			if partition >= 0 {
 				opts = append(opts, kgo.RecordPartitioner(kgo.ManualPartitioner()))
 			}
 			if maxMessageBytes >= 0 {
 				opts = append(opts, kgo.ProducerBatchMaxBytes(maxMessageBytes))
+				opts = append(opts, kgo.BrokerMaxWriteBytes(2*maxMessageBytes))
 			}
 			var defaultTopic string
 			if len(args) == 1 {
@@ -105,6 +119,19 @@ func newProduceCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 			}
 			if len(inFormat) == 0 {
 				out.Die("invalid empty format")
+			}
+
+			keySchemaID, isKeyTopicName, err := parseSchemaIDFlag(keySchemaIDFLag)
+			out.MaybeDie(err, "unable to parse '--schema-key-id' flag: %v", err)
+			schemaID, isValTopicName, err := parseSchemaIDFlag(schemaIDFlag)
+			out.MaybeDie(err, "unable to parse '--schema-id' flag: %v", err)
+
+			isSchemaRegistry := isKeyTopicName || isValTopicName || keySchemaID >= 0 || schemaID >= 0
+			// If the user is using schema registry, we want to use the json
+			// format: %v{json} and %k{json}.
+			if isSchemaRegistry {
+				// Replace any instance of %k or %v with %k{json} or %v{json}.
+				inFormat = regexp.MustCompile("%(v|k)([^{]|$)").ReplaceAllString(inFormat, "%$1{json}$2")
 			}
 
 			// Parse our input/output formats.
@@ -127,13 +154,35 @@ func newProduceCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 
 			// We are now ready to produce.
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
 
 			cl, err := kafka.NewFranzClient(fs, p, opts...)
 			out.MaybeDie(err, "unable to initialize kafka client: %v", err)
 			defer cl.Close()
 			defer cl.Flush(context.Background())
 
+			var defaultKeySerde, defaultValSerde *serde.Serde
+			var srCl *sr.Client
+			if isSchemaRegistry {
+				srCl, err = schemaregistry.NewClient(fs, p)
+				out.MaybeDie(err, "unable to initialize schema registry client: %v", err)
+
+				keySchema, valSchema, err := querySchemas(cmd.Context(), srCl, keySchemaID, schemaID)
+				out.MaybeDie(err, "unable to query schemas from the registry: %v", err)
+
+				if keySchema != nil {
+					defaultKeySerde, err = serde.NewSerde(cmd.Context(), srCl, keySchema, keySchemaID, protoKeyFQN)
+					out.MaybeDie(err, "unable to build serializer for the key schema: %v", err)
+				}
+				if valSchema != nil {
+					defaultValSerde, err = serde.NewSerde(cmd.Context(), srCl, valSchema, schemaID, protoFQN)
+					out.MaybeDie(err, "unable to build serializer for the value schema: %v", err)
+				}
+			}
+
+			// This is just the cache for TopicName strategy
+			// [topicName-key|value]:serde.
+			serdeCache := make(map[string]*serde.Serde)
 			for {
 				r := &kgo.Record{
 					Partition: partition,
@@ -151,10 +200,50 @@ func newProduceCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 				if r.Topic == "" && defaultTopic == "" {
 					out.Die("topic to produce to is missing, check --help for produce syntax")
 				}
-				if tombstone && len(r.Value) == 0 {
-					r.Value = nil
+				topicName := defaultTopic
+				if topicName == "" {
+					topicName = r.Topic
+				}
+				if len(r.Value) == 0 {
+					if tombstone {
+						// `null` value
+						r.Value = nil
+					} else {
+						// empty byte-slice
+						r.Value = []byte{}
+					}
+				}
+
+				if defaultKeySerde != nil || isKeyTopicName {
+					keySerde := defaultKeySerde
+					if isKeyTopicName && keySerde == nil {
+						keySerde, err = serdeFromTopicName(cmd.Context(), srCl, topicName, "key", protoKeyFQN, serdeCache)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "unable to build key serializer using TopicNameStrategy for topic %q: %v\n", topicName, err)
+							return
+						}
+					}
+					record, err := keySerde.EncodeRecord(r.Key)
+					out.MaybeDie(err, "unable to encode key: %v", err)
+					r.Key = record
+				}
+				if defaultValSerde != nil || isValTopicName {
+					valSerde := defaultValSerde
+					if isValTopicName && valSerde == nil {
+						valSerde, err = serdeFromTopicName(cmd.Context(), srCl, topicName, "value", protoFQN, serdeCache)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "unable to build value serializer using TopicNameStrategy for topic %q: %v\n", topicName, err)
+							return
+						}
+					}
+					record, err := valSerde.EncodeRecord(r.Value)
+					out.MaybeDie(err, "unable to encode value: %v", err)
+					r.Value = record
 				}
 				cl.Produce(context.Background(), r, func(r *kgo.Record, err error) {
+					if isTooLarge := errors.Is(err, kerr.MessageTooLarge); isTooLarge {
+						err = fmt.Errorf("%w Check --max-message-bytes flag or your cluster property 'kafka_batch_max_bytes'", err)
+					}
 					out.MaybeDie(err, "unable to produce record: %v", err)
 					if outf != nil {
 						outfBuf = outf.AppendRecord(outfBuf[:0], r)
@@ -173,17 +262,15 @@ func newProduceCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 	cmd.Flags().Int32Var(&maxMessageBytes, "max-message-bytes", -1, "If non-negative, maximum size of a record batch before compression")
 
 	cmd.Flags().StringVarP(&inFormat, "format", "f", "%v\n", "Input record format")
-	cmd.Flags().StringVarP(
-		&outFormat,
-		"output-format",
-		"o",
-		"Produced to partition %p at offset %o with timestamp %d.\n",
-		"what to write to stdout when a record is successfully produced",
-	)
+	cmd.Flags().StringVarP(&outFormat, "output-format", "o", "Produced to partition %p at offset %o with timestamp %d.\n", "what to write to stdout when a record is successfully produced")
 	cmd.Flags().StringArrayVarP(&recHeaders, "header", "H", nil, "Headers in format key:value to add to each record (repeatable)")
 	cmd.Flags().StringVarP(&key, "key", "k", "", "A fixed key to use for each record (parsed input keys take precedence)")
 	cmd.Flags().BoolVarP(&tombstone, "tombstone", "Z", false, "Produce empty values as tombstones")
 	cmd.Flags().BoolVar(&allowAutoTopicCreation, "allow-auto-topic-creation", false, "Auto-create non-existent topics; requires auto_create_topics_enabled on the broker")
+	cmd.Flags().StringVar(&schemaIDFlag, "schema-id", "", "Schema ID to encode the record value with, use 'topic' for TopicName strategy")
+	cmd.Flags().StringVar(&keySchemaIDFLag, "schema-key-id", "", "Schema ID to encode the record key with, use 'topic' for TopicName strategy")
+	cmd.Flags().StringVar(&protoFQN, "schema-type", "", "Name of the protobuf message type to be used to encode the record value using schema registry")
+	cmd.Flags().StringVar(&protoKeyFQN, "schema-key-type", "", "Name of the protobuf message type to be used to encode the record key using schema registry")
 
 	// Deprecated
 	cmd.Flags().IntVarP(new(int), "num", "n", 1, "")
@@ -194,6 +281,60 @@ func newProduceCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 	cmd.Flags().MarkDeprecated("timestamp", "Record timestamps are set when producing")
 
 	return cmd
+}
+
+func querySchemas(ctx context.Context, cl *sr.Client, keySchemaID, valSchemaID int) (keySchema *sr.Schema, valSchema *sr.Schema, err error) {
+	if keySchemaID > 0 {
+		keySch, err := cl.SchemaByID(ctx, keySchemaID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to retrieve the key schema with ID %v: %v", keySchemaID, err)
+		}
+		keySchema = &keySch
+	}
+	if valSchemaID > 0 {
+		vSch, err := cl.SchemaByID(ctx, valSchemaID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to retrieve the value schema with ID %v: %v", valSchemaID, err)
+		}
+		valSchema = &vSch
+	}
+	return
+}
+
+func parseSchemaIDFlag(flag string) (int, bool, error) {
+	if flag == "" {
+		return -1, false, nil
+	}
+	if strings.ToLower(flag) == "topic" {
+		return -1, true, nil
+	}
+	parsed, err := strconv.Atoi(flag)
+	if err != nil {
+		return -1, false, fmt.Errorf("unable to parse %q: %v; use either a number or 'topic'", flag, err)
+	}
+	return parsed, false, nil
+}
+
+// serdeFromTopicName returns a new serde.Serde based on the topicName strategy.
+// First, it searches if the serde is cached, if not, it will query the latest
+// schema with subject name: <topic>-<suffix> and cache the result.
+func serdeFromTopicName(ctx context.Context, cl *sr.Client, topic, suffix, protoFQN string, serdeCache map[string]*serde.Serde) (*serde.Serde, error) {
+	var newSerde *serde.Serde
+	schSubjectName := topic + "-" + suffix
+	if s, ok := serdeCache[schSubjectName]; ok {
+		newSerde = s
+	} else {
+		schema, err := cl.SchemaByVersion(ctx, schSubjectName, -1)
+		if err != nil {
+			return nil, fmt.Errorf("unable to get schema with name %q using TopicName strategy: %v", schSubjectName, err)
+		}
+		newSerde, err = serde.NewSerde(ctx, cl, &schema.Schema, schema.ID, protoFQN)
+		if err != nil {
+			return nil, fmt.Errorf("unable to build serializer for the schema: %v", err)
+		}
+		serdeCache[schSubjectName] = newSerde
+	}
+	return newSerde, nil
 }
 
 const helpProduce = `Produce records to a topic.
@@ -279,6 +420,7 @@ Reading text values can have the following modifiers:
     hex       read text then hex decode it
     base64    read text then std-encoding base64 decode it
     re        read text matching a regular expression
+    json      read text as json then compact it
 
 HEADERS
 
@@ -287,6 +429,45 @@ the following will read three headers that begin and end with a space and are
 separated by an equal:
 
     %H{3}%h{ %k=%v }
+
+SCHEMA-REGISTRY
+
+Records can be encoded using a specified schema from our schema registry. Use
+the '--schema-id' or '--schema-key-id' flags to define the schema ID, rpk will
+retrieve the schemas and encode the record accordingly.
+
+Additionally, utilizing 'topic' in the mentioned flags allows for the use of the
+Topic Name Strategy. This strategy identifies a schema subject name based on the
+topic itself. For example:
+
+Produce to 'foo', encode using the latest schema in the subject 'foo-value':
+    rpk topic produce foo --schema-id=topic
+
+For protobuf schemas, you can specify the fully qualified name of the message
+you want the record to be encoded with. Use the 'schema-type' flag or
+'schema-key-type'. If the schema contains only one message, specifying the
+message name is unnecessary. For example:
+
+Produce to 'foo', using schema ID 1, message FQN Person.Name
+    rpk topic produce foo --schema-id 1 --schema-type Person.Name
+
+TOMBSTONES
+
+By default, records produced without a value will have an empty-string value, "".
+The below example produces a record with the key 'not_a_tombstone_record' and the
+value "":
+    rpk topic produce foo -k not_a_tombstone_record
+    [ret]
+
+Tombstone records (records with a 'null' value) can be produced by using the '-Z'
+flag and creating empty-string value records. Using the same example from above,
+but adding the '-Z' flag will produce a record with the key 'tombstone_record'
+and the value 'null':
+    rpk topic produce foo -k tombstone_record -Z
+    [ret]
+
+It is important to note that records produced with values of string "null" are
+not considered tombstones by Redpanda.
 
 EXAMPLES
 
@@ -304,6 +485,8 @@ A big-endian uint16 key size, the text " foo ", and then that key:
     -f '%K{big16} foo %k'
 A value that can be two or three characters followed by a newline:
     -f '%v{re#...?#}\n'
+A key and a json value, separated by a space:
+    -f '%k %v{json}'
 
 MISC
 

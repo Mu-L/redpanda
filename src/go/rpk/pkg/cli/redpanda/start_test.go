@@ -39,63 +39,6 @@ func (l *noopLauncher) Start(_ string, rpArgs *redpanda.RedpandaArgs) error {
 	return nil
 }
 
-func TestMergeFlags(t *testing.T) {
-	tests := []struct {
-		name      string
-		current   map[string]interface{}
-		overrides []string
-		expected  map[string]string
-	}{
-		{
-			name:      "it should override the existent values",
-			current:   map[string]interface{}{"a": "true", "b": "2", "c": "127.0.0.1"},
-			overrides: []string{"--a false", "b 42"},
-			expected:  map[string]string{"a": "false", "b": "42", "c": "127.0.0.1"},
-		}, {
-			name:    "it should override the existent values (2)",
-			current: map[string]interface{}{"lock-memory": "true", "cpumask": "0-1", "logger-log-level": "'exception=debug'"},
-			overrides: []string{
-				"--overprovisioned", "--unsafe-bypass-fsync 1",
-				"--default-log-level=trace", "--logger-log-level='exception=debug'",
-				"--fail-on-abandoned-failed-futures",
-			},
-			expected: map[string]string{
-				"lock-memory":                        "true",
-				"cpumask":                            "0-1",
-				"logger-log-level":                   "'exception=debug'",
-				"overprovisioned":                    "",
-				"unsafe-bypass-fsync":                "1",
-				"default-log-level":                  "trace",
-				"--fail-on-abandoned-failed-futures": "",
-			},
-		}, {
-			name:      "it should create values not present in the current flags",
-			current:   map[string]interface{}{},
-			overrides: []string{"b 42", "c 127.0.0.1"},
-			expected:  map[string]string{"b": "42", "c": "127.0.0.1"},
-		}, {
-			name:      "it shouldn't change the current flags if no overrides are given",
-			current:   map[string]interface{}{"b": "42", "c": "127.0.0.1"},
-			overrides: []string{},
-			expected:  map[string]string{"b": "42", "c": "127.0.0.1"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			flags := mergeFlags(tt.current, tt.overrides)
-			require.Equal(t, len(flags), len(tt.expected))
-			if len(flags) != len(tt.expected) {
-				t.Fatal("the flags dicts differ in size")
-			}
-
-			for k, v := range flags {
-				require.Equal(t, tt.expected[k], v)
-			}
-		})
-	}
-}
-
 func TestParseNamedAuthNAddress(t *testing.T) {
 	authNSasl := "sasl"
 	tests := []struct {
@@ -251,6 +194,7 @@ func TestStartCommand(t *testing.T) {
 				"fetch_reads_debounce_timeout":  10,
 				"group_initial_rebalance_delay": 0,
 				"log_segment_size_min":          1,
+				"write_caching_default":         "true",
 			}
 			expYAML, err := yaml.Marshal(c)
 			require.NoError(st, err)
@@ -1536,6 +1480,7 @@ func TestStartCommand(t *testing.T) {
 				"fetch_reads_debounce_timeout":  10,
 				"group_initial_rebalance_delay": 0,
 				"log_segment_size_min":          1,
+				"write_caching_default":         "true",
 			}
 			require.Equal(st, expectedClusterFields, y.Redpanda.Other)
 		},
@@ -1588,6 +1533,7 @@ func TestStartCommand(t *testing.T) {
 				"fetch_reads_debounce_timeout":  10,
 				"group_initial_rebalance_delay": 0,
 				"log_segment_size_min":          1,
+				"write_caching_default":         "true",
 			}
 			require.Nil(st, y.Redpanda.ID)
 			require.Equal(st, true, y.Redpanda.DeveloperMode)
@@ -1631,6 +1577,7 @@ func TestStartCommand(t *testing.T) {
 				"fetch_reads_debounce_timeout":  10,
 				"group_initial_rebalance_delay": 0,
 				"log_segment_size_min":          1,
+				"write_caching_default":         "true",
 			}
 			require.Exactly(st, expectedClusterFields, y.Redpanda.Other)
 		},

@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "seastarx.h"
+#include "base/seastarx.h"
 
 #include <seastar/core/expiring_fifo.hh>
 #include <seastar/core/file.hh>
@@ -29,6 +29,8 @@ enum class chunk_state {
     download_in_progress,
     hydrated,
 };
+
+std::ostream& operator<<(std::ostream& os, chunk_state);
 
 struct segment_chunk {
     chunk_state current_state;

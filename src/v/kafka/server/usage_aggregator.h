@@ -10,10 +10,12 @@
  */
 
 #pragma once
+#include "base/vlog.h"
+#include "container/fragmented_vector.h"
 #include "kafka/server/logger.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/optional.h"
 #include "storage/kvstore.h"
-#include "utils/fragmented_vector.h"
-#include "vlog.h"
 
 #include <seastar/core/gate.hh>
 #include <seastar/core/timer.hh>
@@ -32,7 +34,7 @@ std::chrono::time_point<clock_type, duration> round_to_interval(
     /// error if this cannot be done within some threshold.
     using namespace std::chrono_literals;
     const auto interval = usage_window_width_interval;
-    const auto err_threshold = interval < 2min ? interval : 2min;
+    const auto err_threshold = interval < 2min ? 2s : 2min;
     const auto cur_interval_start = t - (t.time_since_epoch() % interval);
     const auto next_interval_start = cur_interval_start + interval;
     if (t - cur_interval_start <= err_threshold) {
@@ -43,9 +45,10 @@ std::chrono::time_point<clock_type, duration> round_to_interval(
     vlog(
       klog.error,
       "usage has detected a timestamp '{}' that exceeds the preconfigured "
-      "threshold of 2min meaning a clock has fired later or earlier then "
+      "threshold of {}s meaning a clock has fired later or earlier then "
       "expected, this is unexpected behavior and should be investigated.",
-      t.time_since_epoch().count());
+      t.time_since_epoch().count(),
+      std::chrono::duration_cast<std::chrono::seconds>(err_threshold));
     return t;
 }
 
@@ -64,6 +67,7 @@ struct usage
     auto serde_fields() {
         return std::tie(bytes_sent, bytes_received, bytes_cloud_storage);
     }
+    friend bool operator==(const usage&, const usage&) = default;
     friend std::ostream& operator<<(std::ostream& os, const usage& u) {
         fmt::print(
           os,
@@ -147,7 +151,7 @@ private:
     ss::timer<clock_type> _close_window_timer;
     ss::timer<clock_type> _persist_disk_timer;
 
-    mutex _m;
+    mutex _m{"usage_aggregator"};
     ss::gate _bg_write_gate;
     ss::gate _gate;
     size_t _current_window{0};

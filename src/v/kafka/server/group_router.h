@@ -10,9 +10,10 @@
  */
 
 #pragma once
+#include "base/seastarx.h"
 #include "cluster/fwd.h"
 #include "cluster/shard_table.h"
-#include "features/feature_table.h"
+#include "container/fragmented_vector.h"
 #include "kafka/protocol/describe_groups.h"
 #include "kafka/protocol/heartbeat.h"
 #include "kafka/protocol/join_group.h"
@@ -24,16 +25,11 @@
 #include "kafka/protocol/sync_group.h"
 #include "kafka/server/coordinator_ntp_mapper.h"
 #include "kafka/server/group_manager.h"
-#include "kafka/types.h"
-#include "seastarx.h"
 
 #include <seastar/core/reactor.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
-
-#include <exception>
-#include <type_traits>
 
 namespace kafka {
 
@@ -84,19 +80,17 @@ public:
     ss::future<cluster::begin_group_tx_reply>
     begin_tx(cluster::begin_group_tx_request request);
 
-    ss::future<cluster::prepare_group_tx_reply>
-    prepare_tx(cluster::prepare_group_tx_request request);
-
     ss::future<cluster::abort_group_tx_reply>
     abort_tx(cluster::abort_group_tx_request request);
 
     // return groups from across all shards, and if any core was still loading
-    ss::future<std::pair<error_code, std::vector<listed_group>>> list_groups();
+    ss::future<std::pair<error_code, chunked_vector<listed_group>>>
+    list_groups(group_manager::list_groups_filter_data filter_data);
 
     ss::future<described_group> describe_group(kafka::group_id g);
 
     ss::future<std::vector<deletable_group_result>>
-    delete_groups(std::vector<group_id> groups);
+    delete_groups(chunked_vector<group_id> groups);
 
     ss::sharded<coordinator_ntp_mapper>& coordinator_mapper() {
         return _coordinators;

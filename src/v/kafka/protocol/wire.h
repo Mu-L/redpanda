@@ -11,13 +11,13 @@
 
 #pragma once
 
+#include "base/likely.h"
+#include "base/seastarx.h"
 #include "bytes/bytes.h"
 #include "bytes/iobuf_parser.h"
 #include "kafka/protocol/batch_reader.h"
 #include "kafka/protocol/types.h"
-#include "likely.h"
-#include "seastarx.h"
-#include "utils/utf8.h"
+#include "strings/utf8.h"
 #include "utils/vint.h"
 
 #include <seastar/core/byteorder.hh>
@@ -25,6 +25,7 @@
 
 #include <fmt/format.h>
 
+#include <limits>
 #include <optional>
 #include <type_traits>
 
@@ -34,6 +35,22 @@ class input_stream;
 }
 
 namespace kafka::protocol {
+
+namespace detail {
+
+template<typename Container>
+concept push_backable = requires(Container c) {
+    typename Container::value_type;
+    c.push_back(std::declval<typename Container::value_type>());
+};
+
+template<typename Container>
+concept reserveable = requires(Container c) {
+    typename Container::value_type;
+    c.reserve(size_t{});
+};
+
+} // namespace detail
 
 class decoder {
 public:
@@ -55,6 +72,12 @@ public:
     uint32_t read_unsigned_varint() {
         auto [i, _] = _parser.read_unsigned_varint();
         return i;
+    }
+    float64_t read_float64() {
+        static_assert(
+          std::numeric_limits<float64_t>::is_iec559,
+          "Kafka float64 type should be IEEE 754 (IEC599)");
+        return std::bit_cast<float64_t>(read_int64());
     }
 
     static ss::sstring apply_control_validation(ss::sstring val) {
@@ -175,50 +198,62 @@ public:
     }
 
     template<
+      template<typename...> typename Container = std::vector,
       typename ElementParser,
       typename T = std::invoke_result_t<ElementParser, decoder&>>
-    std::vector<T> read_array(ElementParser&& parser) {
+    requires detail::push_backable<Container<T>>
+    Container<T> read_array(ElementParser&& parser) {
         auto len = read_int32();
         if (len < 0) {
             throw std::out_of_range(
               "Attempt to read array with negative length");
         }
-        return do_read_array(len, std::forward<ElementParser>(parser));
+        return do_read_array<Container>(
+          len, std::forward<ElementParser>(parser));
     }
 
     template<
+      template<typename...> typename Container = std::vector,
       typename ElementParser,
       typename T = std::invoke_result_t<ElementParser, decoder&>>
-    std::vector<T> read_flex_array(ElementParser&& parser) {
+    requires detail::push_backable<Container<T>>
+    Container<T> read_flex_array(ElementParser&& parser) {
         auto len = read_unsigned_varint();
         if (len == 0) {
             throw std::out_of_range(
               "Attempt to read non-null flex array with 0 length");
         }
-        return do_read_array(len - 1, std::forward<ElementParser>(parser));
+        return do_read_array<Container>(
+          len - 1, std::forward<ElementParser>(parser));
     }
 
     template<
+      template<typename...> typename Container = std::vector,
       typename ElementParser,
       typename T = std::invoke_result_t<ElementParser, decoder&>>
-    std::optional<std::vector<T>> read_nullable_array(ElementParser&& parser) {
+    requires detail::push_backable<Container<T>>
+    std::optional<Container<T>> read_nullable_array(ElementParser&& parser) {
         auto len = read_int32();
         if (len < 0) {
             return std::nullopt;
         }
-        return do_read_array(len, std::forward<ElementParser>(parser));
+        return do_read_array<Container>(
+          len, std::forward<ElementParser>(parser));
     }
 
     template<
+      template<typename...> typename Container = std::vector,
       typename ElementParser,
       typename T = std::invoke_result_t<ElementParser, decoder&>>
-    std::optional<std::vector<T>>
+    requires detail::push_backable<Container<T>>
+    std::optional<Container<T>>
     read_nullable_flex_array(ElementParser&& parser) {
         auto len = read_unsigned_varint();
         if (len == 0) {
             return std::nullopt;
         }
-        return do_read_array(len - 1, std::forward<ElementParser>(parser));
+        return do_read_array<Container>(
+          len - 1, std::forward<ElementParser>(parser));
     }
 
     // Only relevent when reading flex requests
@@ -270,17 +305,21 @@ private:
     }
 
     template<
+      template<typename...> typename Container = std::vector,
       typename ElementParser,
       typename T = std::invoke_result_t<ElementParser, decoder&>>
     requires requires(ElementParser parser, decoder& rr) {
         { parser(rr) } -> std::same_as<T>;
+        detail::push_backable<Container<T>>;
     }
-    std::vector<T> do_read_array(int32_t len, ElementParser&& parser) {
+    Container<T> do_read_array(int32_t len, ElementParser&& parser) {
         if (len < 0) {
             throw std::out_of_range("Attempt to parse array w/ negative len");
         }
-        std::vector<T> res;
-        res.reserve(len);
+        Container<T> res;
+        if constexpr (detail::reserveable<Container<T>>) {
+            res.reserve(len);
+        }
         while (len-- > 0) {
             res.push_back(parser(*this));
         }
@@ -419,6 +458,13 @@ public:
         return uuid::length;
     }
 
+    uint32_t write(float64_t v) {
+        static_assert(
+          std::numeric_limits<float64_t>::is_iec559,
+          "Kafka float64 type should be IEEE 754 (IEC599)");
+        return serialize_int<int64_t>(std::bit_cast<int64_t>(v));
+    }
+
     uint32_t write(bytes_view bv) {
         auto size = serialize_int<int32_t>(bv.size()) + bv.size();
         _out->append(reinterpret_cast<const char*>(bv.data()), bv.size());
@@ -530,12 +576,12 @@ public:
         return _out->size_bytes() - start_size;
     }
 
-    template<typename T, typename ElementWriter>
-    requires requires(ElementWriter writer, encoder& rw, T& elem) {
+    template<typename C, typename ElementWriter>
+    requires requires(
+      ElementWriter writer, encoder& rw, typename C::value_type& elem) {
         { writer(elem, rw) } -> std::same_as<void>;
     }
-    uint32_t write_nullable_array(
-      std::optional<std::vector<T>>& v, ElementWriter&& writer) {
+    uint32_t write_nullable_array(std::optional<C>& v, ElementWriter&& writer) {
         if (!v) {
             return write(int32_t(-1));
         }
@@ -557,12 +603,13 @@ public:
         return _out->size_bytes() - start_size;
     }
 
-    template<typename T, typename ElementWriter>
-    requires requires(ElementWriter writer, encoder& rw, T& elem) {
+    template<typename C, typename ElementWriter>
+    requires requires(
+      ElementWriter writer, encoder& rw, typename C::value_type& elem) {
         { writer(elem, rw) } -> std::same_as<void>;
     }
-    uint32_t write_nullable_flex_array(
-      std::optional<std::vector<T>>& v, ElementWriter&& writer) {
+    uint32_t
+    write_nullable_flex_array(std::optional<C>& v, ElementWriter&& writer) {
         if (!v) {
             return write_unsigned_varint(0);
         }

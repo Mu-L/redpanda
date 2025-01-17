@@ -10,10 +10,9 @@
  */
 
 #pragma once
+#include "metrics/metrics.h"
 #include "model/fundamental.h"
-#include "ssx/metrics.h"
 #include "storage/fwd.h"
-#include "storage/logger.h"
 #include "storage/types.h"
 
 #include <seastar/core/metrics_registration.hh>
@@ -32,10 +31,10 @@ struct disk_metrics {
 class node_probe {
 public:
     void setup_node_metrics();
-    void set_disk_metrics(
+    void set_data_disk_metrics(
       uint64_t total_bytes, uint64_t free_bytes, disk_space_alert alert);
-
-    const disk_metrics& get_disk_metrics() const { return _disk; }
+    void set_cache_disk_metrics(
+      uint64_t total_bytes, uint64_t free_bytes, disk_space_alert alert);
 
     node_probe() = default;
     node_probe(const node_probe&) = delete;
@@ -45,9 +44,9 @@ public:
     ~node_probe() = default;
 
 private:
-    disk_metrics _disk;
-    ssx::metrics::metric_groups _public_metrics
-      = ssx::metrics::metric_groups::make_public();
+    disk_metrics _data_disk;
+    disk_metrics _cache_disk;
+    metrics::public_metric_groups _public_metrics;
 };
 
 // Per-NTP probe.
@@ -85,15 +84,26 @@ public:
     void initial_segments_count(size_t cnt) { _log_segments_active = cnt; }
 
     void segment_compacted() { ++_segment_compacted; }
+    auto get_segments_compacted() const { return _segment_compacted; }
 
-    void batch_write_error(const std::exception_ptr& e) {
-        stlog.error("Error writing record batch {}", e);
-        ++_batch_write_errors;
+    void add_compaction_removed_bytes(ssize_t bytes) {
+        _compaction_removed_bytes += bytes;
     }
+
+    void batch_write_error(const std::exception_ptr& e);
 
     void add_batches_read(uint32_t batches) { _batches_read += batches; }
     void add_cached_batches_read(uint32_t batches) {
         _cached_batches_read += batches;
+    }
+
+    void add_removed_tombstone() { ++_tombstones_removed; }
+    void add_cleanly_compacted_segment() { ++_segment_cleanly_compacted; }
+    void add_segment_marked_tombstone_free() {
+        ++_segments_marked_tombstone_free;
+    }
+    void add_sliding_window_round_complete() {
+        ++_num_rounds_window_compaction;
     }
 
     void batch_parse_error() { ++_batch_parse_errors; }
@@ -113,11 +123,16 @@ public:
      */
     void clear_metrics() { _metrics.clear(); }
 
+    void add_bytes_prefix_truncated(size_t bytes) {
+        _bytes_prefix_truncated += bytes;
+    }
+
 private:
     uint64_t _partition_bytes = 0;
     uint64_t _bytes_written = 0;
     uint64_t _bytes_read = 0;
     uint64_t _cached_bytes_read = 0;
+    uint64_t _bytes_prefix_truncated = 0;
 
     uint64_t _batches_written = 0;
     uint64_t _batches_read = 0;
@@ -131,7 +146,13 @@ private:
     uint32_t _batch_parse_errors = 0;
     uint32_t _batch_write_errors = 0;
     double _compaction_ratio = 1.0;
-    ssx::metrics::metric_groups _metrics
-      = ssx::metrics::metric_groups::make_internal();
+    uint64_t _tombstones_removed = 0;
+    uint64_t _segment_cleanly_compacted = 0;
+    uint64_t _segments_marked_tombstone_free = 0;
+    uint64_t _num_rounds_window_compaction = 0;
+
+    ssize_t _compaction_removed_bytes = 0;
+
+    metrics::internal_metric_groups _metrics;
 };
 } // namespace storage

@@ -9,14 +9,13 @@
 
 #include "compression/internal/gzip_compressor.h"
 
+#include "base/vassert.h"
 #include "bytes/bytes.h"
-#include "vassert.h"
+#include "thirdparty/zlib/zlib.h"
 
 #include <seastar/core/temporary_buffer.hh>
 
 #include <fmt/core.h>
-
-#include <zlib.h>
 
 namespace compression::internal {
 [[noreturn]] [[gnu::cold]] static void

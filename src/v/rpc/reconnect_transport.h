@@ -11,13 +11,12 @@
 
 #pragma once
 
+#include "base/outcome.h"
 #include "model/metadata.h"
-#include "outcome.h"
 #include "rpc/backoff_policy.h"
 #include "rpc/transport.h"
 #include "rpc/types.h"
 #include "ssx/semaphore.h"
-#include "ssx/sformat.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
@@ -43,7 +42,7 @@ public:
       const std::optional<connection_cache_label>& label = std::nullopt,
       const std::optional<model::node_id>& node_id = std::nullopt)
       : _transport(
-        ss::make_lw_shared<rpc::transport>(std::move(c), label, node_id))
+          ss::make_lw_shared<rpc::transport>(std::move(c), label, node_id))
       , _backoff_policy(std::move(backoff_policy)) {}
 
     bool is_valid() const { return _transport->is_valid(); }

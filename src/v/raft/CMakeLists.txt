@@ -17,7 +17,6 @@ v_cc_library(
     types.cc
     replicate_entries_stm.cc
     vote_stm.cc
-    prevote_stm.cc
     recovery_stm.cc
     follower_stats.cc
     replicate_batcher.cc
@@ -30,10 +29,15 @@ v_cc_library(
     configuration_manager.cc
     group_configuration.cc
     append_entries_buffer.cc
-    follower_queue.cc
-    offset_translator.cc
     recovery_memory_quota.cc
     coordinated_recovery_throttle.cc
+    heartbeats.cc
+    state_machine_manager.cc
+    state_machine_base.cc
+    recovery_scheduler.cc
+    persisted_stm.cc
+    replication_monitor.cc
+    buffered_protocol.cc
   DEPS
     v::storage
     raft_rpc

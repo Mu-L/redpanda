@@ -8,13 +8,13 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
-#include "cloud_roles/gcp_refresh_impl.h"
+#include "gcp_refresh_impl.h"
 
 #include "bytes/streambuf.h"
 #include "cloud_roles/logger.h"
-#include "cloud_roles/request_response_helpers.h"
 #include "json/document.h"
 #include "json/istreamwrapper.h"
+#include "request_response_helpers.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
@@ -41,7 +41,7 @@ gcp_refresh_impl::gcp_refresh_impl(
   ss::abort_source& as,
   retry_params retry_params)
   : refresh_credentials::impl(
-    std::move(address), std::move(region), as, retry_params) {}
+      std::move(address), std::move(region), as, retry_params) {}
 
 ss::future<api_response> gcp_refresh_impl::fetch_credentials() {
     http::client::request_header oauth_req;
@@ -52,7 +52,7 @@ ss::future<api_response> gcp_refresh_impl::fetch_credentials() {
       metadata_flavor::header_name.data(), metadata_flavor::value.data());
 
     co_return co_await make_request(
-      co_await make_api_client(), std::move(oauth_req));
+      co_await make_api_client("gcp"), std::move(oauth_req));
 }
 
 api_response_parse_result gcp_refresh_impl::parse_response(iobuf response) {

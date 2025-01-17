@@ -12,13 +12,16 @@
 #include "cluster/cluster_utils.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/topics_frontend.h"
+#include "cluster/types.h"
 #include "config/configuration.h"
 #include "kafka/protocol/errors.h"
+#include "kafka/protocol/logger.h"
 #include "kafka/protocol/timeout.h"
+#include "kafka/server/handlers/configs/config_response_utils.h"
 #include "kafka/server/handlers/topics/topic_utils.h"
 #include "kafka/server/handlers/topics/types.h"
+#include "kafka/server/handlers/topics/validators.h"
 #include "kafka/server/quota_manager.h"
-#include "kafka/types.h"
 #include "model/metadata.h"
 #include "security/acl.h"
 #include "utils/to_string.h"
@@ -31,42 +34,71 @@
 
 #include <array>
 #include <chrono>
+#include <iterator>
+#include <optional>
 #include <string_view>
 
 namespace kafka {
 
-static constexpr auto supported_configs = std::to_array(
-  {topic_property_compression,
-   topic_property_cleanup_policy,
-   topic_property_timestamp_type,
-   topic_property_segment_size,
-   topic_property_compaction_strategy,
-   topic_property_retention_bytes,
-   topic_property_retention_duration,
-   topic_property_recovery,
-   topic_property_remote_write,
-   topic_property_remote_read,
-   topic_property_remote_delete,
-   topic_property_read_replica,
-   topic_property_max_message_bytes,
-   topic_property_retention_local_target_bytes,
-   topic_property_retention_local_target_ms,
-   topic_property_segment_ms,
-   topic_property_record_key_schema_id_validation,
-   topic_property_record_key_schema_id_validation_compat,
-   topic_property_record_key_subject_name_strategy,
-   topic_property_record_key_subject_name_strategy_compat,
-   topic_property_record_value_schema_id_validation,
-   topic_property_record_value_schema_id_validation_compat,
-   topic_property_record_value_subject_name_strategy,
-   topic_property_record_value_subject_name_strategy_compat});
+namespace {
 
 bool is_supported(std::string_view name) {
-    return std::any_of(
-      supported_configs.begin(),
-      supported_configs.end(),
-      [name](std::string_view p) { return name == p; });
+    static constexpr auto supported_configs = std::to_array(
+      {topic_property_compression,
+       topic_property_cleanup_policy,
+       topic_property_timestamp_type,
+       topic_property_segment_size,
+       topic_property_compaction_strategy,
+       topic_property_retention_bytes,
+       topic_property_retention_duration,
+       topic_property_recovery,
+       topic_property_remote_write,
+       topic_property_remote_read,
+       topic_property_remote_delete,
+       topic_property_read_replica,
+       topic_property_max_message_bytes,
+       topic_property_retention_local_target_bytes,
+       topic_property_retention_local_target_ms,
+       topic_property_segment_ms,
+       topic_property_record_key_schema_id_validation,
+       topic_property_record_key_schema_id_validation_compat,
+       topic_property_record_key_subject_name_strategy,
+       topic_property_record_key_subject_name_strategy_compat,
+       topic_property_record_value_schema_id_validation,
+       topic_property_record_value_schema_id_validation_compat,
+       topic_property_record_value_subject_name_strategy,
+       topic_property_record_value_subject_name_strategy_compat,
+       topic_property_initial_retention_local_target_bytes,
+       topic_property_initial_retention_local_target_ms,
+       topic_property_write_caching,
+       topic_property_flush_ms,
+       topic_property_flush_bytes,
+       topic_property_iceberg_mode,
+       topic_property_leaders_preference,
+       topic_property_delete_retention_ms,
+       topic_property_iceberg_delete});
+
+    if (std::any_of(
+          supported_configs.begin(),
+          supported_configs.end(),
+          [name](std::string_view p) { return name == p; })) {
+        return true;
+    }
+
+    /*
+     * check development features below. if a development feature is not
+     * enabled, the system should behave as if the feature does not exist.
+     */
+
+    if (config::shard_local_cfg().development_enable_cloud_topics()) {
+        if (name == topic_property_cloud_topic_enabled) {
+            return true;
+        }
+    }
+
+    return false;
 }
+} // namespace
 
 using validators = make_validator_types<
   creatable_topic,
@@ -81,25 +113,13 @@ using validators = make_validator_types<
   cleanup_policy_validator,
   remote_read_and_write_are_not_supported_for_read_replica,
   batch_max_bytes_limits,
-  subject_name_strategy_validator>;
-
-static std::vector<creatable_topic_configs>
-properties_to_result_configs(config_map_t config_map) {
-    std::vector<creatable_topic_configs> configs;
-    configs.reserve(config_map.size());
-    std::transform(
-      config_map.begin(),
-      config_map.end(),
-      std::back_inserter(configs),
-      [](auto& cfg) {
-          return creatable_topic_configs{
-            .name = cfg.first,
-            .value = {std::move(cfg.second)},
-            .config_source = kafka::describe_configs_source::default_config,
-          };
-      });
-    return configs;
-}
+  subject_name_strategy_validator,
+  replication_factor_must_be_greater_or_equal_to_minimum,
+  vcluster_id_validator,
+  write_caching_configs_validator,
+  iceberg_config_validator,
+  cloud_topic_config_validator,
+  delete_retention_ms_validator>;
 
 static void
 append_topic_configs(request_context& ctx, create_topics_response& response) {
@@ -111,9 +131,8 @@ append_topic_configs(request_context& ctx, create_topics_response& response) {
         auto cfg = ctx.metadata_cache().get_topic_cfg(
           model::topic_namespace_view{model::kafka_namespace, ct_result.name});
         if (cfg) {
-            auto config_map = from_cluster_type(cfg->properties);
-            ct_result.configs = {
-              properties_to_result_configs(std::move(config_map))};
+            ct_result.configs = std::make_optional(
+              report_topic_configs(ctx.metadata_cache(), cfg->properties));
             ct_result.topic_config_error_code = kafka::error_code::none;
         } else {
             // Topic was sucessfully created but metadata request did not
@@ -123,6 +142,69 @@ append_topic_configs(request_context& ctx, create_topics_response& response) {
               = kafka::error_code::unknown_server_error;
         }
     }
+}
+
+static void append_topic_properties(
+  request_context& ctx, create_topics_response& response) {
+    for (auto& ct_result : response.data.topics) {
+        auto cfg = ctx.metadata_cache().get_topic_cfg(
+          model::topic_namespace_view{model::kafka_namespace, ct_result.name});
+        if (cfg) {
+            ct_result.num_partitions = cfg->partition_count;
+            ct_result.replication_factor = cfg->replication_factor;
+        }
+    };
+}
+
+static void log_topic_status(const std::vector<cluster::topic_result>& c_res) {
+    // Group-by error code, value is list of topic names as strings
+    absl::flat_hash_map<cluster::errc, std::vector<model::topic_namespace_view>>
+      err_map;
+    for (const auto& result : c_res) {
+        auto [itr, _] = err_map.try_emplace(
+          result.ec, std::vector<model::topic_namespace_view>());
+        itr->second.emplace_back(result.tp_ns);
+    }
+
+    // Log success case
+    auto found = err_map.find(cluster::errc::success);
+    if (found != err_map.end()) {
+        vlog(
+          klog.info,
+          "Created topic(s) {{{}}} successfully",
+          fmt::join(found->second, ", "));
+        err_map.erase(found);
+    }
+
+    // Log topics that had not successfully been created at warn level
+    for (const auto& err : err_map) {
+        vlog(
+          klog.warn,
+          "Failed to create topic(s) {{{}}} error_code observed: {}",
+          fmt::join(err.second, ", "),
+          err.first);
+    }
+}
+
+// To ensure that responses to `CreateTopics` requests are returned in the same
+// order as the topics were passed. This would be out of order in the case that
+// some topics were not successfully created (error response returned) while
+// others were.
+static void sort_topic_response(
+  const create_topics_request& req, create_topics_response& resp) {
+    absl::flat_hash_map<model::topic, size_t> topic_name_order_map;
+    for (size_t i = 0; i < req.data.topics.size(); ++i) {
+        topic_name_order_map[req.data.topics[i].name] = i;
+    }
+
+    std::sort(
+      resp.data.topics.begin(),
+      resp.data.topics.end(),
+      [&topic_name_order_map](
+        const creatable_topic_result& a, const creatable_topic_result& b) {
+          return topic_name_order_map.at(a.name)
+                 < topic_name_order_map.at(b.name);
+      });
 }
 
 template<>
@@ -141,8 +223,31 @@ ss::future<response_ptr> create_topics_handler::handle(
       request.data.topics.end(),
       std::back_inserter(response.data.topics));
 
+    if (ctx.recovery_mode_enabled()) {
+        for (const auto& t :
+             boost::make_iterator_range(begin, valid_range_end)) {
+            response.data.topics.push_back(generate_error(
+              t, error_code::policy_violation, "Forbidden in recovery mode"));
+        }
+        co_return co_await ctx.respond(std::move(response));
+    }
+
+    auto additional_resources_func = [&request]() {
+        std::vector<model::topic> topics;
+        topics.reserve(request.data.topics.size());
+        std::transform(
+          request.data.topics.begin(),
+          request.data.topics.end(),
+          std::back_inserter(topics),
+          [](const creatable_topic& t) { return t.name; });
+
+        return topics;
+    };
+
     const auto has_cluster_auth = ctx.authorized(
-      security::acl_operation::create, security::default_cluster_name);
+      security::acl_operation::create,
+      security::default_cluster_name,
+      std::move(additional_resources_func));
 
     if (!has_cluster_auth) {
         auto unauthorized_it = std::partition(
@@ -158,6 +263,21 @@ ss::future<response_ptr> create_topics_handler::handle(
                 t, error_code::topic_authorization_failed, "Unauthorized");
           });
         valid_range_end = unauthorized_it;
+    }
+
+    if (!ctx.audit()) {
+        request.data.topics.erase_to_end(valid_range_end);
+        create_topics_response err_resp(
+          error_code::broker_not_available,
+          "Broker not available - audit system failure",
+          std::move(response),
+          std::move(request));
+
+        if (ctx.header().version >= api_version(5)) {
+            append_topic_configs(ctx, err_resp);
+        }
+
+        co_return co_await ctx.respond(std::move(err_resp));
     }
 
     // fill in defaults if necessary
@@ -186,6 +306,12 @@ ss::future<response_ptr> create_topics_handler::handle(
     // Print log if not supported configuration options are present
     for (auto& r : boost::make_iterator_range(begin, valid_range_end)) {
         for (auto c : r.configs) {
+            // special case for vcluster topic property
+            if (
+              config::shard_local_cfg().enable_mpx_extensions()
+              && c.name == topic_property_mpx_virtual_cluster_id) {
+                continue;
+            }
             if (!is_supported(c.name)) {
                 vlog(
                   klog.info,
@@ -209,11 +335,34 @@ ss::future<response_ptr> create_topics_handler::handle(
           std::back_inserter(response.data.topics),
           [&ctx](const creatable_topic& t) {
               auto result = generate_successfull_result(t);
+              if (ctx.metadata_cache().contains(model::topic_namespace_view{
+                    model::kafka_namespace, t.name})) {
+                  result.error_code = error_code::topic_already_exists;
+                  return result;
+              }
+              try {
+                  // Try parsing all the config parameters.
+                  std::ignore = to_cluster_type(t);
+              } catch (...) {
+                  auto e = std::current_exception();
+                  vlog(
+                    klog.warn,
+                    "Invalid config for topic creation generated error: {}",
+                    e);
+                  result.error_code = error_code::invalid_config;
+                  return result;
+              }
+              result.num_partitions = t.num_partitions;
+              result.replication_factor = t.replication_factor;
               if (ctx.header().version >= api_version(5)) {
+                  // TODO(Rob): it looks like get_default_properties is used
+                  // only there so there is a high chance of diverging
+                  // dry run's default_properties upposed to be used on
+                  // topic creation and the real deal
                   auto default_properties
                     = ctx.metadata_cache().get_default_properties();
-                  result.configs = {properties_to_result_configs(
-                    from_cluster_type(default_properties))};
+                  result.configs = std::make_optional(report_topic_configs(
+                    ctx.metadata_cache(), default_properties));
               }
               return result;
           });
@@ -253,19 +402,8 @@ ss::future<response_ptr> create_topics_handler::handle(
       });
     valid_range_end = quota_exceeded_it;
 
-    auto to_create = to_cluster_type(begin, valid_range_end);
-    /**
-     * We always override cleanup policy. i.e. topic cleanup policy will
-     * stay the same even if it was changed in defaults (broker
-     * configuration) and there was no override passed by client while
-     * creating a topic. The the same policy is applied in Kafka.
-     */
-    for (auto& tp : to_create) {
-        if (!tp.cfg.properties.cleanup_policy_bitflags.has_value()) {
-            tp.cfg.properties.cleanup_policy_bitflags
-              = ctx.metadata_cache().get_default_cleanup_policy_bitflags();
-        }
-    }
+    auto to_create = to_cluster_type(
+      begin, valid_range_end, std::back_inserter(response.data.topics));
 
     // Create the topics with controller on core 0
     auto c_res = co_await ctx.topics_frontend().create_topics(
@@ -277,11 +415,14 @@ ss::future<response_ptr> create_topics_handler::handle(
       to_timeout(request.data.timeout_ms));
     // Append controller results to validation errors
     append_cluster_results(c_res, response.data.topics);
+    append_topic_properties(ctx, response);
     if (ctx.header().version >= api_version(5)) {
         append_topic_configs(ctx, response);
     }
 
-    co_return co_await ctx.respond(response);
+    log_topic_status(c_res);
+    sort_topic_response(request, response);
+    co_return co_await ctx.respond(std::move(response));
 }
 
 } // namespace kafka

@@ -1,7 +1,18 @@
+// Copyright 2023 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
 package partitions
 
 import (
 	"fmt"
+
+	"github.com/redpanda-data/common-go/rpadmin"
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
@@ -69,10 +80,10 @@ investigation. A few areas to investigate:
 		Args: cobra.ExactArgs(0),
 		Run: func(cmd *cobra.Command, _ []string) {
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
-			out.CheckExitCloudAdmin(p)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
+			config.CheckExitCloudAdmin(p)
 
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			status, err := cl.GetPartitionStatus(cmd.Context())
@@ -85,18 +96,18 @@ investigation. A few areas to investigate:
 	return cmd
 }
 
-func printBalancerStatus(pbs adminapi.PartitionBalancerStatus) {
-	const format = `Status:                       %v
-Seconds Since Last Tick:      %v
-Current Reassignment Count:   %v
-`
-	fmt.Printf(format, pbs.Status, pbs.SecondsSinceLastTick, pbs.CurrentReassignmentsCount)
-
+func printBalancerStatus(pbs rpadmin.PartitionBalancerStatus) {
+	tw := out.NewTable()
+	defer tw.Flush()
+	tw.Print("Status:", pbs.Status)
+	tw.Print("Seconds Since Last Tick:", pbs.SecondsSinceLastTick)
+	tw.Print("Current Reassignment Count:", pbs.CurrentReassignmentsCount)
+	if pbs.PartitionsPendingForceRecovery != nil && pbs.PartitionsPendingRecoveryList != nil {
+		tw.Print(fmt.Sprintf("Partitions Pending Recovery (%v):", *pbs.PartitionsPendingForceRecovery), pbs.PartitionsPendingRecoveryList)
+	}
 	v := pbs.Violations
 	if len(v.OverDiskLimitNodes) > 0 || len(v.UnavailableNodes) > 0 {
-		const vFormat = `Unavailable Nodes:            %v
-Over Disk Limit Nodes:        %v
-`
-		fmt.Printf(vFormat, v.UnavailableNodes, v.OverDiskLimitNodes)
+		tw.Print("Unavailable Nodes:", v.UnavailableNodes)
+		tw.Print("Over Disk Limit Nodes:", v.OverDiskLimitNodes)
 	}
 }

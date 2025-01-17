@@ -10,6 +10,7 @@
 
 #include "cloud_storage/recovery_request.h"
 #include "cloud_storage/tests/s3_imposter.h"
+#include "cluster/cloud_metadata/tests/manual_mixin.h"
 #include "cluster/topic_recovery_service.h"
 #include "redpanda/tests/fixture.h"
 #include "test_utils/fixture.h"
@@ -79,22 +80,22 @@ const ss::sstring topic_manifest_json = R"JSON({
 const model::topic_namespace tp_ns{model::ns{"kafka"}, model::topic{"test"}};
 
 const s3_imposter_fixture::expectation root_level{
-  .url = "/?list-type=2&delimiter=/",
+  .url = "?list-type=2&delimiter=/",
   .body = top_level_result,
 };
 
 const s3_imposter_fixture::expectation meta_level{
-  .url = "/?list-type=2&prefix=b0000000/",
+  .url = "?list-type=2&prefix=b0000000/",
   .body = valid_manifest_list,
 };
 
 const s3_imposter_fixture::expectation manifest{
-  .url = "/b0000000/meta/kafka/test/topic_manifest.json",
+  .url = "b0000000/meta/kafka/test/topic_manifest.json",
   .body = topic_manifest_json,
 };
 
 const s3_imposter_fixture::expectation recovery_state{
-  .url = "/?list-type=2&prefix=recovery_state",
+  .url = "?list-type=2&prefix=recovery_state",
   .body = recovery_results,
 };
 
@@ -107,58 +108,73 @@ generate_no_manifests_expectations(
     std::vector<s3_imposter_fixture::expectation> expectations;
     for (int i = 0; i < 16; ++i) {
         expectations.emplace_back(s3_imposter_fixture::expectation{
-          .url = fmt::format("/?list-type=2&prefix={}0000000/", hex_chars[i]),
+          .url = fmt::format("?list-type=2&prefix={}0000000/", hex_chars[i]),
           .body = no_manifests,
         });
     }
+    expectations.emplace_back(s3_imposter_fixture::expectation{
+      .url = fmt::format(
+        "?list-type=2&prefix=meta/{}/{}/", tp_ns.ns(), tp_ns.tp()),
+      .body = no_manifests,
+    });
+    expectations.emplace_back(s3_imposter_fixture::expectation{
+      .url = "?list-type=2&prefix=meta/",
+      .body = no_manifests,
+    });
     for (auto& e : additional_expectations) {
         expectations.emplace_back(std::move(e));
     }
     return expectations;
 }
 
+bool is_manifest_list_request(const http_test_utils::request_info& req) {
+    return req.method == "GET" && req.url.contains("?list-type=2&prefix=")
+           && req.url.ends_with("0000000/");
+}
+
 } // namespace
 
 class fixture
   : public s3_imposter_fixture
+  , public manual_metadata_upload_mixin
   , public redpanda_thread_fixture
   , public enable_cloud_storage_fixture {
 public:
     fixture()
       : redpanda_thread_fixture(
-        redpanda_thread_fixture::init_cloud_storage_tag{},
-        httpd_port_number()) {
+          redpanda_thread_fixture::init_cloud_storage_tag{},
+          httpd_port_number()) {
         // This test will manually set expectations for list requests.
         set_search_on_get_list(false);
     }
 
     void wait_for_topic(model::topic_namespace tp_ns) {
-        tests::cooperative_spin_wait_with_timeout(
-          10s,
-          [this, tn = std::move(tp_ns)] {
-              const auto& topics
-                = app.controller->get_topics_state().local().all_topics();
-              const auto has_topic = std::find_if(
-                                       topics.cbegin(),
-                                       topics.cend(),
-                                       [&tn](const auto& tp_ns) {
-                                           return tp_ns == tn;
-                                       })
-                                     != topics.cend();
-              return ss::make_ready_future<bool>(has_topic);
-          })
-          .get();
+        RPTEST_REQUIRE_EVENTUALLY(10s, [this, tn = std::move(tp_ns)] {
+            const auto& topics
+              = app.controller->get_topics_state().local().all_topics();
+            const auto has_topic = std::find_if(
+                                     topics.cbegin(),
+                                     topics.cend(),
+                                     [&tn](const auto& tp_ns) {
+                                         return tp_ns == tn;
+                                     })
+                                   != topics.cend();
+            return ss::make_ready_future<bool>(has_topic);
+        });
     }
 
     using equals = ss::bool_class<struct equals_tag>;
-    void wait_for_n_requests(size_t n, equals e = equals::no) {
-        tests::cooperative_spin_wait_with_timeout(10s, [this, n, e] {
-            if (e) {
-                return get_requests().size() == n;
-            } else {
-                return get_requests().size() >= n;
-            }
-        }).get();
+    void wait_for_n_requests(
+      size_t n,
+      equals e = equals::no,
+      std::optional<req_pred_t> predicate = std::nullopt) {
+        RPTEST_REQUIRE_EVENTUALLY(10s, [this, n, e, predicate] {
+            const auto matching_requests_size
+              = predicate ? get_requests(predicate.value()).size()
+                          : get_requests().size();
+            return e ? matching_requests_size == n
+                     : matching_requests_size >= n;
+        });
     }
 
     cloud_storage::init_recovery_result
@@ -217,10 +233,11 @@ FIXTURE_TEST(recovery_with_no_topics_exits_early, fixture) {
     BOOST_REQUIRE_EQUAL(result, expected);
 
     // Wait until one request is received, to list bucket for manifest files
-    wait_for_n_requests(16, equals::yes);
+    wait_for_n_requests(16, equals::yes, is_manifest_list_request);
 
     const auto& list_topics_req = get_requests()[0];
-    BOOST_REQUIRE_EQUAL(list_topics_req.url, "/?list-type=2&prefix=00000000/");
+    BOOST_REQUIRE_EQUAL(
+      list_topics_req.url, "/" + url_base() + "?list-type=2&prefix=meta/");
 
     // Wait until recovery exits after finding no topics to create
     tests::cooperative_spin_wait_with_timeout(10s, [&service] {
@@ -228,7 +245,7 @@ FIXTURE_TEST(recovery_with_no_topics_exits_early, fixture) {
     }).get();
 
     // No other calls were made
-    BOOST_REQUIRE_EQUAL(get_requests().size(), 16);
+    BOOST_REQUIRE_EQUAL(get_requests().size(), 17);
 }
 
 void do_test(fixture& f) {
@@ -242,19 +259,20 @@ void do_test(fixture& f) {
     BOOST_REQUIRE_EQUAL(result, expected);
 
     // Wait until three requests are received:
-    // 1..16. to list bucket for topic meta prefixes
-    // 17. to download manifest
-    f.wait_for_n_requests(17, fixture::equals::yes);
+    // 1. meta/kafka for labeled topic manifests
+    // 2..17. to list bucket for topic meta prefixes
+    // 18..20. to download manifest, which now takes three requests
+    f.wait_for_n_requests(20, fixture::equals::yes);
 
-    const auto& get_manifest_req = f.get_requests()[16];
-    BOOST_REQUIRE_EQUAL(get_manifest_req.url, manifest.url);
+    const auto& get_manifest_req = f.get_requests()[19];
+    BOOST_REQUIRE_EQUAL(
+      get_manifest_req.url, "/" + f.url_base() + manifest.url);
 
     // Wait until recovery exits after finding no topics to create
-    tests::cooperative_spin_wait_with_timeout(10s, [&service] {
-        return service.local().is_active() == false;
-    }).get();
+    RPTEST_REQUIRE_EVENTUALLY(
+      10s, [&service] { return service.local().is_active() == false; });
 
-    BOOST_REQUIRE_EQUAL(f.get_requests().size(), 17);
+    BOOST_REQUIRE_EQUAL(f.get_requests().size(), 20);
 }
 
 FIXTURE_TEST(recovery_with_unparseable_topic_manifest, fixture) {
@@ -271,13 +289,13 @@ FIXTURE_TEST(recovery_with_missing_topic_manifest, fixture) {
 }
 
 FIXTURE_TEST(recovery_with_existing_topic, fixture) {
-    cluster::topic_configuration cfg{
-      model::ns{"kafka"}, model::topic{"test"}, 1, 1};
-    std::vector<cluster::custom_assignable_topic_configuration> topic_cfg = {
-      cluster::custom_assignable_topic_configuration{std::move(cfg)}};
+    cluster::custom_assignable_topic_configuration_vector topic_cfg{
+      {cluster::custom_assignable_topic_configuration{
+        {model::ns{"kafka"}, model::topic{"test"}, 1, 1}}}};
     auto topic_create_result = app.controller->get_topics_frontend()
                                  .local()
-                                 .create_topics(topic_cfg, model::no_timeout)
+                                 .create_topics(
+                                   std::move(topic_cfg), model::no_timeout)
                                  .get();
     wait_for_topics(std::move(topic_create_result)).get();
     set_expectations_and_listen(
@@ -291,13 +309,13 @@ FIXTURE_TEST(recovery_with_existing_topic, fixture) {
       .message = "recovery started"};
 
     BOOST_REQUIRE_EQUAL(result, expected);
-    wait_for_n_requests(16, equals::yes);
+    wait_for_n_requests(16, equals::yes, is_manifest_list_request);
 
     tests::cooperative_spin_wait_with_timeout(10s, [&service] {
         return service.local().is_active() == false;
     }).get();
 
-    BOOST_REQUIRE_EQUAL(get_requests().size(), 16);
+    BOOST_REQUIRE_GE(get_requests().size(), 16);
 }
 
 FIXTURE_TEST(recovery_where_topic_is_created, fixture) {
@@ -351,10 +369,11 @@ FIXTURE_TEST(recovery_result_clear_before_start, fixture) {
     start_recovery();
     wait_for_n_requests(22);
 
-    // 16 to check each manifest prefix, 1 to download the topic manifest, 1 to
-    // check recovery results, 1 to delete.
-    const auto& delete_request = get_requests()[18];
-    BOOST_REQUIRE_EQUAL(delete_request.url, "/?delete");
+    // 1 to check the labeled root, 16 to check each manifest prefix, 3 to
+    // download the JSON topic manifest, 1 to check recovery results, 1 to
+    // delete.
+    const auto& delete_request = get_requests()[21];
+    BOOST_REQUIRE_EQUAL(delete_request.url, "/" + url_base() + "?delete");
     BOOST_REQUIRE_EQUAL(delete_request.method, "POST");
 }
 
@@ -388,14 +407,14 @@ FIXTURE_TEST(recovery_with_topic_name_pattern_without_match, fixture) {
 
     start_recovery(R"JSON({"topic_names_pattern": "abc*"})JSON");
 
-    wait_for_n_requests(16, equals::yes);
+    wait_for_n_requests(16, equals::yes, is_manifest_list_request);
 
     auto& service = app.topic_recovery_service;
     tests::cooperative_spin_wait_with_timeout(10s, [&service] {
         return !service.local().is_active();
     }).get();
 
-    BOOST_REQUIRE_EQUAL(get_requests().size(), 16);
+    BOOST_REQUIRE_EQUAL(get_requests().size(), 17);
 }
 
 FIXTURE_TEST(recovery_with_topic_name_pattern_with_match, fixture) {

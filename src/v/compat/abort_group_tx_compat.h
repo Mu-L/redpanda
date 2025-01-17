@@ -10,14 +10,15 @@
  */
 #pragma once
 
-#include "cluster/types.h"
+#include "cluster/tx_protocol_types.h"
 #include "compat/abort_group_tx_generator.h"
 #include "compat/check.h"
 #include "compat/json.h"
+#include "compat/model_json.h"
 
 namespace compat {
 
-GEN_COMPAT_CHECK(
+GEN_COMPAT_CHECK_SERDE_ONLY(
   cluster::abort_group_tx_request,
   {
       json_write(ntp);
@@ -34,7 +35,7 @@ GEN_COMPAT_CHECK(
       json_read(timeout);
   });
 
-GEN_COMPAT_CHECK(
+GEN_COMPAT_CHECK_SERDE_ONLY(
   cluster::abort_group_tx_reply, { json_write(ec); }, { json_read(ec); });
 
 }; // namespace compat

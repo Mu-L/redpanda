@@ -8,18 +8,23 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
-#include "cloud_roles/signature.h"
+#include "signature.h"
 
+#include "base/vlog.h"
 #include "bytes/bytes.h"
 #include "cloud_roles/logger.h"
+#include "config/base_property.h"
 #include "hashing/secure.h"
+#include "http/utils.h"
+#include "request_response_helpers.h"
 #include "ssx/sformat.h"
 #include "utils/base64.h"
-#include "vlog.h"
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sstring.hh>
 
+#include <absl/strings/str_join.h>
+#include <absl/strings/str_split.h>
 #include <boost/algorithm/string/compare.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
@@ -132,42 +137,12 @@ inline void tolower(ss::sstring& str) {
     }
 }
 
-inline void append_hex_utf8(ss::sstring& result, char ch) {
-    bytes b = {static_cast<uint8_t>(ch)};
-    result.append("%", 1);
-    auto h = to_hex(b);
-    result.append(h.data(), h.size());
-}
-
 ss::sstring time_source::format(auto fmt) const {
     const auto point = _gettime_fn();
     const std::time_t time = std::chrono::system_clock::to_time_t(point);
     const std::tm gm = fmt::gmtime(time);
 
     return fmt::format(fmt, gm);
-}
-
-ss::sstring uri_encode(const ss::sstring& input, bool encode_slash) {
-    // The function defined here:
-    //     https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
-    ss::sstring result;
-    for (auto ch : input) {
-        if (
-          (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
-          || (ch >= '0' && ch <= '9') || (ch == '_') || (ch == '-')
-          || (ch == '~') || (ch == '.')) {
-            result.append(&ch, 1);
-        } else if (ch == '/') {
-            if (encode_slash) {
-                result.append("%2F", 3);
-            } else {
-                result.append(&ch, 1);
-            }
-        } else {
-            append_hex_utf8(result, ch);
-        }
-    }
-    return result;
 }
 
 struct target_parts {
@@ -194,9 +169,11 @@ static result<target_parts> split_target(ss::sstring target) {
     auto pos = target.find('?');
     if (pos == ss::sstring::npos) {
         return target_parts{
-          .canonical_uri = uri_encode(target, false), .query_params = {}};
+          .canonical_uri = http::uri_encode(target, http::uri_encode_slash::no),
+          .query_params = {}};
     } else {
-        auto canonical_uri = uri_encode(target.substr(0, pos), false);
+        auto canonical_uri = http::uri_encode(
+          target.substr(0, pos), http::uri_encode_slash::no);
         if (pos == target.size() - 1) {
             return target_parts{
               .canonical_uri = canonical_uri, .query_params = {}};
@@ -254,7 +231,9 @@ static ss::sstring get_canonical_query_string(
             result.append("&", 1);
         }
         result += ssx::sformat(
-          "{}={}", uri_encode(pname, true), uri_encode(pvalue, true));
+          "{}={}",
+          http::uri_encode(pname, http::uri_encode_slash::yes),
+          http::uri_encode(pvalue, http::uri_encode_slash::yes));
     }
     return result;
 }
@@ -372,6 +351,36 @@ ss::sstring signature_v4::sha256_hexdigest(std::string_view payload) {
     return sha_256(payload);
 }
 
+ss::sstring redact_headers_from_string(const std::string_view original) {
+    std::set<std::string_view> redacted{};
+    const auto redacted_fields = http::redacted_fields();
+    for (const auto& rf : redacted_fields) {
+        redacted.insert(ss::visit(
+          rf,
+          [](const boost::beast::http::field& f) {
+              const auto view = to_string(f);
+              return std::string_view{view.data(), view.size()};
+          },
+          [](const std::string& s) { return std::string_view{s}; }));
+    }
+
+    const auto lines = absl::StrSplit(original, "\n");
+    std::vector<ss::sstring> result{};
+    for (const auto& line : lines) {
+        if (line.find(':') != std::string_view::npos) {
+            const auto tokens = absl::StrSplit(line, ":");
+            const auto key = *tokens.begin();
+            if (redacted.contains(key)) {
+                result.emplace_back(fmt::format(
+                  "{}:{}", *tokens.begin(), config::secret_placeholder));
+                continue;
+            }
+        }
+        result.emplace_back(line.data(), line.size());
+    }
+    return absl::StrJoin(result, "\n");
+}
+
 std::error_code signature_v4::sign_header(
   http::client::request_header& header, std::string_view sha256) const {
     ss::sstring date_str = _sig_time.format_date();
@@ -392,7 +401,14 @@ std::error_code signature_v4::sign_header(
     if (!canonical_req) {
         return canonical_req.error();
     }
-    vlog(clrl_log.trace, "\n[canonical-request]\n{}\n", canonical_req.value());
+
+    if (clrl_log.is_enabled(seastar::log_level::trace)) {
+        vlog(
+          clrl_log.trace,
+          "\n[canonical-request]\n{}\n",
+          redact_headers_from_string(canonical_req.value()));
+    }
+
     auto str_to_sign = get_string_to_sign(
       amz_date, cred_scope, canonical_req.value());
     auto digest = hmac(sign_key, str_to_sign);
@@ -428,7 +444,7 @@ static constexpr auto required_headers = {
   "If-Modified-Since",
   "If-Match",
   "If-None-Match",
-  "If-UnmodifiedSince",
+  "If-Unmodified-Since",
   "Range"};
 
 result<ss::sstring> signature_abs::get_canonicalized_resource(

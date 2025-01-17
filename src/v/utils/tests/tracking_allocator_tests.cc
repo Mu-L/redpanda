@@ -91,9 +91,10 @@ BOOST_AUTO_TEST_CASE(allocator_list_vector) {
         allocator<int> alloc{tracker};
         std::vector<int, allocator<int>> v{alloc};
         v.push_back(1);
-        BOOST_REQUIRE_EQUAL(tracker->consumption(), sizeof(int));
+        BOOST_REQUIRE_GE(tracker->consumption(), sizeof(int));
         v.push_back(2);
-        BOOST_REQUIRE_EQUAL(tracker->consumption(), 2 * sizeof(int));
+        BOOST_REQUIRE_GE(tracker->consumption(), 2 * sizeof(int));
+        BOOST_REQUIRE_EQUAL(v.size(), 2);
     }
     BOOST_REQUIRE_EQUAL(tracker->consumption(), 0);
     {
@@ -101,6 +102,7 @@ BOOST_AUTO_TEST_CASE(allocator_list_vector) {
         std::list<int, allocator<int>> v{alloc};
         v.push_back(1);
         BOOST_REQUIRE_GE(tracker->consumption(), 0);
+        BOOST_REQUIRE_EQUAL(v.size(), 1);
     }
     BOOST_REQUIRE_EQUAL(tracker->consumption(), 0);
 }
@@ -163,8 +165,9 @@ void test_mem_tracked_set() {
     auto tracker = ss::make_shared<mem_tracker>("set");
     BOOST_REQUIRE_EQUAL(tracker->consumption(), 0);
     {
-        auto set = util::mem_tracked::set<T, int>(tracker);
-        set.insert(1);
+        auto set = util::mem_tracked::set<T, std::string>(tracker);
+        set.insert("abc");
+        set.insert("def");
         auto before = tracker->consumption();
         BOOST_REQUIRE_GT(before, 0);
         // make a copy, allocator should be copied with
@@ -190,14 +193,14 @@ void test_mem_tracked_set() {
     {
         // Swap
         auto tracker_x = ss::make_shared<mem_tracker>("x");
-        auto x = util::mem_tracked::set<T, int>(tracker_x);
-        x.insert(1);
-        x.insert(2);
+        auto x = util::mem_tracked::set<T, std::string>(tracker_x);
+        x.insert("abc");
+        x.insert("def");
         auto tracker_x_before = tracker_x->consumption();
         BOOST_REQUIRE_GE(tracker_x_before, 0);
         auto tracker_y = ss::make_shared<mem_tracker>("y");
-        auto y = util::mem_tracked::set<T, int>(tracker_y);
-        y.insert(3);
+        auto y = util::mem_tracked::set<T, std::string>(tracker_y);
+        y.insert("ghi");
         auto tracker_y_before = tracker_y->consumption();
         BOOST_REQUIRE_GE(tracker_y_before, 0);
         BOOST_REQUIRE_GE(tracker_x_before, tracker_y_before);

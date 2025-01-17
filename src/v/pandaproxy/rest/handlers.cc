@@ -9,19 +9,11 @@
 
 #include "handlers.h"
 
-#include "config/rest_authn_endpoint.h"
-#include "hashing/jump_consistent_hash.h"
-#include "hashing/xx.h"
+#include "base/vlog.h"
 #include "kafka/client/exceptions.h"
-#include "kafka/protocol/errors.h"
 #include "kafka/protocol/fetch.h"
-#include "kafka/protocol/leave_group.h"
-#include "kafka/protocol/offset_commit.h"
-#include "kafka/protocol/offset_fetch.h"
 #include "kafka/protocol/schemata/offset_commit_request.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
-#include "pandaproxy/json/exceptions.h"
 #include "pandaproxy/json/requests/brokers.h"
 #include "pandaproxy/json/requests/create_consumer.h"
 #include "pandaproxy/json/requests/error_reply.h"
@@ -33,15 +25,9 @@
 #include "pandaproxy/json/requests/produce.h"
 #include "pandaproxy/json/requests/subscribe_consumer.h"
 #include "pandaproxy/json/rjson_util.h"
-#include "pandaproxy/kafka_client_cache.h"
 #include "pandaproxy/parsing/httpd.h"
 #include "pandaproxy/reply.h"
-#include "pandaproxy/rest/configuration.h"
-#include "raft/types.h"
-#include "ssx/future-util.h"
 #include "ssx/sformat.h"
-#include "storage/record_batch_builder.h"
-#include "vlog.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -92,8 +78,7 @@ get_brokers(server::request_t rq, server::reply_t rp) {
                 return b.node_id;
             });
 
-          auto json_rslt = ppj::rjson_serialize(brokers);
-          rp.rep->write_body("json", json_rslt);
+          rp.rep->write_body("json", ppj::rjson_serialize(brokers));
 
           rp.mime_type = res_fmt;
           return std::move(rp);
@@ -123,8 +108,7 @@ get_topics_names(server::request_t rq, server::reply_t rp) {
               }
           }
 
-          auto json_rslt = ppj::rjson_serialize(names);
-          rp.rep->write_body("json", json_rslt);
+          rp.rep->write_body("json", ppj::rjson_serialize(names));
           rp.mime_type = res_fmt;
           return std::move(rp);
       });
@@ -160,16 +144,16 @@ get_topics_records(server::request_t rq, server::reply_t rp) {
           return client
             .fetch_partition(std::move(tp), offset, max_bytes, timeout)
             .then([res_fmt](kafka::fetch_response res) {
-                ::json::StringBuffer str_buf;
-                ::json::Writer<::json::StringBuffer> w(str_buf);
+                ::json::chunked_buffer buf;
+                ::json::iobuf_writer<::json::chunked_buffer> w(buf);
 
                 ppj::rjson_serialize_fmt(res_fmt)(w, std::move(res));
-                // TODO Ben: Prevent this linearization
-                return ss::make_ready_future<ss::sstring>(str_buf.GetString());
+                return buf;
             });
       })
-      .then([res_fmt, rp = std::move(rp)](ss::sstring json_rslt) mutable {
-          rp.rep->write_body("json", json_rslt);
+      .then([res_fmt, rp = std::move(rp)](auto buf) mutable {
+          rp.rep->write_body(
+            "json", json::as_body_writer(std::move(buf).as_iobuf()));
           rp.mime_type = res_fmt;
           return std::move(rp);
       });
@@ -189,19 +173,16 @@ post_topics_name(server::request_t rq, server::reply_t rp) {
 
     vlog(plog.debug, "get_topics_name: topic: {}", topic);
 
+    auto records = co_await ppj::rjson_parse(
+      std::move(rq.req), ppj::produce_request_handler(req_fmt));
     co_return co_await rq.dispatch(
-      [data{rq.req->content.data()},
-       topic,
-       req_fmt,
-       res_fmt,
-       rp{std::move(rp)}](kafka::client::client& client) mutable {
-          auto records = ppj::rjson_parse(
-            data, ppj::produce_request_handler(req_fmt));
+      [records{std::move(records)}, topic, res_fmt, rp{std::move(rp)}](
+        kafka::client::client& client) mutable {
           return client.produce_records(topic, std::move(records))
             .then([rp{std::move(rp)},
                    res_fmt](kafka::produce_response res) mutable {
-                auto json_rslt = ppj::rjson_serialize(res.data.responses[0]);
-                rp.rep->write_body("json", json_rslt);
+                rp.rep->write_body(
+                  "json", ppj::rjson_serialize(res.data.responses[0]));
                 rp.mime_type = res_fmt;
                 return std::move(rp);
             });
@@ -229,8 +210,10 @@ create_consumer(server::request_t rq, server::reply_t rp) {
     auto group_id = parse::request_param<kafka::group_id>(
       *rq.req, "group_name");
 
-    auto req_data = ppj::rjson_parse(
-      rq.req->content.data(), ppj::create_consumer_request_handler());
+    auto base_uri = make_consumer_uri_base(rq, group_id);
+
+    auto req_data = co_await ppj::rjson_parse(
+      std::move(rq.req), ppj::create_consumer_request_handler());
 
     validate_no_control(
       req_data.name(), parse::pp_parsing_error{req_data.name()});
@@ -248,8 +231,6 @@ create_consumer(server::request_t rq, server::reply_t rp) {
         throw parse::error(
           parse::error_code::invalid_param, "auto.commit must be false");
     }
-
-    auto base_uri = make_consumer_uri_base(rq, group_id);
 
     co_return co_await rq.dispatch(
       group_id,
@@ -292,8 +273,7 @@ create_consumer(server::request_t rq, server::reply_t rp) {
                             kafka::member_id name) mutable {
                         json::create_consumer_response res{
                           .instance_id = name, .base_uri = base_uri + name};
-                        auto json_rslt = ppj::rjson_serialize(res);
-                        rp.rep->write_body("json", json_rslt);
+                        rp.rep->write_body("json", ppj::rjson_serialize(res));
                         rp.mime_type = res_fmt;
                         return std::move(rp);
                     });
@@ -343,8 +323,8 @@ subscribe_consumer(server::request_t rq, server::reply_t rp) {
     auto member_id = parse::request_param<kafka::member_id>(
       *rq.req, "instance");
 
-    auto req_data = ppj::rjson_parse(
-      rq.req->content.data(), ppj::subscribe_consumer_request_handler());
+    auto req_data = co_await ppj::rjson_parse(
+      std::move(rq.req), ppj::subscribe_consumer_request_handler());
     std::for_each(
       req_data.topics.begin(),
       req_data.topics.end(),
@@ -410,14 +390,13 @@ consumer_fetch(server::request_t rq, server::reply_t rp) {
 
           return client.consumer_fetch(group_id, name, timeout, max_bytes)
             .then([res_fmt, rp{std::move(rp)}](auto res) mutable {
-                ::json::StringBuffer str_buf;
-                ::json::Writer<::json::StringBuffer> w(str_buf);
+                ::json::chunked_buffer buf;
+                ::json::iobuf_writer<::json::chunked_buffer> w(buf);
 
                 ppj::rjson_serialize_fmt(res_fmt)(w, std::move(res));
 
-                // TODO Ben: Prevent this linearization
-                ss::sstring json_rslt = str_buf.GetString();
-                rp.rep->write_body("json", json_rslt);
+                rp.rep->write_body(
+                  "json", json::as_body_writer(std::move(buf).as_iobuf()));
                 rp.mime_type = res_fmt;
                 return std::move(rp);
             });
@@ -434,8 +413,9 @@ get_consumer_offsets(server::request_t rq, server::reply_t rp) {
     auto group_id{parse::request_param<kafka::group_id>(*rq.req, "group_name")};
     auto member_id{parse::request_param<kafka::member_id>(*rq.req, "instance")};
 
-    auto req_data = ppj::partitions_request_to_offset_request(ppj::rjson_parse(
-      rq.req->content.data(), ppj::partitions_request_handler()));
+    auto req_data = ppj::partitions_request_to_offset_request(
+      co_await ppj::rjson_parse(
+        std::move(rq.req), ppj::partitions_request_handler()));
 
     std::for_each(req_data.begin(), req_data.end(), [](const auto& r) {
         validate_no_control(r.name(), parse::pp_parsing_error{r.name()});
@@ -458,11 +438,7 @@ get_consumer_offsets(server::request_t rq, server::reply_t rp) {
           return client
             .consumer_offset_fetch(group_id, member_id, std::move(req_data))
             .then([rp{std::move(rp)}, res_fmt](auto res) mutable {
-                ::json::StringBuffer str_buf;
-                ::json::Writer<::json::StringBuffer> w(str_buf);
-                ppj::rjson_serialize(w, res);
-                ss::sstring json_rslt = str_buf.GetString();
-                rp.rep->write_body("json", json_rslt);
+                rp.rep->write_body("json", ppj::rjson_serialize(res));
                 rp.mime_type = res_fmt;
                 return std::move(rp);
             });
@@ -480,12 +456,12 @@ post_consumer_offsets(server::request_t rq, server::reply_t rp) {
     auto member_id{parse::request_param<kafka::member_id>(*rq.req, "instance")};
 
     // If the request is empty, commit all offsets
-    auto req_data = rq.req->content.length() == 0
+    auto req_data = rq.req->content_length == 0
                       ? std::vector<kafka::offset_commit_request_topic>()
                       : ppj::partition_offsets_request_to_offset_commit_request(
-                        ppj::rjson_parse(
-                          rq.req->content.data(),
-                          ppj::partition_offsets_request_handler()));
+                          co_await ppj::rjson_parse(
+                            std::move(rq.req),
+                            ppj::partition_offsets_request_handler()));
 
     std::for_each(req_data.begin(), req_data.end(), [](const auto& r) {
         validate_no_control(r.name(), parse::pp_parsing_error{r.name()});

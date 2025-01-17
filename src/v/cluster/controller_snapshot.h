@@ -11,14 +11,16 @@
 
 #pragma once
 
-#include "cluster/config_manager.h"
+#include "cluster/client_quota_serde.h"
+#include "cluster/cluster_recovery_state.h"
+#include "cluster/data_migration_types.h"
 #include "cluster/types.h"
+#include "container/chunked_hash_map.h"
+#include "container/fragmented_vector.h"
 #include "features/feature_table_snapshot.h"
-#include "security/scram_credential.h"
+#include "security/role.h"
 #include "security/types.h"
 #include "serde/envelope.h"
-#include "serde/serde.h"
-#include "utils/fragmented_vector.h"
 
 #include <absl/container/btree_map.h>
 #include <absl/container/flat_hash_map.h>
@@ -51,7 +53,7 @@ struct features_t
 
 struct members_t
   : public serde::
-      envelope<members_t, serde::version<0>, serde::compat_version<0>> {
+      envelope<members_t, serde::version<2>, serde::compat_version<0>> {
     struct node_t
       : serde::envelope<node_t, serde::version<0>, serde::compat_version<0>> {
         model::broker broker;
@@ -84,6 +86,9 @@ struct members_t
     absl::node_hash_map<model::node_id, update_t> in_progress_updates;
 
     model::offset first_node_operation_command_offset;
+    // revision of metadata table (offset of last applied cluster member
+    // command)
+    model::revision_id version{};
 
     friend bool operator==(const members_t&, const members_t&) = default;
 
@@ -95,7 +100,8 @@ struct members_t
           removed_nodes,
           removed_nodes_still_in_raft0,
           in_progress_updates,
-          first_node_operation_command_offset);
+          first_node_operation_command_offset,
+          version);
     }
 };
 
@@ -113,7 +119,7 @@ struct config_t
 
 struct topics_t
   : public serde::
-      envelope<topics_t, serde::version<0>, serde::compat_version<0>> {
+      envelope<topics_t, serde::version<2>, serde::compat_version<0>> {
     // NOTE: layout here is a bit different than in the topic table because it
     // allows more compact storage and more convenient generation of controller
     // backend deltas when applying the snapshot.
@@ -142,7 +148,7 @@ struct topics_t
 
     struct update_t
       : public serde::
-          envelope<update_t, serde::version<0>, serde::compat_version<0>> {
+          envelope<update_t, serde::version<1>, serde::compat_version<0>> {
         /// NOTE: In the event of cancellation this remains the original target.
         std::vector<model::broker_shard> target_assignment;
         reconfiguration_state state;
@@ -150,29 +156,32 @@ struct topics_t
         model::revision_id revision;
         /// Revision of the last command in this update (cancellation etc.)
         model::revision_id last_cmd_revision;
+        /// Reconfiguration policy used with this update
+        reconfiguration_policy policy;
 
         friend bool operator==(const update_t&, const update_t&) = default;
 
         auto serde_fields() {
             return std::tie(
-              target_assignment, state, revision, last_cmd_revision);
+              target_assignment, state, revision, last_cmd_revision, policy);
         }
     };
 
     struct topic_t
       : public serde::
-          envelope<topic_t, serde::version<0>, serde::compat_version<0>> {
+          envelope<topic_t, serde::version<1>, serde::compat_version<0>> {
         topic_metadata_fields metadata;
-        absl::node_hash_map<model::partition_id, partition_t> partitions;
-        absl::node_hash_map<model::partition_id, update_t> updates;
+        chunked_hash_map<model::partition_id, partition_t> partitions;
+        chunked_hash_map<model::partition_id, update_t> updates;
+        std::optional<topic_disabled_partitions_set> disabled_set;
 
         friend bool operator==(const topic_t&, const topic_t&) = default;
 
         ss::future<> serde_async_write(iobuf&);
-        ss::future<> serde_async_read(iobuf_parser&, serde::header const);
+        ss::future<> serde_async_read(iobuf_parser&, const serde::header);
     };
 
-    absl::node_hash_map<model::topic_namespace, topic_t> topics;
+    chunked_hash_map<model::topic_namespace, topic_t> topics;
     raft::group_id highest_group_id;
 
     absl::node_hash_map<
@@ -182,22 +191,47 @@ struct topics_t
       nt_revision_eq>
       lifecycle_markers;
 
+    force_recoverable_partitions_t partitions_to_force_recover;
+
+    chunked_hash_map<
+      model::topic_namespace,
+      nt_iceberg_tombstone,
+      model::topic_namespace_hash,
+      model::topic_namespace_eq>
+      iceberg_tombstones;
+
     friend bool operator==(const topics_t&, const topics_t&) = default;
 
     ss::future<> serde_async_write(iobuf&);
-    ss::future<> serde_async_read(iobuf_parser&, serde::header const);
+    ss::future<> serde_async_read(iobuf_parser&, const serde::header);
+};
+
+struct named_role_t
+  : public serde::
+      envelope<named_role_t, serde::version<0>, serde::compat_version<0>> {
+    named_role_t() = default;
+    named_role_t(security::role_name name, security::role role)
+      : name(std::move(name))
+      , role(std::move(role)) {}
+    security::role_name name;
+    security::role role;
+
+    friend bool operator==(const named_role_t&, const named_role_t&) = default;
+
+    auto serde_fields() { return std::tie(name, role); }
 };
 
 struct security_t
   : public serde::
-      envelope<security_t, serde::version<0>, serde::compat_version<0>> {
+      envelope<security_t, serde::version<1>, serde::compat_version<0>> {
     fragmented_vector<user_and_credential> user_credentials;
     fragmented_vector<security::acl_binding> acls;
+    chunked_vector<named_role_t> roles;
 
     friend bool operator==(const security_t&, const security_t&) = default;
 
     ss::future<> serde_async_write(iobuf&);
-    ss::future<> serde_async_read(iobuf_parser&, serde::header const);
+    ss::future<> serde_async_read(iobuf_parser&, const serde::header);
 };
 
 struct metrics_reporter_t
@@ -213,12 +247,61 @@ struct metrics_reporter_t
     auto serde_fields() { return std::tie(cluster_info); }
 };
 
+struct plugins_t
+  : public serde::
+      envelope<plugins_t, serde::version<0>, serde::compat_version<0>> {
+    absl::btree_map<model::transform_id, model::transform_metadata> transforms;
+
+    friend bool operator==(const plugins_t&, const plugins_t&) = default;
+
+    auto serde_fields() { return std::tie(transforms); }
+};
+
+struct cluster_recovery_t
+  : public serde::envelope<
+      cluster_recovery_t,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    std::vector<cluster_recovery_state> recovery_states;
+
+    friend bool operator==(const cluster_recovery_t&, const cluster_recovery_t&)
+      = default;
+
+    auto serde_fields() { return std::tie(recovery_states); }
+};
+
+struct client_quotas_t
+  : public serde::
+      envelope<client_quotas_t, serde::version<0>, serde::compat_version<0>> {
+    absl::node_hash_map<client_quota::entity_key, client_quota::entity_value>
+      quotas;
+
+    friend bool operator==(const client_quotas_t&, const client_quotas_t&)
+      = default;
+
+    auto serde_fields() { return std::tie(quotas); }
+};
+
+struct data_migrations_t
+  : public serde::
+      envelope<data_migrations_t, serde::version<0>, serde::compat_version<0>> {
+    data_migrations::id next_id;
+    absl::
+      node_hash_map<data_migrations::id, data_migrations::migration_metadata>
+        migrations;
+
+    friend bool operator==(const data_migrations_t&, const data_migrations_t&)
+      = default;
+
+    auto serde_fields() { return std::tie(next_id, migrations); }
+};
+
 } // namespace controller_snapshot_parts
 
 struct controller_snapshot
   : public serde::checksum_envelope<
       controller_snapshot,
-      serde::version<0>,
+      serde::version<4>,
       serde::compat_version<0>> {
     controller_snapshot_parts::bootstrap_t bootstrap;
     controller_snapshot_parts::features_t features;
@@ -227,13 +310,17 @@ struct controller_snapshot
     controller_snapshot_parts::topics_t topics;
     controller_snapshot_parts::security_t security;
     controller_snapshot_parts::metrics_reporter_t metrics_reporter;
+    controller_snapshot_parts::plugins_t plugins;
+    controller_snapshot_parts::cluster_recovery_t cluster_recovery;
+    controller_snapshot_parts::client_quotas_t client_quotas;
+    controller_snapshot_parts::data_migrations_t data_migrations;
 
     friend bool
     operator==(const controller_snapshot&, const controller_snapshot&)
       = default;
 
     ss::future<> serde_async_write(iobuf&);
-    ss::future<> serde_async_read(iobuf_parser&, serde::header const);
+    ss::future<> serde_async_read(iobuf_parser&, const serde::header);
 };
 
 /// A subset of the controller snapshot used to initialize nodes joining

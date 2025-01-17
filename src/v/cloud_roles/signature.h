@@ -10,13 +10,13 @@
 
 #pragma once
 
+#include "base/outcome.h"
+#include "base/seastarx.h"
+#include "base/units.h"
+#include "base/vassert.h"
 #include "cloud_roles/types.h"
 #include "http/client.h"
-#include "outcome.h"
-#include "seastarx.h"
-#include "units.h"
 #include "utils/named_type.h"
-#include "vassert.h"
 
 #include <fmt/chrono.h>
 
@@ -149,14 +149,6 @@ public:
     std::error_code sign_header(http::client::request_header& header) const;
 
 private:
-    // Azure expects every request to Blob Storage to contain an
-    // 'x-ms-version' header that specifies the API version to use.
-    // This version is hardcoded in Redpanda to ensure that an API
-    // version that we've tested with is used in field.
-    //
-    // Update this version to use a different storage API version.
-    static constexpr auto azure_storage_api_version = "2023-01-03";
-
     result<ss::sstring>
     get_string_to_sign(http::client::request_header& header) const;
 
@@ -178,6 +170,6 @@ template<class Fn>
 time_source::time_source(Fn&& fn, int)
   : _gettime_fn(std::forward<Fn>(fn)) {}
 
-ss::sstring uri_encode(const ss::sstring& input, bool encode_slash);
+ss::sstring redact_headers_from_string(const std::string_view original);
 
 } // namespace cloud_roles

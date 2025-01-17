@@ -10,15 +10,14 @@
 #include "pandaproxy/schema_registry/api.h"
 
 #include "config/configuration.h"
-#include "kafka/client/client.h"
 #include "kafka/client/configuration.h"
 #include "model/metadata.h"
 #include "pandaproxy/logger.h"
 #include "pandaproxy/schema_registry/configuration.h"
 #include "pandaproxy/schema_registry/schema_id_cache.h"
-#include "pandaproxy/schema_registry/seq_writer.h"
 #include "pandaproxy/schema_registry/service.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
+#include "pandaproxy/schema_registry/types.h"
 #include "pandaproxy/schema_registry/validation_metrics.h"
 
 #include <seastar/core/coroutine.hh>
@@ -33,19 +32,22 @@ api::api(
   size_t max_memory,
   kafka::client::configuration& client_cfg,
   configuration& cfg,
-  std::unique_ptr<cluster::controller>& c) noexcept
+  std::unique_ptr<cluster::controller>& c,
+  ss::sharded<security::audit::audit_log_manager>& audit_mgr) noexcept
   : _node_id{node_id}
   , _sg{sg}
   , _max_memory{max_memory}
   , _client_cfg{client_cfg}
   , _cfg{cfg}
-  , _controller(c) {}
+  , _controller(c)
+  , _audit_mgr(audit_mgr) {}
 
 api::~api() noexcept = default;
 
 ss::future<> api::start() {
-    _store = std::make_unique<sharded_store>();
-    co_await _store->start(_sg);
+    _store = std::make_unique<sharded_store>(protobuf_renderer_v2{
+      config::shard_local_cfg().schema_registry_protobuf_renderer_v2});
+    co_await _store->start(is_mutable(_cfg.mode_mutability), _sg);
     co_await _schema_id_validation_probe.start();
     co_await _schema_id_validation_probe.invoke_on_all(
       &schema_id_validation_probe::setup_metrics);
@@ -67,7 +69,8 @@ ss::future<> api::start() {
       std::ref(_client),
       std::ref(*_store),
       std::ref(_sequencer),
-      std::ref(_controller));
+      std::ref(_controller),
+      std::ref(_audit_mgr));
 
     co_await _service.invoke_on_all(&service::start);
 }

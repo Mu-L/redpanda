@@ -11,10 +11,12 @@
 
 #pragma once
 
-#include "cluster/health_monitor_frontend.h"
-#include "cluster/metadata_cache.h"
-#include "cluster/node_status_table.h"
-#include "seastarx.h"
+#include "base/seastarx.h"
+#include "cluster/fwd.h"
+#include "model/timeout_clock.h"
+
+#include <seastar/core/gate.hh>
+#include <seastar/core/sharded.hh>
 
 namespace cluster {
 

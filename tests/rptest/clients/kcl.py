@@ -9,7 +9,9 @@
 
 from collections import namedtuple
 import json
+import random
 import re
+import string
 import subprocess
 import time
 import itertools
@@ -38,8 +40,22 @@ KclListPartitionReassignmentsResponse = namedtuple(
 
 
 class KCL:
-    def __init__(self, redpanda):
+    def __init__(self,
+                 redpanda,
+                 username: str = None,
+                 password: str = None,
+                 sasl_mechanism: str = None):
         self._redpanda = redpanda
+        self._username = username
+        self._password = password
+        self._sasl_mechanism = sasl_mechanism
+        if self._username is None:
+            assert self._password is None and self._sasl_mechanism is None, 'Incomplete KCL sasl credentials'
+        else:
+            assert self._password is not None and self._sasl_mechanism is not None, 'Incomplete KCL sasl credentials'
+
+    def sasl_enabled(self):
+        return self._username is not None
 
     def list_topics(self):
         return self._cmd(['topic', 'list'])
@@ -120,7 +136,12 @@ class KCL:
         cmd.append(topic)
         return self._cmd(cmd)
 
-    def _alter_config(self, values, incremental, entity_type, entity):
+    def _alter_config(self,
+                      values,
+                      incremental,
+                      entity_type,
+                      entity,
+                      node=None):
         """
         :param broker: node id.
         :param values: dict of property name to new value
@@ -149,7 +170,7 @@ class KCL:
             # cmd needs to be string, so handle things like broker=1
             cmd.append(str(entity))
 
-        r = self._cmd(cmd, attempts=1)
+        r = self._cmd(cmd, attempts=1, node=node)
         if 'OK' not in r:
             raise RuntimeError(r)
         else:
@@ -158,8 +179,12 @@ class KCL:
     def alter_broker_config(self, values, incremental, broker=None):
         return self._alter_config(values, incremental, "broker", broker)
 
-    def alter_topic_config(self, values, incremental, topic):
-        return self._alter_config(values, incremental, "topic", topic)
+    def alter_topic_config(self, values, incremental, topic, node=None):
+        return self._alter_config(values,
+                                  incremental,
+                                  "topic",
+                                  topic,
+                                  node=node)
 
     def delete_broker_config(self, keys, incremental):
         """
@@ -178,7 +203,8 @@ class KCL:
     def describe_topic(self,
                        topic: str,
                        with_docs: bool = False,
-                       with_types: bool = False):
+                       with_types: bool = False,
+                       node=None):
         """
         :param topic: the name of the topic to describe
         :param with_docs: if true, include documention strings in the response
@@ -191,7 +217,7 @@ class KCL:
         if with_types:
             cmd.append("--with-types")
 
-        return self._cmd(cmd, attempts=1)
+        return self._cmd(cmd, attempts=1, node=node)
 
     def offset_delete(self, group: str, topic_partitions: dict):
         """
@@ -218,16 +244,12 @@ class KCL:
         cmd = ['group', 'offset-delete', "-j", group] + request_args_w_flags
         return json.loads(self._cmd(cmd, attempts=5))
 
-    def get_user_credentials_cmd(self,
-                                 user_cred: Optional[dict[str, str]] = None):
-        if user_cred is not None:
-            assert "user" in user_cred
-            assert "passwd" in user_cred
-            assert "method" in user_cred
+    def sasl_options(self):
+        if self.sasl_enabled():
             return [
-                "-X", f'sasl_user={user_cred["user"]}', "-X",
-                f'sasl_pass={user_cred["passwd"]}', "-X",
-                f'sasl_method={user_cred["method"]}'
+                "-X", f'sasl_user={self._username}', "-X",
+                f'sasl_pass={self._password}', "-X",
+                f'sasl_method={self._sasl_mechanism}'
             ]
 
         return []
@@ -242,9 +264,7 @@ class KCL:
                        to new replica assignments
         :return: list of KclAlterPartitionReassignmentsResponse
         """
-        cmd = self.get_user_credentials_cmd(user_cred) + [
-            "admin", "partas", "alter"
-        ]
+        cmd = ["admin", "partas", "alter"]
 
         for topic in topics:
             assert len(topics[topic]) > 0
@@ -317,17 +337,13 @@ class KCL:
 
     def list_partition_reassignments(self,
                                      topics: Optional[dict[str,
-                                                           list[int]]] = None,
-                                     user_cred: Optional[dict[str,
-                                                              str]] = None):
+                                                           list[int]]] = None):
         """
         :param topics: dict where topic name is the key and the value is the list
                        of partition IDs
         :return: list of KclListPartitionReassignmentsResponse
         """
-        cmd = self.get_user_credentials_cmd(user_cred) + [
-            "admin", "partas", "list"
-        ]
+        cmd = ["admin", "partas", "list"]
 
         lines = None
         if topics is None:
@@ -368,16 +384,17 @@ class KCL:
 
         return ret
 
-    def _cmd(self, cmd, input=None, attempts=5):
+    def _cmd(self, cmd, input=None, attempts=5, node=None):
         """
 
         :param attempts: how many times to try before giving up (1 for no retries)
         :return: stdout string
         """
-        brokers = self._redpanda.brokers()
+        brokers = node.name if node is not None else self._redpanda.brokers()
         cmd = ["kcl", "-X", f"seed_brokers={brokers}", "--no-config-file"
-               ] + cmd
+               ] + self.sasl_options() + cmd
         assert attempts > 0
+        self._redpanda.logger.debug(f"Executing {cmd}")
         for retry in reversed(range(attempts)):
             try:
                 res = subprocess.check_output(cmd,
@@ -404,13 +421,42 @@ class RawKCL(KCL):
 
     Callers should expect raw kafka responses json encoded with franz-go key naming scheme
     """
-    def raw_create_topics(self, version, topics):
+    def create_topics(self,
+                      version,
+                      topics: list[dict] = [],
+                      validate_only: bool = False):
+        """
+        Create some topics based on the provided dicts
+        Valid fields, which will be propagated into the request, are:
+          - 'name' - default 12 random ascii letters
+          - 'partition_count' - default -1
+          - 'replication_factor' - default -1
+        """
+        tps = []
+        for tp in topics:
+            tps.append(
+                KclCreateTopicsRequestTopic(
+                    tp.get('name',
+                           ''.join(random.choices(string.ascii_letters,
+                                                  k=12))),
+                    tp.get('partition_count', -1),
+                    tp.get('replication_factor', -1),
+                ))
+        try:
+            return json.loads(
+                self.raw_create_topics(version,
+                                       tps,
+                                       validate_only=validate_only))['Topics']
+        except:
+            return []
+
+    def raw_create_topics(self, version, topics, validate_only=False):
         assert version >= 0 and version <= 6, "version out of supported redpanda range for this API"
         create_topics_request = {
             'Version':
             version,
             'ValidateOnly':
-            False,
+            validate_only,
             'TimeoutMillis':
             60000,
             'Topics': [{
@@ -475,3 +521,13 @@ class RawKCL(KCL):
         self._redpanda.logger.info(f"DBG: {json.dumps(alter_configs_request)}")
         return self._cmd(['misc', 'raw-req', '-k', '33'],
                          input=json.dumps(alter_configs_request))
+
+    def raw_alter_quotas(self, body):
+        res = self._cmd(['misc', 'raw-req', '-k', '49'],
+                        input=json.dumps(body))
+        return json.loads(res)
+
+    def raw_describe_quotas(self, body):
+        res = self._cmd(['misc', 'raw-req', '-k', '48'],
+                        input=json.dumps(body))
+        return json.loads(res)

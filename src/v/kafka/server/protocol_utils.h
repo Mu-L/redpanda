@@ -11,14 +11,12 @@
 
 #pragma once
 
-#include "kafka/protocol/types.h"
 #include "kafka/server/request_context.h"
 #include "kafka/server/response.h"
-#include "kafka/types.h"
+#include "net/types.h"
 
 #include <seastar/core/iostream.hh>
 #include <seastar/core/scattered_message.hh>
-#include <seastar/core/temporary_buffer.hh>
 
 #include <optional>
 
@@ -28,5 +26,11 @@ namespace kafka {
 ss::future<std::optional<request_header>> parse_header(ss::input_stream<char>&);
 
 ss::scattered_message<char> response_as_scattered(response_ptr response);
+
+class malformed_header_exception : public net::parsing_exception {
+public:
+    explicit malformed_header_exception(const std::string& m)
+      : net::parsing_exception(m) {}
+};
 
 } // namespace kafka

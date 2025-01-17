@@ -13,9 +13,10 @@
 #include "cloud_roles/apply_credentials.h"
 #include "cloud_storage_clients/client.h"
 #include "cloud_storage_clients/client_probe.h"
-#include "utils/gate_guard.h"
-#include "utils/intrusive_list_helpers.h"
+#include "container/intrusive_list_helpers.h"
+#include "utils/stop_signal.h"
 
+#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -31,6 +32,8 @@ enum class client_pool_overdraft_policy {
     /// Client pool should try to borrow connection from another shard
     borrow_if_empty
 };
+
+inline constexpr ss::shard_id self_config_shard = ss::shard_id{0};
 
 /// Connection pool implementation
 /// All connections share the same configuration
@@ -95,11 +98,15 @@ public:
     /// \param conf is a client configuration
     /// \param policy controls what happens when the pool is empty (wait or try
     ///               to borrow from another shard)
+    /// \param application_abort_source abort source which can be used to stop
+    /// Redpanda gracefully
     client_pool(
       size_t size,
       client_configuration conf,
       client_pool_overdraft_policy policy
-      = client_pool_overdraft_policy::wait_if_empty);
+      = client_pool_overdraft_policy::wait_if_empty,
+      std::optional<std::reference_wrapper<stop_signal>> application_stop_signal
+      = std::nullopt);
 
     ss::future<> stop();
 
@@ -126,9 +133,24 @@ public:
 
     size_t max_size() const noexcept;
 
+    bool has_background_operations() const noexcept {
+        return _bg_gate.get_count() > 0;
+    }
+
+    bool has_waiters() const noexcept { return _cvar.has_waiters(); }
+
 private:
+    ss::future<>
+    client_self_configure(std::optional<std::reference_wrapper<stop_signal>>
+                            application_stop_signal);
+    ss::future<
+      std::optional<cloud_storage_clients::client_self_configuration_output>>
+    do_client_self_configure(http_client_ptr client);
+    ss::future<> accept_self_configure_result(
+      std::optional<client_self_configuration_output> result);
+
     void populate_client_pool();
-    http_client_ptr make_client() const;
+    http_client_ptr make_client() const noexcept;
     void release(http_client_ptr leased);
 
     /// Return number of clients which wasn't utilized
@@ -147,17 +169,23 @@ private:
     client_configuration _config;
     ss::shared_ptr<client_probe> _probe;
     client_pool_overdraft_policy _policy;
-    std::vector<http_client_ptr> _pool;
+    ss::circular_buffer<http_client_ptr> _pool;
     // List of all connections currently used by clients
     intrusive_list<client_lease, &client_lease::_hook> _leased;
     ss::condition_variable _cvar;
     ss::abort_source _as;
     ss::gate _gate;
+    // A gate for background operations. Most useful in testing where we want
+    // to wait all async housekeeping to complete before asserting state
+    // invariants.
+    ss::gate _bg_gate;
 
     /// Holds and applies the credentials for requests to S3. Shared pointer to
     /// enable rotating credentials to all clients.
     ss::lw_shared_ptr<cloud_roles::apply_credentials> _apply_credentials;
     ss::condition_variable _credentials_var;
+
+    ssx::semaphore _self_config_barrier{0, "self_config_barrier"};
 };
 
 } // namespace cloud_storage_clients

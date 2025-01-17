@@ -8,13 +8,15 @@
 // by the Apache License, Version 2.0
 #pragma once
 
-#include "seastarx.h"
+#include "base/seastarx.h"
 
 #include <seastar/core/sstring.hh>
 
 #include <absl/hash/hash.h>
 #include <boost/uuid/uuid.hpp>
 
+#include <string>
+#include <string_view>
 #include <vector>
 
 // Wrapper around Boost's UUID type suitable for serialization with serde.
@@ -39,6 +41,7 @@ public:
     }
 
     friend std::ostream& operator<<(std::ostream& os, const uuid_t& u);
+    friend std::istream& operator>>(std::istream& is, uuid_t& u);
     friend bool operator==(const uuid_t& u, const uuid_t& v) = default;
 
     operator ss::sstring() const;
@@ -53,9 +56,13 @@ public:
 
     underlying_t& mutable_uuid() { return _uuid; }
 
+    static uuid_t from_string(std::string_view);
+
 private:
     explicit uuid_t(const underlying_t& uuid)
       : _uuid(uuid) {}
 
     underlying_t _uuid;
 };
+
+bool operator<(const uuid_t& l, const uuid_t& r);

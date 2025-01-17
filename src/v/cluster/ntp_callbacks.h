@@ -10,8 +10,10 @@
  */
 
 #pragma once
-#include "cluster/partition.h"
-#include "cluster/types.h"
+
+#include "cluster/notification.h"
+#include "container/chunked_hash_map.h"
+#include "model/fundamental.h"
 
 #include <absl/container/flat_hash_map.h>
 
@@ -61,13 +63,19 @@ public:
     /// Invoke all matching callbacks.
     template<typename... Args>
     void notify(const model::ntp& ntp, Args&&... args) const {
+        notify(
+          ntp.ns, ntp.tp.topic, ntp.tp.partition, std::forward<Args>(args)...);
+    }
+
+    /// Invoke all matching callbacks.
+    template<typename... Args>
+    void notify(
+      const model::ns& ns,
+      const model::topic& topic,
+      model::partition_id part,
+      Args&&... args) const {
         // invoke for wildcard watchers
         notify(_root.callbacks, std::forward<Args>(args)...);
-
-        // filter callbacks on ntp path components
-        const auto& ns = ntp.ns;
-        const auto& topic = ntp.tp.topic;
-        const auto& part = ntp.tp.partition;
 
         // invoke for namespace watchers
         const auto& n_nodes = _root.next;
@@ -141,7 +149,7 @@ private:
     template<typename Key, typename Value>
     struct node {
         callbacks_t callbacks;
-        absl::flat_hash_map<Key, Value> next;
+        chunked_hash_map<Key, Value> next;
     };
 
     notification_id_type

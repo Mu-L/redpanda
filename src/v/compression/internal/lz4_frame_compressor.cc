@@ -9,15 +9,13 @@
 
 #include "compression/internal/lz4_frame_compressor.h"
 
-#include "bytes/bytes.h"
-#include "static_deleter_fn.h"
-#include "units.h"
-#include "vassert.h"
+#include "base/vassert.h"
+#include "compression/lz4_decompression_buffers.h"
+#include "thirdparty/lz4/lz4.h"
+#include "thirdparty/lz4/lz4frame.h"
+#include "utils/static_deleter_fn.h"
 
 #include <seastar/core/temporary_buffer.hh>
-
-#include <lz4.h>
-#include <lz4frame.h>
 
 namespace compression::internal {
 // from frameCompress.c
@@ -59,13 +57,21 @@ using lz4_decompression_ctx = std::unique_ptr<
     &LZ4F_freeDecompressionContext>>;
 
 static lz4_decompression_ctx make_decompression_context() {
-    LZ4F_dctx* c = nullptr;
-    LZ4F_errorCode_t code = LZ4F_createDecompressionContext(&c, LZ4F_VERSION);
-    check_lz4_error("LZ4F_createDecompressionContext error: {}", code);
+    LZ4F_dctx* c = LZ4F_createDecompressionContext_advanced(
+      lz4_decompression_buffers_instance().custom_mem_alloc(), LZ4F_VERSION);
+    if (c == nullptr) {
+        throw std::runtime_error("Failed to initialize decompression context");
+    }
+
     return lz4_decompression_ctx(c);
 }
 
 iobuf lz4_frame_compressor::compress(const iobuf& b) {
+    return compress_with_block_size(b, std::nullopt);
+}
+
+iobuf lz4_frame_compressor::compress_with_block_size(
+  const iobuf& b, std::optional<LZ4F_blockSizeID_t> block_size_id) {
     auto ctx_ptr = make_compression_context();
     LZ4F_compressionContext_t ctx = ctx_ptr.get();
     /* Required by Kafka */
@@ -73,7 +79,13 @@ iobuf lz4_frame_compressor::compress(const iobuf& b) {
     std::memset(&prefs, 0, sizeof(prefs));
     prefs.compressionLevel = 1; // default
     prefs.frameInfo = {
-      .blockMode = LZ4F_blockIndependent, .contentSize = b.size_bytes()};
+      .blockMode = LZ4F_blockIndependent,
+      .contentSize = b.size_bytes(),
+    };
+
+    if (block_size_id.has_value()) {
+        prefs.frameInfo.blockSizeID = block_size_id.value();
+    }
 
     const size_t max_chunk_size = details::io_allocation_size::max_chunk_size;
 
@@ -101,8 +113,8 @@ iobuf lz4_frame_compressor::compress(const iobuf& b) {
 
     // We do not consume entire input chunks at once, to avoid
     // max_chunk_size input chunks resulting in >max_chunk_size output
-    // chunks.  A half-sized input chunk never results in a LZ4F_compressBound
-    // that exceeds a the max output chunk.
+    // chunks.  A half-sized input chunk never results in a
+    // LZ4F_compressBound that exceeds a the max output chunk.
     const size_t max_input_chunk_size = max_chunk_size / 2;
 
     iobuf ret;
@@ -117,6 +129,17 @@ iobuf lz4_frame_compressor::compress(const iobuf& b) {
 
         size_t input_chunk_size = std::min(
           input_sz - input_cursor, max_input_chunk_size);
+        size_t next_output_size = LZ4F_compressBound(input_chunk_size, &prefs);
+
+        if (output_sz - output_cursor < next_output_size) {
+            obuf.trim(output_cursor);
+            ret.append(std::move(obuf));
+            output_chunk_size = std::min(max_chunk_size, output_chunk_size * 2);
+            obuf = ss::temporary_buffer<char>(output_chunk_size);
+            output = obuf.get_write();
+            output_sz = obuf.size();
+            output_cursor = 0;
+        }
 
         code = LZ4F_compressUpdate(
           ctx,
@@ -132,20 +155,16 @@ iobuf lz4_frame_compressor::compress(const iobuf& b) {
 
         // Advance by how many bytes we consumed
         output_cursor += code;
+    }
 
-        input_chunk_size = std::min(
-          input_sz - input_cursor, max_input_chunk_size);
-        size_t next_output_size = LZ4F_compressBound(input_chunk_size, &prefs);
-
-        if (output_sz - output_cursor < next_output_size) {
-            obuf.trim(output_cursor);
-            ret.append(std::move(obuf));
-            output_chunk_size = std::min(max_chunk_size, output_chunk_size * 2);
-            obuf = ss::temporary_buffer<char>(output_chunk_size);
-            output = obuf.get_write();
-            output_sz = obuf.size();
-            output_cursor = 0;
-        }
+    if (const auto sz_for_compress_end = LZ4F_compressBound(0, &prefs);
+        output_sz - output_cursor < sz_for_compress_end) {
+        obuf.trim(output_cursor);
+        ret.append(std::move(obuf));
+        obuf = ss::temporary_buffer<char>(sz_for_compress_end);
+        output = obuf.get_write();
+        output_sz = obuf.size();
+        output_cursor = 0;
     }
 
     code = LZ4F_compressEnd(
@@ -157,7 +176,7 @@ iobuf lz4_frame_compressor::compress(const iobuf& b) {
     return ret;
 }
 
-inline static constexpr size_t
+static inline constexpr size_t
 compute_frame_uncompressed_size(size_t frame_size, size_t original) {
     if (frame_size == 0 || frame_size > original * 255) {
         return original * 4;
@@ -165,7 +184,7 @@ compute_frame_uncompressed_size(size_t frame_size, size_t original) {
     return frame_size;
 }
 
-iobuf lz4_frame_compressor::uncompress(iobuf const& input) {
+iobuf lz4_frame_compressor::uncompress(const iobuf& input) {
     size_t src_size = input.size_bytes();
 
     const size_t max_chunk = details::io_allocation_size::max_chunk_size;

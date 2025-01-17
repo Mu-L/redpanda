@@ -10,8 +10,8 @@
  */
 
 #pragma once
+#include "metrics/metrics.h"
 #include "model/fundamental.h"
-#include "ssx/metrics.h"
 
 #include <seastar/core/metrics.hh>
 #include <seastar/core/metrics_registration.hh>
@@ -32,7 +32,12 @@ public:
 
     void vote_request_sent() { ++_vote_requests_sent; }
 
-    void replicate_requests_ack_all() { ++_replicate_requests_ack_all; }
+    void replicate_requests_ack_all_with_flush() {
+        ++_replicate_requests_ack_all_with_flush;
+    }
+    void replicate_requests_ack_all_without_flush() {
+        ++_replicate_requests_ack_all_without_flush;
+    }
     void replicate_requests_ack_leader() { ++_replicate_requests_ack_leader; }
     void replicate_requests_ack_none() { ++_replicate_requests_ack_none; }
     void replicate_done() { ++_replicate_requests_done; }
@@ -56,11 +61,23 @@ public:
     void replicate_request_error() { ++_replicate_request_error; };
     void recovery_request_error() { ++_recovery_request_error; };
 
+    void full_heartbeat() { ++_full_heartbeat_requests; }
+    void lw_heartbeat() { ++_lw_heartbeat_requests; }
+    void offset_translator_inconsistency_error() {
+        ++_offset_translator_inconsistency_error;
+    }
+
+    void clear() {
+        _metrics.clear();
+        _public_metrics.clear();
+    }
+
 private:
     uint64_t _vote_requests = 0;
     uint64_t _append_requests = 0;
     uint64_t _vote_requests_sent = 0;
-    uint64_t _replicate_requests_ack_all = 0;
+    uint64_t _replicate_requests_ack_all_with_flush = 0;
+    uint64_t _replicate_requests_ack_all_without_flush = 0;
     uint64_t _replicate_requests_ack_leader = 0;
     uint64_t _replicate_requests_ack_none = 0;
     uint64_t _replicate_requests_done = 0;
@@ -73,10 +90,10 @@ private:
     uint64_t _heartbeat_request_error = 0;
     uint64_t _replicate_request_error = 0;
     uint64_t _recovery_request_error = 0;
-
-    ssx::metrics::metric_groups _metrics
-      = ssx::metrics::metric_groups::make_internal();
-    ssx::metrics::metric_groups _public_metrics
-      = ssx::metrics::metric_groups::make_public();
+    uint64_t _full_heartbeat_requests = 0;
+    uint64_t _lw_heartbeat_requests = 0;
+    uint64_t _offset_translator_inconsistency_error = 0;
+    metrics::internal_metric_groups _metrics;
+    metrics::public_metric_groups _public_metrics;
 };
 } // namespace raft

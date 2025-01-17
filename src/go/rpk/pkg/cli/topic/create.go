@@ -22,6 +22,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
+	"go.uber.org/zap"
 )
 
 func newCreateCommand(fs afero.Fs, p *config.Params) *cobra.Command {
@@ -49,9 +50,9 @@ will create two topics, foo and bar, each with 20 partitions, 3 replicas, and
 the cleanup.policy=compact config option set.
 `,
 
-		Run: func(cmd *cobra.Command, topics []string) {
+		Run: func(_ *cobra.Command, topics []string) {
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
 
 			cl, err := kafka.NewFranzClient(fs, p)
 			out.MaybeDie(err, "unable to initialize kafka client: %v", err)
@@ -99,15 +100,29 @@ the cleanup.policy=compact config option set.
 
 			for _, topic := range resp.Topics {
 				msg := "OK"
+				if topic.ErrorMessage != nil {
+					zap.L().Sugar().Debugf("redpanda returned error message: %v", *topic.ErrorMessage)
+				}
 				if err := kerr.ErrorForCode(topic.ErrorCode); err != nil {
 					if errors.Is(err, kerr.InvalidPartitions) && partitions > 0 {
 						msg = fmt.Sprintf("INVALID_PARTITIONS: unable to create topic with %d partitions due to hardware constraints", partitions)
 					} else if errors.Is(err, kerr.InvalidReplicationFactor) && replicas == -1 {
-						msg = "INVALID_REPLICATION_FACTOR: replication factor must be odd; check your 'default_topic_replications' cluster configuration property"
+						msg = "INVALID_REPLICATION_FACTOR: "
+						if topic.ErrorMessage != nil {
+							msg += *topic.ErrorMessage
+						} else {
+							msg += "replication factor must be odd"
+						}
+						msg += "; check your 'default_topic_replications' cluster configuration property"
 					} else if errors.Is(err, kerr.InvalidReplicationFactor) && replicas%2 == 0 {
 						msg = "INVALID_REPLICATION_FACTOR: replication factor must be odd"
 					} else {
 						msg = err.Error()
+						if ke := (*kerr.Error)(nil); errors.As(err, &ke) {
+							if topic.ErrorMessage != nil {
+								msg = ke.Message + ": " + *topic.ErrorMessage
+							}
+						}
 					}
 					exit1 = true
 				}

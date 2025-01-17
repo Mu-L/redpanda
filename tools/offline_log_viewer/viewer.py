@@ -3,9 +3,10 @@ import os
 import sys
 from os.path import join
 
-from controller import ControllerLog
+from controller import ControllerLog, ControllerSnapshot
 from consumer_groups import GroupsLog
 from consumer_offsets import OffsetsLog
+from topic_manifest import decode_topic_manifest, decode_topic_manifest_to_legacy_v1_json
 from tx_coordinator import TxLog
 
 import itertools
@@ -60,6 +61,28 @@ def print_controller(store, bin_dump: bool):
                 print(j, end='')
 
 
+def print_controller_snapshot(store, bin_dump: bool):
+    for ntp in store.ntps:
+        if ntp.nspace == "redpanda" and ntp.topic == "controller":
+
+            snap = ControllerSnapshot(ntp, bin_dump=bin_dump)
+            iter_json = json.JSONEncoder(indent=2).iterencode(
+                SerializableGenerator(snap.to_dict().items()))
+            for j in iter_json:
+                print(j, end='')
+
+
+def print_topic_manifest(serde_file_path, legacy_json: bool):
+    if not os.path.exists(serde_file_path):
+        logger.error(f"File doesn't exist {serde_file_path}")
+        sys.exit(1)
+
+    res = decode_topic_manifest_to_legacy_v1_json(
+        serde_file_path) if legacy_json else decode_topic_manifest(
+            serde_file_path)
+    print(json.dumps(res, indent=2))
+
+
 def print_kafka(store, topic, headers_only):
     for ntp in store.ntps:
         if ntp.nspace in ["kafka", "kafka_internal"]:
@@ -68,8 +91,10 @@ def print_kafka(store, topic, headers_only):
 
             logger.info(f'topic: {ntp.topic}, partition: {ntp.partition}')
             log = KafkaLog(ntp, headers_only=headers_only)
-            for result in log.decode():
-                logger.info(json.dumps(result, indent=2))
+            json_iter = json.JSONEncoder(indent=2).iterencode(
+                SerializableGenerator(log))
+            for record in json_iter:
+                print(record, end='')
 
 
 def print_groups(store):
@@ -82,19 +107,13 @@ def print_groups(store):
 
 
 def print_consumer_offsets(store):
-    records = []
+    logs = dict()
     for ntp in store.ntps:
         if ntp.nspace == "kafka" and ntp.topic == "__consumer_offsets":
-            l = OffsetsLog(ntp)
-            l.decode()
-            records.append({
-                "partition_id": ntp.partition,
-                "records": l.records
-            })
-
-    # Send JSON output to stdout in case caller wants to parse it, other
-    # CLI output goes to stderr via logger
-    print(json.dumps(records, indent=2))
+            logs[str(ntp)] = SerializableGenerator(OffsetsLog(ntp))
+    json_records = json.JSONEncoder(indent=2).iterencode(logs)
+    for record in json_records:
+        print(record, end='')
 
 
 def print_tx_coordinator(store):
@@ -106,10 +125,13 @@ def print_tx_coordinator(store):
     logger.info("")
 
 
-def validate_path(path):
+def validate_path(options):
+    path = options.path
     if not os.path.exists(path):
         logger.error(f"Path doesn't exist {path}")
         sys.exit(1)
+    if options.force:
+        return
     controller = join(path, "redpanda", "controller")
     if not os.path.exists(controller):
         logger.error(
@@ -147,7 +169,9 @@ def main():
                             choices=[
                                 'controller', 'kvstore', 'kafka',
                                 'consumer_offsets', 'legacy-group',
-                                'kafka_records', 'tx_coordinator'
+                                'kafka_records', 'tx_coordinator',
+                                'topic_manifest', 'topic_manifest_legacy',
+                                'controller_snapshot'
                             ],
                             required=True,
                             help='operation to execute')
@@ -161,23 +185,34 @@ def main():
             '--dump',
             action='store_true',
             help='output binary dumps of keys and values being parsed')
+        parser.add_argument('--force',
+                            action='store_true',
+                            help='Skip data directory validation')
         return parser
 
     parser = generate_options()
     options, _ = parser.parse_known_args()
+
+    if options.type in ["topic_manifest", "topic_manifest_legacy"]:
+        print_topic_manifest(
+            options.path, legacy_json=options.type == "topic_manifest_legacy")
+        sys.exit(0)
+
     if options.verbose:
         logging.basicConfig(level="DEBUG")
     else:
         logging.basicConfig(level="INFO")
     logger.info(f"starting metadata viewer with options: {options}")
 
-    validate_path(options.path)
+    validate_path(options)
 
     store = Store(options.path)
     if options.type == "kvstore":
         print_kv_store(store)
     elif options.type == "controller":
         print_controller(store, options.dump)
+    elif options.type == "controller_snapshot":
+        print_controller_snapshot(store, options.dump)
     elif options.type == "kafka":
         validate_topic(options.path, options.topic)
         print_kafka(store, options.topic, headers_only=True)

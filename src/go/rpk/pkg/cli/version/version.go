@@ -12,6 +12,9 @@ package version
 import (
 	"fmt"
 	"runtime"
+	"time"
+
+	"github.com/redpanda-data/common-go/rpadmin"
 
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
@@ -57,7 +60,10 @@ This command prints the current rpk version and allows you to list the Redpanda
 version running on each node in your cluster.
 
 To list the Redpanda version of each node in your cluster you may pass the
-Admin API hosts via flags, profile, or environment variables.`,
+Admin API hosts using flags, profile, or environment variables.
+
+To get only the rpk version, use 'rpk --version'.`,
+		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, _ []string) {
 			rv := rpkVersion{
 				Version:   version,
@@ -68,14 +74,31 @@ Admin API hosts via flags, profile, or environment variables.`,
 			}
 			printRpkVersion(rv)
 			var rows redpandaVersions
-			defer printClusterVersions(&rows)
+			printCV := true
+			defer func() {
+				if printCV {
+					printClusterVersions(&rows)
+				}
+			}()
 
 			p, err := p.LoadVirtualProfile(fs)
 			if err != nil {
 				zap.L().Sugar().Errorf("unable to load the profile: %v", err)
 				return
 			}
-			cl, err := adminapi.NewClient(fs, p)
+			// Cloud clusters don't expose their admin API, the rest of the
+			// command will always fail. We better exit early.
+			if p.FromCloud {
+				printCV = false
+				return
+			}
+			cl, err := adminapi.NewClient(
+				cmd.Context(),
+				fs,
+				p,
+				rpadmin.ClientTimeout(3*time.Second),
+				rpadmin.MaxRetries(2),
+			)
 			if err != nil {
 				zap.L().Sugar().Errorf("unable to create the admin client: %v", err)
 				return
@@ -110,7 +133,9 @@ func printClusterVersions(rpv *redpandaVersions) {
 	if len(*rpv) == 0 {
 		fmt.Println(`  Unreachable, to debug, use the '-v' flag. To get the broker versions, pass the
   hosts via flags, profile, or environment variables:
-    rpk version -X admin.hosts=<host address>`)
+    rpk version -X admin.hosts=<host address>
+
+  To get only the rpk version, use 'rpk --version'.`)
 		return
 	}
 	for _, v := range *rpv {

@@ -10,10 +10,9 @@
  */
 #pragma once
 
+#include "base/units.h"
 #include "kafka/server/fetch_session.h"
-#include "kafka/types.h"
-#include "ssx/metrics.h"
-#include "units.h"
+#include "metrics/metrics.h"
 
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/smp.hh>
@@ -77,8 +76,7 @@ private:
 
     size_t _sessions_mem_usage = 0;
 
-    ssx::metrics::metric_groups _metrics
-      = ssx::metrics::metric_groups::make_internal();
+    metrics::internal_metric_groups _metrics;
 };
 
 } // namespace kafka

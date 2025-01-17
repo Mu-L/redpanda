@@ -11,7 +11,7 @@
 #include "cluster/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "raft/types.h"
+#include "raft/fundamental.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/testing/thread_test_case.hh>
@@ -20,9 +20,50 @@
 
 using namespace std::chrono_literals;
 
+static void validate_topic_deltas(
+  const std::vector<cluster::topic_table::topic_delta>& d,
+  int new_topics,
+  int removed_topics) {
+    size_t additions = std::count_if(
+      d.begin(), d.end(), [](const cluster::topic_table::topic_delta& d) {
+          return d.type == cluster::topic_table_topic_delta_type::added;
+      });
+    size_t deletions = std::count_if(
+      d.begin(), d.end(), [](const cluster::topic_table::topic_delta& d) {
+          return d.type == cluster::topic_table_topic_delta_type::removed;
+      });
+    BOOST_REQUIRE_EQUAL(additions, new_topics);
+    BOOST_REQUIRE_EQUAL(deletions, removed_topics);
+}
+
+static void validate_ntp_deltas(
+  const std::vector<cluster::topic_table::ntp_delta>& d,
+  int new_partitions,
+  int removed_partitions) {
+    size_t additions = std::count_if(
+      d.begin(), d.end(), [](const cluster::topic_table::ntp_delta& d) {
+          return d.type == cluster::topic_table_ntp_delta_type::added;
+      });
+    size_t deletions = std::count_if(
+      d.begin(), d.end(), [](const cluster::topic_table::ntp_delta& d) {
+          return d.type == cluster::topic_table_ntp_delta_type::removed;
+      });
+    BOOST_REQUIRE_EQUAL(additions, new_partitions);
+    BOOST_REQUIRE_EQUAL(deletions, removed_partitions);
+}
+
 FIXTURE_TEST(test_happy_path_create, topic_table_fixture) {
+    std::vector<cluster::topic_table_topic_delta> topic_deltas;
+    table.local().register_topic_delta_notification([&](const auto& d) {
+        topic_deltas.insert(topic_deltas.end(), d.begin(), d.end());
+    });
+
+    std::vector<cluster::topic_table_ntp_delta> deltas;
+    table.local().register_ntp_delta_notification(
+      [&](const auto& d) { deltas.insert(deltas.end(), d.begin(), d.end()); });
+
     create_topics();
-    auto md = table.local().all_topics_metadata();
+    auto& md = table.local().all_topics_metadata();
 
     BOOST_REQUIRE_EQUAL(md.size(), 3);
 
@@ -37,60 +78,73 @@ FIXTURE_TEST(test_happy_path_create, topic_table_fixture) {
     BOOST_REQUIRE_EQUAL(
       md.find(make_tp_ns("test_tp_3"))->second.get_assignments().size(), 8);
 
-    // check delta
-    auto d = table.local().wait_for_changes(as).get0();
-
-    validate_delta(d, 21, 0);
+    validate_topic_deltas(topic_deltas, 3, 0);
+    validate_ntp_deltas(deltas, 21, 0);
 }
 
 FIXTURE_TEST(test_happy_path_delete, topic_table_fixture) {
     create_topics();
-    // discard create delta
-    table.local().wait_for_changes(as).get0();
-    table.local()
-      .apply(
-        cluster::delete_topic_cmd(
-          make_tp_ns("test_tp_2"), make_tp_ns("test_tp_2")),
-        model::offset(0))
-      .get0();
-    table.local()
-      .apply(
-        cluster::delete_topic_cmd(
-          make_tp_ns("test_tp_3"), make_tp_ns("test_tp_3")),
-        model::offset(0))
-      .get0();
 
-    auto md = table.local().all_topics_metadata();
+    std::vector<cluster::topic_table_topic_delta> topic_deltas;
+    table.local().register_topic_delta_notification([&](const auto& d) {
+        topic_deltas.insert(topic_deltas.end(), d.begin(), d.end());
+    });
+
+    std::vector<cluster::topic_table_ntp_delta> deltas;
+    table.local().register_ntp_delta_notification(
+      [&](const auto& d) { deltas.insert(deltas.end(), d.begin(), d.end()); });
+
+    BOOST_REQUIRE(!table.local()
+                     .apply(
+                       cluster::delete_topic_cmd(
+                         make_tp_ns("test_tp_2"), make_tp_ns("test_tp_2")),
+                       model::offset(0))
+                     .get());
+    BOOST_REQUIRE(!table.local()
+                     .apply(
+                       cluster::delete_topic_cmd(
+                         make_tp_ns("test_tp_3"), make_tp_ns("test_tp_3")),
+                       model::offset(0))
+                     .get());
+
+    auto& md = table.local().all_topics_metadata();
     BOOST_REQUIRE_EQUAL(md.size(), 1);
     BOOST_REQUIRE(md.contains(make_tp_ns("test_tp_1")));
 
     BOOST_REQUIRE_EQUAL(
       md.find(make_tp_ns("test_tp_1"))->second.get_assignments().size(), 1);
-    // check delta
-    auto d = table.local().wait_for_changes(as).get0();
 
-    validate_delta(d, 0, 20);
+    validate_topic_deltas(topic_deltas, 0, 2);
+    validate_ntp_deltas(deltas, 0, 20);
 }
 
 FIXTURE_TEST(test_conflicts, topic_table_fixture) {
     create_topics();
-    // discard create delta
-    table.local().wait_for_changes(as).get0();
+
+    std::vector<cluster::topic_table_topic_delta> topic_deltas;
+    table.local().register_topic_delta_notification([&](const auto& d) {
+        topic_deltas.insert(topic_deltas.end(), d.begin(), d.end());
+    });
+
+    std::vector<cluster::topic_table_ntp_delta> deltas;
+    table.local().register_ntp_delta_notification(
+      [&](const auto& d) { deltas.insert(deltas.end(), d.begin(), d.end()); });
 
     auto res_1 = table.local()
                    .apply(
                      cluster::delete_topic_cmd(
                        make_tp_ns("not_exists"), make_tp_ns("not_exists")),
                      model::offset(0))
-                   .get0();
+                   .get();
     BOOST_REQUIRE_EQUAL(res_1, cluster::errc::topic_not_exists);
 
     auto res_2 = table.local()
                    .apply(
                      make_create_topic_cmd("test_tp_1", 2, 3), model::offset(0))
-                   .get0();
+                   .get();
     BOOST_REQUIRE_EQUAL(res_2, cluster::errc::topic_already_exists);
-    BOOST_REQUIRE_EQUAL(table.local().has_pending_changes(), false);
+    BOOST_REQUIRE_EQUAL(topic_deltas.size(), 0);
+    BOOST_REQUIRE_EQUAL(deltas.size(), 0);
 }
 
 FIXTURE_TEST(get_getting_config, topic_table_fixture) {
@@ -112,21 +166,18 @@ FIXTURE_TEST(get_getting_config, topic_table_fixture) {
       tristate(std::make_optional(std::chrono::milliseconds(3600000))));
 }
 
-FIXTURE_TEST(test_wait_aborted, topic_table_fixture) {
-    ss::abort_source local_as;
-    ss::timer<> timer;
-    timer.set_callback([&local_as] { local_as.request_abort(); });
-    timer.arm(500ms);
-    // discard create delta
-    BOOST_REQUIRE_THROW(
-      table.local().wait_for_changes(local_as).get0(),
-      ss::abort_requested_exception);
-}
-
 FIXTURE_TEST(test_adding_partition, topic_table_fixture) {
-    // discard create delta
     create_topics();
-    table.local().wait_for_changes(as).get0();
+
+    std::vector<cluster::topic_table_topic_delta> topic_deltas;
+    table.local().register_topic_delta_notification([&](const auto& d) {
+        topic_deltas.insert(topic_deltas.end(), d.begin(), d.end());
+    });
+
+    std::vector<cluster::topic_table_ntp_delta> deltas;
+    table.local().register_ntp_delta_notification(
+      [&](const auto& d) { deltas.insert(deltas.end(), d.begin(), d.end()); });
+
     cluster::create_partitions_configuration cfg(make_tp_ns("test_tp_2"), 3);
     ss::chunked_fifo<cluster::partition_assignment> p_as;
     p_as.push_back(cluster::partition_assignment{
@@ -153,19 +204,20 @@ FIXTURE_TEST(test_adding_partition, topic_table_fixture) {
     cluster::create_partitions_configuration_assignment pca(
       std::move(cfg), std::move(p_as));
 
-    table.local()
-      .apply(
-        cluster::create_partition_cmd(make_tp_ns("test_tp_2"), std::move(pca)),
-        model::offset(0))
-      .get0();
+    auto result = table.local()
+                    .apply(
+                      cluster::create_partition_cmd(
+                        make_tp_ns("test_tp_2"), std::move(pca)),
+                      model::offset(0))
+                    .get();
+    BOOST_REQUIRE(!result);
 
     auto md = table.local().get_topic_metadata(make_tp_ns("test_tp_2"));
 
     BOOST_REQUIRE_EQUAL(md->get_assignments().size(), 15);
-    // check delta
-    auto d = table.local().wait_for_changes(as).get0();
     // require 3 partition additions
-    validate_delta(d, 3, 0);
+    BOOST_REQUIRE_EQUAL(topic_deltas.size(), 0);
+    validate_ntp_deltas(deltas, 3, 0);
 }
 
 void validate_brokers_revisions(
@@ -185,7 +237,7 @@ void validate_brokers_revisions(
     BOOST_REQUIRE(p_meta_it != tp_it->second.partitions.end());
     const auto& revisions = p_meta_it->second.replicas_revisions;
 
-    for (auto& bs : p_it->replicas) {
+    for (auto& bs : p_it->second.replicas) {
         fmt::print("replica: {}\n", bs);
     }
     for (auto& bs : expected_revisions) {
@@ -517,6 +569,34 @@ FIXTURE_TEST(test_topic_with_schema_id_validation_ops, topic_table_fixture) {
     cfg = topics.get_topic_cfg(tp_ns);
     BOOST_REQUIRE(cfg.has_value());
     BOOST_REQUIRE(!cfg->properties.record_key_schema_id_validation.has_value());
+
+    // Ensure that an invalid update cmd does not get persisted in the topic
+    // table.
+    // Sanity check before starting.
+    BOOST_REQUIRE(!cfg->properties.record_key_schema_id_validation.has_value());
+    BOOST_REQUIRE(
+      !cfg->properties.record_key_schema_id_validation_compat.has_value());
+
+    update.record_key_schema_id_validation.op
+      = cluster::incremental_update_operation::set;
+    update.record_key_schema_id_validation.value.emplace(true);
+
+    update.record_key_schema_id_validation_compat.op
+      = cluster::incremental_update_operation::set;
+    update.record_key_schema_id_validation_compat.value.emplace(false);
+    ec = topics
+           .apply(
+             cluster::update_topic_properties_cmd{tp_ns, update},
+             model::offset{11})
+           .get();
+    BOOST_REQUIRE_EQUAL(ec, cluster::errc::topic_invalid_config);
+    cfg = topics.get_topic_cfg(tp_ns);
+    BOOST_REQUIRE(cfg.has_value());
+
+    // Properties from invalid configuration should not have been persisted.
+    BOOST_REQUIRE(!cfg->properties.record_key_schema_id_validation.has_value());
+    BOOST_REQUIRE(
+      !cfg->properties.record_key_schema_id_validation_compat.has_value());
 }
 
 FIXTURE_TEST(test_topic_table_iterator_basic, topic_table_fixture) {

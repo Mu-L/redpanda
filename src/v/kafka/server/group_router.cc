@@ -10,9 +10,14 @@
  */
 #include "kafka/server/group_router.h"
 
+#include "kafka/server/logger.h"
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/with_scheduling_group.hh>
+
+#include <algorithm>
+#include <iterator>
 
 namespace kafka {
 
@@ -51,10 +56,10 @@ auto group_router::route_tx(Request&& r, FwdFunc func) {
     if (!m) {
         resp_type reply;
         // route_tx routes internal intra cluster so it uses
-        // cluster::tx_errc instead of kafka::error_code
+        // cluster::tx::errc instead of kafka::error_code
         // because the latter is part of the kafka protocol
         // we can't extend it
-        reply.ec = cluster::tx_errc::not_coordinator;
+        reply.ec = cluster::tx::errc::not_coordinator;
         return ss::make_ready_future<resp_type>(reply);
     }
     r.ntp = std::move(m->first);
@@ -189,7 +194,7 @@ ss::future<> group_router::parallel_route_delete_groups(
 }
 
 ss::future<std::vector<deletable_group_result>>
-group_router::delete_groups(std::vector<group_id> groups) {
+group_router::delete_groups(chunked_vector<group_id> groups) {
     // partial results
     std::vector<deletable_group_result> results;
 
@@ -286,28 +291,28 @@ group_router::begin_tx(cluster::begin_group_tx_request request) {
     return route_tx(std::move(request), &group_manager::begin_tx);
 }
 
-ss::future<cluster::prepare_group_tx_reply>
-group_router::prepare_tx(cluster::prepare_group_tx_request request) {
-    return route_tx(std::move(request), &group_manager::prepare_tx);
-}
-
 ss::future<cluster::abort_group_tx_reply>
 group_router::abort_tx(cluster::abort_group_tx_request request) {
     return route_tx(std::move(request), &group_manager::abort_tx);
 }
 
-ss::future<std::pair<error_code, std::vector<listed_group>>>
-group_router::list_groups() {
-    using type = std::pair<error_code, std::vector<listed_group>>;
+ss::future<std::pair<error_code, chunked_vector<listed_group>>>
+group_router::list_groups(group_manager::list_groups_filter_data filter_data) {
+    using type = std::pair<error_code, chunked_vector<listed_group>>;
     return get_group_manager().map_reduce0(
-      [](group_manager& mgr) { return mgr.list_groups(); },
+      [filter_data = std::move(filter_data)](group_manager& mgr) {
+          return mgr.list_groups(filter_data);
+      },
       type{},
       [](type a, type b) {
           // reduce errors into `a` and retain the first
           if (a.first == error_code::none) {
               a.first = b.first;
           }
-          a.second.insert(a.second.end(), b.second.begin(), b.second.end());
+          auto& av = a.second;
+          auto& bv = b.second;
+          av.reserve(av.size() + bv.size());
+          std::copy(bv.begin(), bv.end(), std::back_inserter(av));
           return a;
       });
 }

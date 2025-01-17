@@ -64,6 +64,7 @@ type (
 		AdvertisedRPCAPI           *SocketAddress            `yaml:"advertised_rpc_api,omitempty" json:"advertised_rpc_api,omitempty"`
 		AdvertisedKafkaAPI         []NamedSocketAddress      `yaml:"advertised_kafka_api,omitempty" json:"advertised_kafka_api,omitempty"`
 		DeveloperMode              bool                      `yaml:"developer_mode,omitempty" json:"developer_mode"`
+		RecoveryModeEnabled        bool                      `yaml:"recovery_mode_enabled,omitempty" json:"recovery_mode_enabled,omitempty"`
 		CrashLoopLimit             *int                      `yaml:"crash_loop_limit,omitempty" json:"crash_loop_limit"`
 		Other                      map[string]interface{}    `yaml:",inline"`
 	}
@@ -123,9 +124,10 @@ type (
 	// BACKCOMPAT 23-05-01: The CA used to be "truststore_file" in yaml; we
 	// deserialize truststore_file AND ca_file. See weak.go.
 	TLS struct {
-		KeyFile        string `yaml:"key_file,omitempty" json:"key_file"`
-		CertFile       string `yaml:"cert_file,omitempty" json:"cert_file"`
-		TruststoreFile string `yaml:"ca_file,omitempty" json:"ca_file"`
+		KeyFile            string `yaml:"key_file,omitempty" json:"key_file,omitempty"`
+		CertFile           string `yaml:"cert_file,omitempty" json:"cert_file,omitempty"`
+		TruststoreFile     string `yaml:"ca_file,omitempty" json:"ca_file,omitempty"`
+		InsecureSkipVerify bool   `yaml:"insecure_skip_verify,omitempty" json:"insecure_skip_verify,omitempty"`
 	}
 
 	ServerTLS struct {
@@ -139,8 +141,9 @@ type (
 	}
 
 	RpkNodeConfig struct {
-		KafkaAPI RpkKafkaAPI `yaml:"kafka_api,omitempty" json:"kafka_api"`
-		AdminAPI RpkAdminAPI `yaml:"admin_api,omitempty" json:"admin_api"`
+		KafkaAPI RpkKafkaAPI          `yaml:"kafka_api,omitempty" json:"kafka_api"`
+		AdminAPI RpkAdminAPI          `yaml:"admin_api,omitempty" json:"admin_api"`
+		SR       RpkSchemaRegistryAPI `yaml:"schema_registry,omitempty" json:"schema_registry"`
 
 		// The following four configs are passed to redpanda on `rpk
 		// redpanda start`. They are not tuner configs. They live here
@@ -174,14 +177,19 @@ type (
 	}
 
 	RpkKafkaAPI struct {
-		Brokers []string `yaml:"brokers,omitempty" json:"brokers"`
-		TLS     *TLS     `yaml:"tls,omitempty" json:"tls"`
+		Brokers []string `yaml:"brokers,omitempty" json:"brokers,omitempty"`
+		TLS     *TLS     `yaml:"tls,omitempty" json:"tls,omitempty"`
 		SASL    *SASL    `yaml:"sasl,omitempty" json:"sasl,omitempty"`
 	}
 
 	RpkAdminAPI struct {
-		Addresses []string `yaml:"addresses,omitempty" json:"addresses"`
-		TLS       *TLS     `yaml:"tls,omitempty" json:"tls"`
+		Addresses []string `yaml:"addresses,omitempty" json:"addresses,omitempty"`
+		TLS       *TLS     `yaml:"tls,omitempty" json:"tls,omitempty"`
+	}
+
+	RpkSchemaRegistryAPI struct {
+		Addresses []string `yaml:"addresses,omitempty" json:"addresses,omitempty"`
+		TLS       *TLS     `yaml:"tls,omitempty" json:"tls,omitempty"`
 	}
 
 	SASL struct {
@@ -195,7 +203,7 @@ func (t *TLS) Config(fs afero.Fs) (*tls.Config, error) {
 	if t == nil {
 		return nil, nil
 	}
-	return tlscfg.New(
+	tc, err := tlscfg.New(
 		tlscfg.WithFS(
 			tlscfg.FuncFS(func(path string) ([]byte, error) {
 				return afero.ReadFile(fs, path)
@@ -210,6 +218,11 @@ func (t *TLS) Config(fs afero.Fs) (*tls.Config, error) {
 			t.KeyFile,
 		),
 	)
+	if err != nil {
+		return nil, err
+	}
+	tc.InsecureSkipVerify = t.InsecureSkipVerify
+	return tc, nil
 }
 
 func namedAuthnToNamed(src []NamedAuthNSocketAddress) []NamedSocketAddress {

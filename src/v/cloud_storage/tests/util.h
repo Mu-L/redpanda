@@ -19,11 +19,10 @@
 #include "cloud_storage/tests/cloud_storage_fixture.h"
 #include "cloud_storage/tests/common_def.h"
 #include "model/record_batch_types.h"
+#include "utils/lazy_abort_source.h"
 
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/util/defer.hh>
-
-#include <boost/test/unit_test.hpp>
 
 #include <algorithm>
 #include <ostream>
@@ -32,8 +31,7 @@
 
 namespace cloud_storage {
 
-static cloud_storage::lazy_abort_source always_continue{
-  []() { return std::nullopt; }};
+static lazy_abort_source always_continue{[]() { return std::nullopt; }};
 
 inline ss::logger test_util_log("test_util"); // NOLINT
 
@@ -81,6 +79,8 @@ struct in_memory_segment {
     // Only used to emulate an older version of Redpanda that had offset
     // overlap between segments.
     int delta_offset_overlap{0};
+    std::optional<model::timestamp> base_timestamp;
+    std::optional<model::timestamp> last_timestamp;
 };
 
 std::ostream& operator<<(std::ostream& o, const in_memory_segment& ims);
@@ -181,10 +181,50 @@ std::vector<model::record_batch_header> scan_remote_partition(
   size_t maybe_max_segments = 0,
   size_t maybe_max_readers = 0);
 
+struct scan_result {
+    std::vector<model::record_batch_header> headers;
+    // number of bytes consumed (acquired from the metrics probe)
+    uint64_t bytes_read = 0;
+    // number of bytes consumed (acquired from the metrics probe)
+    uint64_t records_read = 0;
+    // number of bytes skipped by the segment reader (acquired from the metrics
+    // probe)
+    uint64_t bytes_skip = 0;
+    // number of bytes accepted by the segment reader (acquired from the metrics
+    // probe)
+    uint64_t bytes_accept = 0;
+};
+
+/// Similar to prev function but uses timequery
+scan_result scan_remote_partition(
+  cloud_storage_fixture& imposter,
+  model::offset min,
+  model::timestamp timestamp,
+  model::offset max = model::offset::max(),
+  size_t maybe_max_segments = 0,
+  size_t maybe_max_readers = 0);
+
 void reupload_compacted_segments(
   cloud_storage_fixture& fixture,
   cloud_storage::partition_manifest& m,
   const std::vector<in_memory_segment>& segments,
   bool truncate_segments = false);
+
+std::vector<in_memory_segment> replace_segments(
+  cloud_storage_fixture& fixture,
+  cloud_storage::partition_manifest& manifest,
+  model::offset base_offset,
+  model::offset_delta base_delta,
+  const std::vector<std::vector<batch_t>>& batches);
+
+/// Read batches by one using max_bytes=1 and set max_offset to closes
+/// value in the 'possible_lso_values' list.
+std::vector<model::record_batch_header>
+scan_remote_partition_incrementally_with_closest_lso(
+  cloud_storage_fixture& imposter,
+  model::offset base,
+  model::offset max,
+  size_t maybe_max_segments,
+  size_t maybe_max_readers);
 
 } // namespace cloud_storage

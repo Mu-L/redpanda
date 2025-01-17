@@ -9,12 +9,11 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "base/units.h"
 #include "cluster/node/types.h"
 #include "config/property.h"
-#include "resource_mgmt/storage.h"
 #include "storage/node.h"
 #include "storage/types.h"
-#include "units.h"
 
 #include <seastar/core/sstring.hh>
 
@@ -34,13 +33,12 @@ public:
     local_monitor(
       config::binding<size_t> min_bytes_alert,
       config::binding<unsigned> min_percent_alert,
-      config::binding<size_t> min_bytes,
       ss::sharded<storage::node>&);
 
     local_monitor(const local_monitor&) = delete;
     local_monitor(local_monitor&&) = default;
     ~local_monitor() = default;
-    local_monitor& operator=(local_monitor const&) = delete;
+    local_monitor& operator=(const local_monitor&) = delete;
     local_monitor& operator=(local_monitor&&) = delete;
 
     ss::future<> start();
@@ -83,7 +81,6 @@ private:
       std::chrono::hours(1));
     config::binding<size_t> _free_bytes_alert_threshold;
     config::binding<unsigned> _free_percent_alert_threshold;
-    config::binding<size_t> _min_free_bytes;
 
     ss::sharded<storage::node>& _storage_node_api; // single instance
 

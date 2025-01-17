@@ -9,23 +9,28 @@
 
 #include "net/server.h"
 
+#include "base/likely.h"
+#include "base/vassert.h"
+#include "base/vlog.h"
 #include "config/configuration.h"
-#include "likely.h"
-#include "prometheus/prometheus_sanitize.h"
+#include "metrics/metrics.h"
+#include "metrics/prometheus_sanitize.h"
+#include "ssx/abort_source.h"
 #include "ssx/future-util.h"
-#include "ssx/metrics.h"
 #include "ssx/semaphore.h"
 #include "ssx/sformat.h"
-#include "vassert.h"
-#include "vlog.h"
 
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/net/api.hh>
 #include <seastar/util/later.hh>
+
+#include <exception>
 
 namespace net {
 
@@ -76,6 +81,7 @@ void server::start() {
     }
     for (const auto& endpoint : cfg.addrs) {
         ss::server_socket ss;
+        bool tls_enabled = bool(endpoint.credentials);
         try {
             ss::listen_options lo;
             lo.reuse_address = true;
@@ -83,6 +89,8 @@ void server::start() {
             if (cfg.listen_backlog.has_value()) {
                 lo.listen_backlog = cfg.listen_backlog.value();
             }
+            lo.so_rcvbuf = cfg.tcp_recv_buf;
+            lo.so_sndbuf = cfg.tcp_send_buf;
 
             if (!endpoint.credentials) {
                 ss = ss::engine().listen(endpoint.addr, lo);
@@ -97,20 +105,21 @@ void server::start() {
               endpoint,
               std::current_exception()));
         }
-        auto& b = _listeners.emplace_back(
-          std::make_unique<listener>(endpoint.name, std::move(ss)));
+        auto& b = _listeners.emplace_back(std::make_unique<listener>(
+          endpoint.name, std::move(ss), tls_enabled));
         listener& ref = *b;
         // background
-        ssx::spawn_with_gate(_conn_gate, [this, &ref] { return accept(ref); });
+        ssx::spawn_with_gate(
+          _accept_gate, [this, &ref] { return accept(ref); });
     }
 }
 
 bool is_gate_closed_exception(std::exception_ptr e) {
     try {
         if (e) {
-            rethrow_exception(e);
+            std::rethrow_exception(e);
         }
-    } catch (ss::gate_closed_exception&) {
+    } catch (const ss::gate_closed_exception&) {
         return true;
     } catch (...) {
         return false;
@@ -170,6 +179,7 @@ ss::future<> server::apply_proto(
         [this, conn, cq_units = std::move(cq_units)](ss::future<> f) {
             print_exceptional_future(
               std::move(f), "applying protocol", conn->addr);
+            vlog(_log.trace, "shutting down connection {}", conn->addr);
             return conn->shutdown().then_wrapped(
               [this, addr = conn->addr](ss::future<> f) {
                   print_exceptional_future(std::move(f), "shutting down", addr);
@@ -182,13 +192,13 @@ ss::future<> server::accept(listener& s) {
     return ss::repeat([this, &s]() mutable {
         return s.socket.accept().then_wrapped(
           [this, &s](ss::future<ss::accept_result> f_cs_sa) {
-              return accept_finish(s.name, std::move(f_cs_sa));
+              return accept_finish(s.name, std::move(f_cs_sa), s.tls_enabled);
           });
     });
 }
 
-ss::future<ss::stop_iteration>
-server::accept_finish(ss::sstring name, ss::future<ss::accept_result> f_cs_sa) {
+ss::future<ss::stop_iteration> server::accept_finish(
+  ss::sstring name, ss::future<ss::accept_result> f_cs_sa, bool tls_enabled) {
     if (_as.abort_requested()) {
         f_cs_sa.ignore_ready_future();
         co_return ss::stop_iteration::yes;
@@ -212,28 +222,13 @@ server::accept_finish(ss::sstring name, ss::future<ss::accept_result> f_cs_sa) {
           ar.remote_address.addr());
         if (!cq_units.live()) {
             // Connection limit hit, drop this connection.
-            _probe->connection_rejected();
+            _probe->connection_rejected_open_limit();
             vlog(
-              _log.info,
-              "Connection limit reached, rejecting {}",
-              ar.remote_address.addr());
+              _log.warn,
+              "Open connection limit reached, rejecting {}",
+              ar.remote_address);
             co_return ss::stop_iteration::no;
         }
-    }
-
-    // Apply socket buffer size settings
-    if (cfg.tcp_recv_buf.has_value()) {
-        // Explicitly store in an int to decouple the
-        // config type from the set_sockopt type.
-        int recv_buf = cfg.tcp_recv_buf.value();
-        ar.connection.set_sockopt(
-          SOL_SOCKET, SO_RCVBUF, &recv_buf, sizeof(recv_buf));
-    }
-
-    if (cfg.tcp_send_buf.has_value()) {
-        int send_buf = cfg.tcp_send_buf.value();
-        ar.connection.set_sockopt(
-          SOL_SOCKET, SO_SNDBUF, &send_buf, sizeof(send_buf));
     }
 
     if (_connection_rates) {
@@ -242,10 +237,10 @@ server::accept_finish(ss::sstring name, ss::future<ss::accept_result> f_cs_sa) {
         } catch (const std::exception& e) {
             vlog(
               _log.trace,
-              "Timeout while waiting free token for connection rate. "
-              "addr:{}",
+              "Connection rate limit reached and no token available after "
+              "wait, rejecting {}",
               ar.remote_address);
-            _probe->timeout_waiting_rate_limit();
+            _probe->connection_rejected_rate_limit();
             co_return ss::stop_iteration::no;
         }
     }
@@ -256,17 +251,17 @@ server::accept_finish(ss::sstring name, ss::future<ss::accept_result> f_cs_sa) {
       std::move(ar.connection),
       ar.remote_address,
       *_probe,
-      cfg.stream_recv_buf);
+      cfg.stream_recv_buf,
+      tls_enabled,
+      &_log);
     vlog(
       _log.trace,
       "{} - Incoming connection from {} on \"{}\"",
       this->name(),
       ar.remote_address,
       name);
-    if (_conn_gate.is_closed()) {
-        co_await conn->shutdown();
-        throw ss::gate_closed_exception();
-    }
+
+    _as.check();
     ssx::spawn_with_gate(
       _conn_gate, [this, conn, cq_units = std::move(cq_units)]() mutable {
           return apply_proto(conn, std::move(cq_units));
@@ -274,34 +269,37 @@ server::accept_finish(ss::sstring name, ss::future<ss::accept_result> f_cs_sa) {
     co_return ss::stop_iteration::no;
 }
 
-void server::shutdown_input() {
+ss::future<> server::shutdown_input() {
     vlog(_log.info, "{} - Stopping {} listeners", name(), _listeners.size());
     for (auto& l : _listeners) {
         l->socket.abort_accept();
     }
     vlog(_log.debug, "{} - Service probes {}", name(), _probe);
-    vlog(
-      _log.info,
-      "{} - Shutting down {} connections",
-      name(),
-      _connections.size());
-    _as.request_abort();
-    // close the connections and wait for all dispatches to finish
-    for (auto& c : _connections) {
-        c.shutdown_input();
-    }
+    _as.request_abort_ex(ssx::shutdown_requested_exception{});
+
+    return _accept_gate.close().then([this] {
+        vlog(
+          _log.info,
+          "{} - Shutting down {} connections",
+          name(),
+          _connections.size());
+        // close the connections and wait for all dispatches to finish
+        for (auto& c : _connections) {
+            c.shutdown_input();
+        }
+    });
 }
 
 ss::future<> server::wait_for_shutdown() {
     if (!_as.abort_requested()) {
-        shutdown_input();
+        co_await shutdown_input();
     }
 
     if (_connection_rates.has_value()) {
         _connection_rates->stop();
     }
 
-    return _conn_gate.close().then([this] {
+    co_return co_await _conn_gate.close().then([this] {
         return seastar::do_for_each(
           _connections, [](net::connection& c) { return c.shutdown(); });
     });
@@ -347,7 +345,7 @@ void server::setup_public_metrics() {
         server_name.remove_suffix(4);
     }
 
-    auto server_label = ssx::metrics::make_namespaced_label("server");
+    auto server_label = metrics::make_namespaced_label("server");
 
     _public_metrics.add_group(
       prometheus_sanitize::metrics_name("rpc:request"),

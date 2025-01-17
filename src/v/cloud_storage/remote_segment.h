@@ -13,7 +13,7 @@
 #include "cloud_storage/cache_service.h"
 #include "cloud_storage/logger.h"
 #include "cloud_storage/partition_manifest.h"
-#include "cloud_storage/partition_probe.h"
+#include "cloud_storage/read_path_probes.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage/remote_segment_index.h"
 #include "cloud_storage/segment_chunk_api.h"
@@ -31,38 +31,16 @@
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/expiring_fifo.hh>
 #include <seastar/core/io_priority_class.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
 
 namespace cloud_storage {
 
-class stuck_reader_exception final : public std::runtime_error {
-public:
-    stuck_reader_exception(
-      model::offset cur_rp_offset,
-      size_t cur_bytes_consumed,
-      ss::sstring context)
-      : std::runtime_error{context}
-      , rp_offset(cur_rp_offset)
-      , bytes_consumed(cur_bytes_consumed) {}
-    const model::offset rp_offset;
-    const size_t bytes_consumed;
-};
-
 std::filesystem::path
 generate_index_path(const cloud_storage::remote_segment_path& p);
 
-static constexpr size_t remote_segment_sampling_step_bytes = 64_KiB;
-
-class download_exception : public std::exception {
-public:
-    explicit download_exception(download_result r, std::filesystem::path p);
-
-    const char* what() const noexcept override;
-
-    const download_result result;
-    std::filesystem::path path;
-};
+inline constexpr size_t remote_segment_sampling_step_bytes = 64_KiB;
 
 class remote_segment_exception : public std::runtime_error {
 public:
@@ -80,7 +58,8 @@ public:
       const model::ntp& ntp,
       const segment_meta& meta,
       retry_chain_node& parent,
-      partition_probe& probe);
+      partition_probe& probe,
+      ts_read_path_probe& ts_probe);
 
     remote_segment(const remote_segment&) = delete;
     remote_segment(remote_segment&&) = delete;
@@ -105,6 +84,9 @@ public:
     /// Get base offset of the segment (kafka offset)
     const kafka::offset get_base_kafka_offset() const;
 
+    /// Get segment size
+    size_t get_segment_size() const;
+
     ss::future<> stop();
 
     /// create an input stream _sharing_ the underlying file handle
@@ -123,23 +105,34 @@ public:
       kafka::offset start,
       kafka::offset end,
       std::optional<model::timestamp>,
-      ss::io_priority_class);
+      ss::io_priority_class,
+      storage::opt_abort_source_t as);
+
+    /// Hydrates the segment, index or tx-range depending on segment meta
+    /// version, returning a future that the caller can use to wait for the
+    /// download to finish. If the abort source is triggered or the deadline is
+    /// reached before the download finishes, the wait is aborted. The download
+    /// will still complete but the caller will need to handle the exception.
+    ss::future<> do_hydrate(ss::abort_source&, ss::lowres_clock::time_point);
 
     /// Hydrate the segment for segment meta version v2 or lower. For v3 or
     /// higher, only hydrate the index. If the index hydration fails, fall back
     /// to old mode where the full segment is hydrated. For v3 or higher
     /// versions, the actual segment data is hydrated by the data source
     /// implementation, but the index is still required to be present first.
-    ss::future<> hydrate();
+    ss::future<> hydrate(storage::opt_abort_source_t as = std::nullopt);
 
     /// Hydrate a part of a segment, identified by the given range. The range
     /// can contain data for multiple contiguous chunks, in which case multiple
     /// files are written to cache.
-    ss::future<> hydrate_chunk(segment_chunk_range range);
+    ss::future<> hydrate_chunk(chunk_start_offset_t start_offset);
 
     /// Loads the segment chunk file from cache into an open file handle. If the
     /// file is not present in cache, the returned file handle is unopened.
     ss::future<ss::file> materialize_chunk(chunk_start_offset_t);
+
+    /// Return memory occupied by the object
+    size_t estimate_memory_use() const;
 
     retry_chain_node* get_retry_chain_node() { return &_rtc; }
 
@@ -185,11 +178,20 @@ public:
     // granularity, otherwise the size is chunk granularity.
     std::pair<size_t, bool> min_cache_cost() const;
 
+    ss::future<ss::file> download_chunk(chunk_start_offset_t chunk_start);
+
+    size_t concurrency() { return _api.concurrency(); }
+
 private:
     /// get a file offset for the corresponding kafka offset
     /// if the index is available
     std::optional<offset_index::find_result>
     maybe_get_offsets(kafka::offset kafka_offset);
+
+    /// get a file offset for the corresponding to the timestamp
+    /// if the index is available
+    std::optional<offset_index::find_result>
+      maybe_get_offsets(model::timestamp);
 
     /// Sets the results of the waiters of this segment as the given error.
     void set_waiter_errors(const std::exception_ptr& err);
@@ -245,11 +247,21 @@ private:
     /// download chunks of the segment instead of the entire segment file.
     bool is_legacy_mode_engaged() const;
 
+    /// Switches to legacy mode while also aborting all pending chunk downloads.
+    /// The switch to legacy mode is performed when we cannot download the
+    /// segment index. Since segment index is required to download chunks,
+    /// aborting any pending downloads is necessary when switching to legacy
+    /// mode.
+    void switch_to_legacy_mode();
+
     /// Is the remote segment state materialized, IE do we need to hydrate or
     /// not. For segment format v0, v1 and v2, the data file handle should be
     /// opened. For newer formats, v3 or later, the index should be
     /// materialized.
     bool is_state_materialized() const;
+
+    ss::future<ss::file>
+    hydrate_and_materialize_chunk(chunk_start_offset_t start_offset);
 
     ss::gate _gate;
     remote& _api;
@@ -293,6 +305,7 @@ private:
     bool _hydration_loop_running{false};
 
     segment_name_format _sname_format;
+    uint64_t _metadata_size_hint{0};
 
     using fallback_mode = ss::bool_class<struct fallback_mode_tag>;
     fallback_mode _fallback_mode{fallback_mode::no};
@@ -304,8 +317,31 @@ private:
     std::optional<segment_chunks> _chunks_api;
     std::optional<offset_index::coarse_index_t> _coarse_index;
     partition_probe& _probe;
+    ts_read_path_probe& _ts_probe;
 
-    friend class split_segment_into_chunk_range_consumer;
+    /// Pending chunk download request. The start offset and prefetch are
+    /// supplied by the caller. The promise is created before adding a request
+    /// to the queue and the associated future is returned to the caller.
+    struct chunk_request {
+        chunk_start_offset_t start;
+        ss::promise<ss::file> promise;
+    };
+
+    /// Download all pending chunk requests, waiting until all chunks are
+    /// materialized. Collects requests where the chunk was downloaded but
+    /// failed to materialize (possibly due to cache eviction), and returns the
+    /// collected set of such failed requests. These should then be requeued by
+    /// the caller.
+    ss::future<fragmented_vector<chunk_request>> service_chunk_requests();
+
+    /// Waiters pending chunk downloads. Only the first hydration request for a
+    /// given chunk ends up here. All following requests for that chunk are
+    /// stored by the chunk API in its own wait list. This way only a single
+    /// file handle is created for a given chunk, and the chunk API distributes
+    /// shared ptrs to that handle to consumers.
+    fragmented_vector<chunk_request> _chunk_waiters;
+
+    friend class remote_segment_test_helper;
 };
 
 class remote_segment_batch_consumer;
@@ -335,6 +371,7 @@ public:
       ss::lw_shared_ptr<remote_segment>,
       const storage::log_reader_config& config,
       partition_probe& probe,
+      ts_read_path_probe& ts_probe,
       ssx::semaphore_units) noexcept;
 
     // The following lines of code have different formatting on newer versions
@@ -399,6 +436,7 @@ private:
     ss::lw_shared_ptr<remote_segment> _seg;
     storage::log_reader_config _config;
     partition_probe& _probe;
+    ts_read_path_probe& _ts_probe;
     ss::circular_buffer<model::record_batch> _ringbuf;
     std::optional<std::reference_wrapper<storage::offset_translator_state>>
       _cur_ot_state;

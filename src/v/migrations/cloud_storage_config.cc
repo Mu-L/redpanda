@@ -9,6 +9,7 @@
 
 #include "migrations/cloud_storage_config.h"
 
+#include "base/vlog.h"
 #include "cluster/controller.h"
 #include "cluster/feature_manager.h"
 #include "cluster/topics_frontend.h"
@@ -16,7 +17,6 @@
 #include "features/logger.h"
 #include "migrations/feature_migrator.h"
 #include "ssx/future-util.h"
-#include "vlog.h"
 
 #include <seastar/core/sleep.hh>
 
@@ -50,6 +50,9 @@ ss::future<> cloud_storage_config::do_mutate() {
               model::shadow_indexing_mode::disabled))
             || config::shard_local_cfg().cloud_storage_enable_remote_write();
 
+        // This is a migration from retention_bytes to
+        // retention_local_target_bytes so we don't need to handle
+        // initial_retention_local_target_bytes
         if (
           props.retention_local_target_bytes.has_optional_value()
           || props.retention_local_target_ms.has_optional_value()) {
@@ -132,8 +135,10 @@ ss::future<> cloud_storage_config::do_mutate() {
                          : model::shadow_indexing_mode::fetch;
             }
 
-            update.properties.shadow_indexing = make_property_set(
+            update.properties.get_shadow_indexing() = make_property_set(
               std::make_optional(mode));
+            update.properties.remote_read = make_property_set(remote_read);
+            update.properties.remote_write = make_property_set(remote_write);
 
             vlog(
               featureslog.info, "Updating tiered storage topic {}", i.first.tp);

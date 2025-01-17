@@ -1,4 +1,5 @@
 **
+!src/transform-sdk
 !tests/java
 !tests/docker/ssh
 !tests/setup.py
@@ -11,3 +12,4 @@
 !tests/rptest/remote_scripts
 !tests/protobuf
 !lsan_suppressions.txt
+!ubsan_suppressions.txt

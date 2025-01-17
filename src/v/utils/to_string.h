@@ -11,12 +11,14 @@
 
 #pragma once
 
-#include "seastarx.h"
+#include "base/seastarx.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/print.hh>
 
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/node_hash_map.h>
 #include <fmt/core.h>
 
 #include <optional>
@@ -41,8 +43,9 @@ std::ostream& operator<<(std::ostream& os, const std::variant<T...>& v) {
     return os;
 }
 
+template<typename Rep, typename Period>
 inline std::ostream&
-operator<<(std::ostream& o, const ss::lowres_clock::duration& d) {
+operator<<(std::ostream& o, const std::chrono::duration<Rep, Period>& d) {
     fmt::print(
       o,
       "{}",
@@ -52,9 +55,9 @@ operator<<(std::ostream& o, const ss::lowres_clock::duration& d) {
 
 } // namespace std
 
-template<typename T>
-struct fmt::formatter<ss::chunked_fifo<T>> {
-    using type = ss::chunked_fifo<T>;
+template<typename T, size_t chunk_size>
+struct fmt::formatter<ss::chunked_fifo<T, chunk_size>> {
+    using type = ss::chunked_fifo<T, chunk_size>;
 
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
 
@@ -76,3 +79,35 @@ struct fmt::formatter<ss::chunked_fifo<T>> {
         return ctx.out();
     }
 };
+
+namespace absl {
+template<typename K, typename V>
+std::ostream& operator<<(std::ostream& o, const absl::flat_hash_map<K, V>& r) {
+    o << "{";
+    bool first = true;
+    for (const auto& [k, v] : r) {
+        if (!first) {
+            o << ", ";
+        }
+        o << "{" << k << " -> " << v << "}";
+        first = false;
+    }
+    o << "}";
+    return o;
+}
+
+template<typename K, typename V>
+std::ostream& operator<<(std::ostream& o, const absl::node_hash_map<K, V>& r) {
+    o << "{";
+    bool first = true;
+    for (const auto& [k, v] : r) {
+        if (!first) {
+            o << ", ";
+        }
+        o << "{" << k << " -> " << v << "}";
+        first = false;
+    }
+    o << "}";
+    return o;
+}
+} // namespace absl

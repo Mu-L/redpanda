@@ -9,13 +9,12 @@
 
 #include "http/client.h"
 #include "kafka/protocol/join_group.h"
-#include "kafka/types.h"
-#include "net/unresolved_address.h"
 #include "pandaproxy/json/requests/create_consumer.h"
 #include "pandaproxy/json/rjson_util.h"
 #include "pandaproxy/rest/configuration.h"
 #include "pandaproxy/test/pandaproxy_fixture.h"
 #include "pandaproxy/test/utils.h"
+#include "utils/unresolved_address.h"
 
 #include <boost/beast/http/field.hpp>
 #include <boost/beast/http/status.hpp>
@@ -84,7 +83,7 @@ FIXTURE_TEST(pandaproxy_consumer_group, pandaproxy_test_fixture) {
         BOOST_REQUIRE_EQUAL(
           res.headers.result(), boost::beast::http::status::ok);
 
-        auto res_data = ppj::rjson_parse(
+        auto res_data = ppj::impl::rjson_parse(
           res.body.data(), ppj::create_consumer_response_handler());
         BOOST_REQUIRE_EQUAL(res_data.instance_id, "test_consumer");
         member_id = res_data.instance_id;
@@ -315,7 +314,7 @@ FIXTURE_TEST(
         BOOST_REQUIRE_EQUAL(
           res.headers.result(), boost::beast::http::status::ok);
 
-        auto res_data = ppj::rjson_parse(
+        auto res_data = ppj::impl::rjson_parse(
           res.body.data(), ppj::create_consumer_response_handler());
         BOOST_REQUIRE_EQUAL(res_data.instance_id, "test_consumer");
         member_id = res_data.instance_id;

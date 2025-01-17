@@ -1,4 +1,4 @@
-// Copyright 2021 Redpanda Data, Inc.
+// Copyright 2023 Redpanda Data, Inc.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.md
@@ -10,22 +10,23 @@
 #pragma once
 
 #include <cinttypes>
+#include <compare>
 #include <concepts>
 #include <cstddef>
 #include <type_traits>
 
 namespace serde {
 
-using version_t = uint8_t;
+using version_t = std::uint8_t;
 
 template<version_t V>
 struct version {
-    static constexpr auto const v = V;
+    static constexpr const auto v = V;
 };
 
 template<version_t V>
 struct compat_version {
-    static constexpr auto const v = V;
+    static constexpr const auto v = V;
 };
 
 /**
@@ -38,17 +39,41 @@ struct compat_version {
  */
 template<typename T, typename Version, typename CompatVersion>
 struct envelope {
-    bool operator==(envelope const&) const = default;
-    auto operator<=>(envelope const&) const = default;
     using value_t = T;
     static constexpr auto redpanda_serde_version = Version::v;
     static constexpr auto redpanda_serde_compat_version = CompatVersion::v;
     static constexpr auto redpanda_inherits_from_envelope = true;
+
+    // The operator definitions below may look strange, but they have the role
+    // of ensuring that serde types (which inherit from envelope) do not use
+    // the envelope comparison operators.
+    //
+    // The implementation is templated in order to distinguish the implicit call
+    // when the operator is generated for the base class (will have const
+    // serde::envelope& on both sides) and accidental calls from sub classes
+    // that do not override the operator (will have the derived template type on
+    // both sides).
+
+    template<typename O>
+    requires(std::is_same_v<
+             std::remove_cvref_t<O>,
+             envelope<T, Version, CompatVersion>>)
+    bool operator==(const O&) const {
+        return true;
+    }
+
+    template<typename O>
+    requires(std::is_same_v<
+             std::remove_cvref_t<O>,
+             envelope<T, Version, CompatVersion>>)
+    std::strong_ordering operator<=>(const O&) const {
+        return std::strong_ordering::equal;
+    }
 };
 
 // Overhead of the envelope in bytes: 4 bytes of size, one byte of version,
 // one byte of compat version.
-static constexpr size_t envelope_header_size = 6;
+static constexpr std::size_t envelope_header_size = 6;
 
 /**
  * Checksum envelope uses CRC32c to check data integrity.
@@ -59,7 +84,7 @@ static constexpr size_t envelope_header_size = 6;
  */
 template<typename T, typename Version, typename CompatVersion>
 struct checksum_envelope {
-    bool operator==(checksum_envelope const&) const = default;
+    bool operator==(const checksum_envelope&) const = default;
     using value_t = T;
     static constexpr auto redpanda_serde_version = Version::v;
     static constexpr auto redpanda_serde_compat_version = CompatVersion::v;
@@ -69,8 +94,8 @@ struct checksum_envelope {
 
 // Overhead of the envelope in bytes: a checksummed envelope is
 // a regular envelope plus 4 bytes of checksum.
-static constexpr size_t checksum_envelope_header_size = envelope_header_size
-                                                        + 4;
+inline constexpr std::size_t checksum_envelope_header_size
+  = envelope_header_size + 4;
 
 template<typename T, typename Version = const serde::version_t&>
 concept is_envelope = requires {

@@ -37,11 +37,16 @@ _helm_e2e_artifacts/
 /src/go/k8s/*-exit-code
 /src/go/k8s/kubeconfig
 
+# Compiled WebAssembly artifacts
+*.wasm
+
 # Test binary, build with `go test -c`
 *.test
 
 # bazel
 bazel-*
+user.bazelrc
+/external
 
 # Vagrant
 .vagrant/
@@ -68,6 +73,7 @@ CPackSourceConfig.cmake
 CTestTestfile.cmake
 CMakeDoxyfile.in
 CMakeDoxygenDefaults.cmake
+CMakeUserPresets.json
 
 src/demo_apps/demo_client
 src/demo_apps/demo_server
@@ -188,6 +194,8 @@ venv.bak/
 
 # default data dir for dev-cluster.py script
 /tools/data
+# If you run dev-cluster.py from the repo root
+/data
 
 # mypy
 .mypy_cache/
@@ -240,6 +248,8 @@ vbuild/
 
 /.vtools.yml
 /vtools
+/benthos
+/connect
 /Taskfile.yml
 /.dockerignore
 /.task/
@@ -255,3 +265,6 @@ vbuild/
 
 #asdf tool version file
 .tool-versions
+
+# Ctest
+/Testing

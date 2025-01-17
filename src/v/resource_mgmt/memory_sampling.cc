@@ -11,10 +11,10 @@
 
 #include "resource_mgmt/memory_sampling.h"
 
+#include "base/vlog.h"
 #include "resource_mgmt/available_memory.h"
 #include "ssx/future-util.h"
 #include "ssx/sformat.h"
-#include "vlog.h"
 
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/future.hh>
@@ -27,13 +27,22 @@
 #include <limits>
 #include <vector>
 
-constexpr std::string_view diagnostics_header() {
-    return "Top-N alloc sites - size count stack:";
-}
+constexpr std::string_view diagnostics_header() { return "Top-N alloc sites:"; }
 
 constexpr std::string_view confluence_reference() {
     return "If you work at Redpanda please refer to "
            "https://vectorizedio.atlassian.net/l/cp/iuEMd2NN\n";
+}
+
+fmt::appender fmt::formatter<seastar::memory::allocation_site>::format(
+  const seastar::memory::allocation_site& site,
+  fmt::format_context& ctx) const {
+    return fmt::format_to(
+      ctx.out(),
+      "size: {} count: {} at: {}",
+      site.size,
+      site.count,
+      site.backtrace);
 }
 
 /// Put `top_n` allocation sites into the front of `allocation_sites`
@@ -55,11 +64,18 @@ memory_sampling::get_oom_diagnostics_callback() {
     return [allocation_sites = std::move(allocation_sites),
             format_buf = std::move(format_buf)](
              seastar::memory::memory_diagnostics_writer writer) mutable {
-        auto num_sites = ss::memory::sampled_memory_profile(allocation_sites);
+        auto num_sites = ss::memory::sampled_memory_profile(
+          allocation_sites.data(), allocation_sites.size());
 
         const size_t top_n = std::min(size_t(10), num_sites);
         top_n_allocation_sites(allocation_sites, top_n);
 
+        writer("Alloc sites legend:\n"
+               "    size: the estimated total size of all allocations at this "
+               "stack (i.e., adjusted up from observed samples)\n"
+               "    count: the number of live samples at this "
+               "stack (i.e., NOT adjusted up from observed samples)\n"
+               "    at: the backtrace for this allocation site\n");
         writer(diagnostics_header());
         writer("\n");
 
@@ -140,7 +156,7 @@ void memory_sampling::start_low_available_memory_logging() {
 memory_sampling::memory_sampling(
   ss::logger& logger, config::binding<bool> enabled)
   : memory_sampling(
-    logger, std::move(enabled), std::chrono::seconds(60), 0.2, 0.1) {}
+      logger, std::move(enabled), std::chrono::seconds(60), 0.2, 0.1) {}
 
 memory_sampling::memory_sampling(
   ss::logger& logger,

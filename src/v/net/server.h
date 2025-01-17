@@ -12,11 +12,11 @@
 #pragma once
 
 #include "config/property.h"
+#include "metrics/metrics.h"
 #include "net/conn_quota.h"
 #include "net/connection.h"
 #include "net/connection_rate.h"
 #include "net/types.h"
-#include "ssx/metrics.h"
 #include "ssx/semaphore.h"
 #include "utils/log_hist.h"
 
@@ -125,7 +125,7 @@ public:
      * stopping the server without waiting for downstream services to stop
      * requests processing
      */
-    void shutdown_input();
+    ss::future<> shutdown_input();
     ss::future<> wait_for_shutdown();
     /**
      * Stop function is a nop when `shutdown_input` was previously called. Left
@@ -150,15 +150,17 @@ private:
     struct listener {
         ss::sstring name;
         ss::server_socket socket;
+        bool tls_enabled;
 
-        listener(ss::sstring name, ss::server_socket socket)
+        listener(ss::sstring name, ss::server_socket socket, bool tls_enabled)
           : name(std::move(name))
-          , socket(std::move(socket)) {}
+          , socket(std::move(socket))
+          , tls_enabled(tls_enabled) {}
     };
 
     ss::future<> accept(listener&);
     ss::future<ss::stop_iteration>
-      accept_finish(ss::sstring, ss::future<ss::accept_result>);
+    accept_finish(ss::sstring, ss::future<ss::accept_result>, bool);
     void
     print_exceptional_future(ss::future<>, const char*, ss::socket_address);
     ss::future<>
@@ -171,13 +173,12 @@ private:
     std::vector<std::unique_ptr<listener>> _listeners;
     boost::intrusive::list<net::connection> _connections;
     ss::abort_source _as;
+    ss::gate _accept_gate;
     ss::gate _conn_gate;
     hist_t _hist;
     std::unique_ptr<server_probe> _probe;
-    ssx::metrics::metric_groups _metrics
-      = ssx::metrics::metric_groups::make_internal();
-    ssx::metrics::metric_groups _public_metrics
-      = ssx::metrics::metric_groups::make_public();
+    metrics::internal_metric_groups _metrics;
+    metrics::public_metric_groups _public_metrics;
 
     std::optional<config_connection_rate_bindings> connection_rate_bindings;
     std::optional<connection_rate<>> _connection_rates;

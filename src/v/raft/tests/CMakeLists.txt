@@ -8,17 +8,6 @@ rp_test(
     ARGS "-- -c 8"
 )
 
-rp_test(
-    UNIT_TEST
-    BINARY_NAME group_configuration_tests
-    SOURCES group_configuration_tests.cc
-    DEFINITIONS BOOST_TEST_DYN_LINK
-    LIBRARIES Boost::unit_test_framework v::raft
-    LABELS raft
-    ARGS "-- -c 8"
-)
-
-
 set(srcs
     jitter_tests.cc
     bootstrap_configuration_test.cc
@@ -30,27 +19,58 @@ set(srcs
     leadership_test.cc
     append_entries_test.cc
     offset_monitor_test.cc
-    mux_state_machine_test.cc
     mutex_buffer_test.cc
     state_removal_test.cc
     configuration_manager_test.cc
     coordinated_recovery_throttle_test.cc
+    heartbeats_test.cc
 )
 
 rp_test(
   UNIT_TEST
   BINARY_NAME test_raft
   SOURCES ${srcs}
-  LIBRARIES v::seastar_testing_main v::raft v::storage_test_utils v::model_test_utils v::features
+  LIBRARIES v::seastar_testing_main v::raft v::storage_test_utils v::model_test_utils v::features v::cluster
   LABELS raft
   ARGS "-- -c 8"
 )
 
+
+v_cc_library(
+    NAME raft_fixture
+    SRCS raft_fixture.cc
+         failure_injectable_log.cc
+    DEPS Seastar::seastar v::raft v::gtest_main)
+
+set(gsrcs
+    basic_raft_fixture_test.cc
+    stm_manager_test.cc
+    raft_reconfiguration_test.cc
+    persisted_stm_test.cc
+    replication_monitor_tests.cc
+    mux_state_machine_test.cc
+    snapshot_recovery_test.cc
+    group_configuration_tests.cc
+)
+
 rp_test(
   UNIT_TEST
-  BINARY_NAME test_offset_translator
-  SOURCES offset_translator_tests.cc
-  LIBRARIES v::seastar_testing_main v::raft v::storage_test_utils
-  LABELS kafka
-  ARGS "-- -c 8"
+  GTEST
+  TIMEOUT 2000
+  BINARY_NAME gtest_raft
+  SOURCES ${gsrcs}
+  LIBRARIES  v::raft v::storage_test_utils v::model_test_utils v::features v::gtest_main v::raft_fixture
+  LABELS raft
+  ARGS "-- -c 8 -m 4G"
 )
+
+rp_test(
+  BENCHMARK_TEST
+  BINARY_NAME heartbeat_bench
+  SOURCES heartbeat_bench.cc
+  LIBRARIES Seastar::seastar_perf_testing Boost::unit_test_framework v::raft
+  # the args below are just to keep it fast
+  ARGS "-c 1 --duration=1 --runs=1 --memory=1G"
+  LABELS raft
+)
+

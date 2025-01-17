@@ -11,16 +11,21 @@
 
 #pragma once
 
+#include "base/oncore.h"
+#include "base/vassert.h"
 #include "cluster/types.h"
 #include "model/fundamental.h"
-#include "oncore.h"
-#include "vassert.h"
+#include "model/metadata.h"
 
 #include <seastar/core/chunked_fifo.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/weak_ptr.hh>
 #include <seastar/util/noncopyable_function.hh>
 
+#include <absl/container/flat_hash_map.h>
 #include <absl/container/node_hash_set.h>
+
+#include <optional>
 
 namespace cluster {
 class allocation_node;
@@ -40,11 +45,13 @@ using hard_constraint_evaluator
 using soft_constraint_evaluator
   = ss::noncopyable_function<uint64_t(const allocation_node&)>;
 
+class allocated_partition;
+
 class hard_constraint {
 public:
     struct impl {
         virtual hard_constraint_evaluator make_evaluator(
-          const model::ntp&, const replicas_t& current_replicas) const
+          const allocated_partition&, std::optional<model::node_id> prev) const
           = 0;
 
         virtual ss::sstring name() const = 0;
@@ -62,14 +69,17 @@ public:
 
     ~hard_constraint() noexcept = default;
 
-    hard_constraint_evaluator
-    make_evaluator(const model::ntp&, const replicas_t& current_replicas) const;
+    hard_constraint_evaluator make_evaluator(
+      const allocated_partition& partition,
+      std::optional<model::node_id> prev) const {
+        return _impl->make_evaluator(partition, prev);
+    }
 
     ss::sstring name() const { return _impl->name(); }
 
 private:
     friend std::ostream& operator<<(std::ostream& o, const hard_constraint& c) {
-        fmt::print(o, "hard constraint: [{}]", c.name());
+        fmt::print(o, "hard: [{}]", c.name());
         return o;
     }
     std::unique_ptr<impl> _impl;
@@ -79,8 +89,9 @@ class soft_constraint final {
 public:
     static constexpr uint64_t max_score = 10'000'000;
     struct impl {
-        virtual soft_constraint_evaluator
-        make_evaluator(const replicas_t& current_replicas) const
+        virtual soft_constraint_evaluator make_evaluator(
+          const allocated_partition& partition,
+          std::optional<model::node_id> prev) const
           = 0;
         virtual ss::sstring name() const = 0;
         virtual ~impl() = default;
@@ -97,14 +108,17 @@ public:
 
     ~soft_constraint() noexcept = default;
 
-    soft_constraint_evaluator
-    make_evaluator(const replicas_t& current_replicas) const;
+    soft_constraint_evaluator make_evaluator(
+      const allocated_partition& partition,
+      std::optional<model::node_id> prev) const {
+        return _impl->make_evaluator(partition, prev);
+    }
 
     ss::sstring name() const { return _impl->name(); }
 
 private:
     friend std::ostream& operator<<(std::ostream& o, const soft_constraint& c) {
-        fmt::print(o, "soft constraint: [{}]", c.name());
+        fmt::print(o, "soft: [{}]", c.name());
         return o;
     }
 
@@ -153,6 +167,12 @@ struct allocation_constraints {
         return soft_constraints.push_back(std::move(c));
     }
 
+    void ensure_new_level() {
+        if (!soft_constraints.empty() && !soft_constraints.back().empty()) {
+            soft_constraints.emplace_back();
+        }
+    }
+
     void add(hard_constraint c) {
         return hard_constraints.push_back(
           ss::make_lw_shared<hard_constraint>(std::move(c)));
@@ -181,10 +201,6 @@ struct allocation_units {
      */
     using pointer = ss::foreign_ptr<std::unique_ptr<allocation_units>>;
 
-    allocation_units(
-      ss::chunked_fifo<partition_assignment>,
-      allocation_state&,
-      partition_allocation_domain);
     allocation_units& operator=(allocation_units&&) = default;
     allocation_units& operator=(const allocation_units&) = delete;
     allocation_units(const allocation_units&) = delete;
@@ -205,10 +221,14 @@ struct allocation_units {
     }
 
 private:
+    friend class partition_allocator;
+    allocation_units(allocation_state&);
+
+private:
     ss::chunked_fifo<partition_assignment> _assignments;
+    chunked_vector<model::broker_shard> _added_replicas;
     // keep the pointer to make this type movable
     ss::weak_ptr<allocation_state> _state;
-    partition_allocation_domain _domain;
     // oncore checker to ensure destruction happens on the same core
     [[no_unique_address]] oncore _oncore;
 };
@@ -239,9 +259,7 @@ private:
 /// Note: shard ids for original replicas are preserved.
 class allocated_partition {
 public:
-    const std::vector<model::broker_shard>& replicas() const {
-        return _replicas;
-    }
+    const replicas_t& replicas() const { return _replicas; }
 
     const model::ntp& ntp() const { return _ntp; }
 
@@ -262,31 +280,26 @@ private:
 
     // construct an object from an original assignment
     allocated_partition(
-      model::ntp,
-      std::vector<model::broker_shard>,
-      partition_allocation_domain,
-      allocation_state&);
+      model::ntp, std::vector<model::broker_shard>, allocation_state&);
 
     struct previous_replica {
         model::broker_shard bs;
         size_t idx;
-        std::optional<model::broker_shard> original;
     };
 
-    std::optional<previous_replica> prepare_move(model::node_id previous);
+    std::optional<previous_replica> prepare_move(model::node_id previous) const;
     model::broker_shard
     add_replica(model::node_id, const std::optional<previous_replica>&);
-    void cancel_move(const previous_replica&);
 
     // used to move the allocation to allocation_units
-    std::vector<model::broker_shard> release_new_partition();
+    replicas_t
+    release_new_partition(chunked_vector<model::broker_shard>& added_replicas);
 
 private:
     model::ntp _ntp;
-    std::vector<model::broker_shard> _replicas;
+    replicas_t _replicas;
     std::optional<absl::flat_hash_map<model::node_id, uint32_t>>
       _original_node2shard;
-    partition_allocation_domain _domain;
     ss::weak_ptr<allocation_state> _state;
     // oncore checker to ensure destruction happens on the same core
     [[no_unique_address]] oncore _oncore;
@@ -299,24 +312,42 @@ private:
  * replica
  */
 struct partition_constraints {
-    partition_constraints(model::partition_id, uint16_t);
-
+    // Constructor for allocating a new partition
     partition_constraints(
-      model::partition_id, uint16_t, allocation_constraints);
+      model::partition_id id,
+      uint16_t rf,
+      allocation_constraints constraints = {})
+      : partition_id(id)
+      , replication_factor(rf)
+      , constraints(std::move(constraints)) {}
+
+    // Constructor for reallocating an partition
+    partition_constraints(
+      const partition_assignment& assignment,
+      uint16_t rf,
+      allocation_constraints constraints = {})
+      : partition_id(assignment.id)
+      , replication_factor(rf)
+      , constraints(std::move(constraints))
+      , existing_group(assignment.group)
+      , existing_replicas(assignment.replicas) {}
 
     model::partition_id partition_id;
     uint16_t replication_factor;
     allocation_constraints constraints;
+    std::optional<raft::group_id> existing_group;
+    replicas_t existing_replicas;
+
     friend std::ostream&
     operator<<(std::ostream&, const partition_constraints&);
 };
 
+using node2count_t = absl::flat_hash_map<model::node_id, size_t>;
+
 struct allocation_request {
     allocation_request() = delete;
-    explicit allocation_request(
-      model::topic_namespace nt, const partition_allocation_domain domain_)
-      : _nt(std::move(nt))
-      , domain(domain_) {}
+    explicit allocation_request(model::topic_namespace nt)
+      : _nt(std::move(nt)) {}
     allocation_request(const allocation_request&) = delete;
     allocation_request(allocation_request&&) = default;
     allocation_request& operator=(const allocation_request&) = delete;
@@ -325,9 +356,47 @@ struct allocation_request {
 
     model::topic_namespace _nt;
     ss::chunked_fifo<partition_constraints> partitions;
-    partition_allocation_domain domain;
+    // if present, new partitions will be allocated using topic-aware counts
+    // objective.
+    std::optional<node2count_t> existing_replica_counts;
 
     friend std::ostream& operator<<(std::ostream&, const allocation_request&);
+};
+
+/**
+ * The simple_allocation_request represents a simplified allocation_request
+ * that doesn't allow for partition-specific requirements. The memory required
+ * for a simple_allocation_request objects does not scale with the number of
+ * requested partitions.
+ */
+struct simple_allocation_request {
+    simple_allocation_request() = delete;
+    simple_allocation_request(const simple_allocation_request&) = delete;
+    simple_allocation_request(simple_allocation_request&&) = default;
+    simple_allocation_request& operator=(const simple_allocation_request&)
+      = delete;
+    simple_allocation_request& operator=(simple_allocation_request&&) = default;
+    ~simple_allocation_request() = default;
+
+    simple_allocation_request(
+      model::topic_namespace tp_ns,
+      int32_t additional_partitions,
+      int16_t replication_factor,
+      std::optional<node2count_t> existing_replac_counts = std::nullopt)
+      : tp_ns{std::move(tp_ns)}
+      , additional_partitions{additional_partitions}
+      , replication_factor{replication_factor}
+      , existing_replica_counts{std::move(existing_replac_counts)} {}
+
+    model::topic_namespace tp_ns;
+    int32_t additional_partitions{0};
+    int16_t replication_factor{0};
+    // if present, new partitions will be allocated using topic-aware counts
+    // objective.
+    std::optional<node2count_t> existing_replica_counts;
+
+    friend std::ostream&
+    operator<<(std::ostream&, const simple_allocation_request&);
 };
 
 } // namespace cluster

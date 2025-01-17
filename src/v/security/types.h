@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "seastarx.h"
+#include "base/seastarx.h"
 #include "utils/named_type.h"
 
 #include <seastar/core/sstring.hh>
@@ -21,5 +21,10 @@ namespace security {
 using credential_user = named_type<ss::sstring, struct credential_user_type>;
 using credential_password
   = named_type<ss::sstring, struct credential_password_type>;
+
+using role_name = named_type<ss::sstring, struct role_name_type>;
+
+static constexpr std::string_view default_role_name = "Users";
+static const auto default_role = role_name{security::default_role_name};
 
 } // namespace security

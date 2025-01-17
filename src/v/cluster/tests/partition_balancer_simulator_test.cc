@@ -7,11 +7,17 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "base/vlog.h"
+#include "cluster/health_monitor_types.h"
 #include "cluster/tests/partition_balancer_planner_fixture.h"
+#include "model/fundamental.h"
+#include "model/metadata.h"
 #include "random/generators.h"
-#include "vlog.h"
+#include "test_utils/fixture.h"
 
 #include <seastar/testing/thread_test_case.hh>
+
+#include <cstddef>
 
 static ss::logger logger("balancer_sim");
 
@@ -24,36 +30,28 @@ static constexpr size_t recovery_batch_size = 512_KiB;
 static constexpr size_t recovery_throttle_burst = 100_MiB;
 static constexpr size_t recovery_throttle_ticks_between_refills = 10;
 
-/// If a value is a sum of a large number of random variables that with some
-/// probability add item_size to the value and the result has a mean of `mean`
-/// (example: producing to a topic, randomly choosing the partition for each
-/// produced batch), the distribution will be approximately gaussian with stddev
-/// sqrt(mean number of items). We use this function to calculate partition size
-/// jitter.
-static size_t add_sqrt_jitter(size_t mean, size_t item_size) {
-    std::normal_distribution<> dist(0, sqrt(double(mean) / item_size));
-    auto jitter = std::min(
-      int(mean), int(item_size * dist(random_generators::internal::gen)));
-    return mean + jitter;
-}
-
 class partition_balancer_sim_fixture {
 public:
-    void add_node(model::node_id id, size_t total_size, uint32_t n_cores = 4) {
+    void add_node(
+      model::node_id id,
+      size_t total_size,
+      uint32_t n_cores = 4,
+      std::optional<model::rack_id> rack = std::nullopt) {
         vassert(!_nodes.contains(id), "duplicate node id: {}", id);
 
         model::broker broker(
           id,
           net::unresolved_address{},
           net::unresolved_address{},
-          std::nullopt,
+          rack,
           model::broker_properties{
             .cores = n_cores,
             .available_memory_gb = 2,
-            .available_disk_gb = uint32_t(total_size / 1_GiB)});
+            .available_disk_gb = uint32_t(total_size / 1_GiB),
+            .available_memory_bytes = 2 * 1_GiB});
 
-        _workers.members.local().apply(
-          model::offset{}, cluster::add_node_cmd(id, broker));
+        BOOST_REQUIRE(!_workers.members.local().apply(
+          model::offset{}, cluster::add_node_cmd(id, broker)));
         _workers.allocator.local().register_node(
           std::make_unique<cluster::allocation_node>(
             id,
@@ -84,16 +82,32 @@ public:
       const ss::sstring& name,
       int partitions,
       int16_t replication_factor,
-      size_t mean_partition_size) {
+      size_t mean_partition_size,
+      std::optional<double> stddev = std::nullopt) {
         auto tp_ns = model::topic_namespace(test_ns, model::topic(name));
         auto topic_conf = _workers.make_tp_configuration(
           name, partitions, replication_factor);
         _workers.dispatch_topic_command(
           cluster::create_topic_cmd(tp_ns, topic_conf));
+
+        if (!stddev) {
+            /// If a value is a sum of a large number of random variables that
+            /// with some probability add item_size to the value and the result
+            /// has a mean of `mean` (example: producing to a topic, randomly
+            /// choosing the partition for each produced batch), the
+            /// distribution will be approximately gaussian with stddev
+            /// sqrt(mean number of items).
+            stddev = produce_batch_size
+                     * sqrt(double(mean_partition_size) / produce_batch_size);
+        }
+
+        std::normal_distribution<> dist(0, 1);
         for (const auto& as : topic_conf.assignments) {
             model::ntp ntp{tp_ns.ns, tp_ns.tp, as.id};
-            auto size = add_sqrt_jitter(
-              mean_partition_size, produce_batch_size);
+            auto jitter = std::max(
+              -int64_t(mean_partition_size),
+              int64_t(*stddev * dist(random_generators::internal::gen)));
+            auto size = mean_partition_size + jitter;
             auto partition = ss::make_lw_shared<partition_state>(ntp, size);
             _partitions.emplace(ntp, partition);
 
@@ -105,7 +119,14 @@ public:
             }
 
             elect_leader(ntp);
+
+            logger.info(
+              "added ntp {}, replicas {}, size {}",
+              ntp,
+              as.replicas,
+              human::bytes(size));
         }
+        _total_replicas += static_cast<size_t>(replication_factor) * partitions;
     }
 
     void set_decommissioning(model::node_id id) {
@@ -117,6 +138,31 @@ public:
     }
 
     size_t cur_tick() const { return _cur_tick; }
+
+    // returns true if all partition movements stopped
+    bool run_to_completion(
+      size_t max_balancer_actions, std::function<void()> tick_cb = [] {}) {
+        print_state();
+
+        size_t num_actions = 0;
+        while (num_actions < max_balancer_actions) {
+            tick();
+            tick_cb();
+
+            if (should_schedule_balancer_run()) {
+                num_actions += run_balancer();
+                print_state();
+
+                if (last_run_in_progress_updates() == 0) {
+                    logger.info("finished after {} ticks", cur_tick());
+                    return true;
+                }
+            }
+        }
+
+        print_state();
+        return false;
+    }
 
     void tick() {
         // refill the bandwidth
@@ -181,7 +227,8 @@ public:
         _cur_tick += 1;
     }
 
-    void run_balancer() {
+    // return the number of scheduled actions
+    size_t run_balancer() {
         auto hr = create_health_report();
         populate_node_status_table();
 
@@ -198,10 +245,12 @@ public:
               plan_data.cancellations.size(),
               plan_data.failed_actions_count);
 
+            size_t actions_count = plan_data.reassignments.size()
+                                   + plan_data.cancellations.size();
+
             _last_run_in_progress_updates
               = _workers.table.local().updates_in_progress().size()
-                + plan_data.reassignments.size()
-                + plan_data.cancellations.size();
+                + actions_count;
 
             for (const auto& reassignment : plan_data.reassignments) {
                 dispatch_move(
@@ -210,6 +259,8 @@ public:
             for (const auto& ntp : plan_data.cancellations) {
                 dispatch_cancel(ntp);
             }
+
+            return actions_count;
         }
     }
 
@@ -238,7 +289,7 @@ public:
 
     void print_replica_map() const {
         for (const auto& t : topics().topics_map()) {
-            for (const auto& a : t.second.get_assignments()) {
+            for (const auto& [_, a] : t.second.get_assignments()) {
                 auto ntp = model::ntp(t.first.ns, t.first.tp, a.id);
                 std::vector<model::node_id> replicas;
                 for (const auto& bs : a.replicas) {
@@ -297,7 +348,7 @@ public:
 
         for (auto& [tp_ns, topic_md] :
              _workers.table.local().all_topics_metadata()) {
-            for (auto& p_as : topic_md.get_assignments()) {
+            for (auto& [_, p_as] : topic_md.get_assignments()) {
                 total_topic_replicas[tp_ns] += p_as.replicas.size();
                 for (auto& r : p_as.replicas) {
                     topic_replica_distribution[tp_ns][r.node_id]++;
@@ -313,29 +364,50 @@ public:
             double total_replicas = static_cast<double>(
               total_topic_replicas[tp]);
             for (auto& [id, alloc_node] : allocation_nodes()) {
-                auto expected_replicas = ceil(
-                  total_replicas * alloc_node->max_capacity() / total_capacity);
-
                 auto it = node_replicas.find(id);
                 const auto replicas_on_node = it == node_replicas.end()
                                                 ? 0
                                                 : it->second;
+
+                auto expected = ceil(
+                  total_replicas * alloc_node->max_capacity() / total_capacity);
+
                 logger.info(
-                  "topic {} has {} replicas on {}, expected: {} total "
-                  "replicas: {}",
+                  "topic {} has {} replicas on {}, expected: {}, "
+                  "total replicas: {}",
                   tp,
                   replicas_on_node,
                   id,
-                  expected_replicas,
+                  expected,
                   total_replicas);
-                // Expected variance should be proportional to
-                // sqrt(expected_replicas). Assert that it is not more than 3x
-                // that.
-                auto err = std::abs(expected_replicas - replicas_on_node)
-                           / sqrt(expected_replicas);
-                BOOST_REQUIRE_LE(err, 3.0);
+
+                static constexpr double max_skew = 0.03;
+                auto expected_min = expected - ceil(max_skew * expected);
+                auto expected_max = expected + ceil(max_skew * expected);
+                BOOST_CHECK_MESSAGE(
+                  replicas_on_node >= expected_min
+                    && replicas_on_node <= expected_max,
+                  "topic " << tp.tp() << ": unexpected replicas count on node "
+                           << id);
             }
         }
+    }
+
+    /// Validate that all possible replica pairings are represented
+    /// approximately equally in topic partition assignments.
+    void validate_topic_replica_pair_frequencies(const ss::sstring& topic) {
+        do_validate_replica_pair_frequencies(topic);
+    }
+
+    /// Validate that all possible replica pairings are represented
+    /// approximately equally in overall partition assignments, as well as for
+    /// each topic assignments.
+    void validate_replica_pair_frequencies() {
+        for (const auto& [tp_ns, topic_md] :
+             _workers.table.local().all_topics_metadata()) {
+            do_validate_replica_pair_frequencies(tp_ns.tp());
+        }
+        do_validate_replica_pair_frequencies(std::nullopt);
     }
 
     bool should_schedule_balancer_run() const {
@@ -346,7 +418,69 @@ public:
                     < 0.8 * double(_last_run_in_progress_updates);
     }
 
+    size_t total_replicas() const { return _total_replicas; }
+
 private:
+    void
+    do_validate_replica_pair_frequencies(std::optional<ss::sstring> topic) {
+        absl::flat_hash_map<
+          model::node_id,
+          absl::flat_hash_map<model::node_id, size_t>>
+          pair_freqs;
+        size_t total_pairs = 0;
+        for (const auto& [tp_ns, topic_md] :
+             _workers.table.local().all_topics_metadata()) {
+            if (topic && tp_ns.tp() != topic) {
+                continue;
+            }
+
+            for (const auto& [_, p_as] : topic_md.get_assignments()) {
+                for (const auto& r1 : p_as.replicas) {
+                    for (const auto& r2 : p_as.replicas) {
+                        if (r1.node_id != r2.node_id) {
+                            pair_freqs[r1.node_id][r2.node_id] += 1;
+                            total_pairs += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        size_t node_count = allocation_nodes().size();
+        double expected_freq = double(total_pairs)
+                               / (node_count * (node_count - 1));
+
+        // Generous boundaries to allow for fluctuations. But they will catch
+        // pathological cases.
+        double expected_min = expected_freq - sqrt(expected_freq) * 3;
+        double expected_max = expected_freq + sqrt(expected_freq) * 3;
+
+        logger.info(
+          "validating replica pair frequencies, topic filter: {}, "
+          "expected: {:.4} (interval: [{:.4}, {:.4}])",
+          topic,
+          expected_freq,
+          expected_min,
+          expected_max);
+        std::optional<std::pair<model::node_id, model::node_id>> offending_pair;
+        for (const auto& [id1, _] : allocation_nodes()) {
+            for (const auto& [id2, _] : allocation_nodes()) {
+                if (id1 == id2) {
+                    continue;
+                }
+                size_t freq = pair_freqs[id1][id2];
+                logger.info("node pair {} - {} frequency: {}", id1, id2, freq);
+                if (freq < expected_min || freq > expected_max) {
+                    offending_pair = {id1, id2};
+                }
+            }
+        }
+        BOOST_REQUIRE_MESSAGE(
+          !offending_pair,
+          "validation failed, offending pair: " << offending_pair->first << ", "
+                                                << offending_pair->second);
+    }
+
     cluster::cluster_health_report create_health_report() const {
         cluster::cluster_health_report report;
         for (const auto& [id, state] : _nodes) {
@@ -381,11 +515,12 @@ private:
             .mode = mode,
             .soft_max_disk_usage_ratio = 0.8,
             .hard_max_disk_usage_ratio = 0.95,
-            .movement_disk_size_batch = 5_GiB,
-            .max_concurrent_actions = max_concurrent_actions,
+            .max_concurrent_actions = 50,
             .node_availability_timeout_sec = std::chrono::minutes(1),
             .segment_fallocation_step = 16_MiB,
-            .node_responsiveness_timeout = std::chrono::seconds(10)},
+            .node_responsiveness_timeout = std::chrono::seconds(10),
+            .topic_aware = true,
+          },
           _workers.state.local(),
           _workers.allocator.local());
     }
@@ -564,19 +699,18 @@ private:
         size_t bandwidth_left = recovery_throttle_burst;
         size_t ticks_since_refill = 0;
 
-        cluster::node_health_report get_health_report() const {
-            cluster::node_health_report report;
+        cluster::node_health_report_ptr get_health_report() const {
+            cluster::node::local_state local_state;
             storage::disk node_disk{.free = total - used, .total = total};
-            report.id = id;
-            report.local_state.set_disk(node_disk);
-            report.local_state.log_data_size = {
+            local_state.set_disk(node_disk);
+            local_state.log_data_size = {
               .data_target_size = total,
               .data_current_size = used,
               .data_reclaimable_size = 0};
 
             absl::flat_hash_map<
               model::topic_namespace,
-              ss::chunked_fifo<cluster::partition_status>>
+              cluster::partition_statuses_t>
               topic2partitions;
             for (const auto& [ntp, repl] : replicas) {
                 topic2partitions[model::topic_namespace(ntp.ns, ntp.tp.topic)]
@@ -584,12 +718,15 @@ private:
                     .id = ntp.tp.partition, .size_bytes = repl.local_size});
             }
 
+            chunked_vector<cluster::topic_status> topics;
             for (auto& [topic, partitions] : topic2partitions) {
-                report.topics.push_back(
+                topics.push_back(
                   cluster::topic_status(topic, std::move(partitions)));
             }
 
-            return report;
+            return ss::make_foreign(
+              ss::make_lw_shared<const cluster::node_health_report>(
+                id, local_state, std::move(topics), std::nullopt));
         }
     };
 
@@ -598,38 +735,23 @@ private:
     size_t _cur_tick = 0;
     size_t _last_run_in_progress_updates = 0;
     controller_workers _workers;
+    size_t _total_replicas = 0;
 };
 
 FIXTURE_TEST(test_decommission, partition_balancer_sim_fixture) {
-    for (size_t i = 0; i < 4; ++i) {
+    for (model::node_id::type i = 0; i < 4; ++i) {
         add_node(model::node_id{i}, 100_GiB);
     }
     add_topic("mytopic", 100, 3, 100_MiB);
     set_decommissioning(model::node_id{0});
 
-    print_state();
-    for (size_t i = 0; i < 10000; ++i) {
-        if (nodes().at(model::node_id{0}).replicas.empty()) {
-            logger.info("finished in {} ticks", i);
-            break;
-        }
-
-        tick();
-        if (should_schedule_balancer_run()) {
-            print_state();
-            run_balancer();
-        }
-    }
-
-    logger.info("finished after {} ticks", cur_tick());
-    print_state();
-
+    BOOST_REQUIRE(run_to_completion(100));
     BOOST_REQUIRE_EQUAL(
       allocation_nodes().at(model::node_id{0})->allocated_partitions()(), 0);
 }
 
 FIXTURE_TEST(test_two_decommissions, partition_balancer_sim_fixture) {
-    for (size_t i = 0; i < 5; ++i) {
+    for (model::node_id::type i = 0; i < 5; ++i) {
         add_node(model::node_id{i}, 100_GiB);
     }
     add_topic("mytopic", 200, 3, 100_MiB);
@@ -637,15 +759,7 @@ FIXTURE_TEST(test_two_decommissions, partition_balancer_sim_fixture) {
 
     size_t start_node_0_replicas
       = nodes().at(model::node_id{0}).replicas.size();
-
-    print_state();
-    for (size_t i = 0; i < 20000; ++i) {
-        if (
-          nodes().at(model::node_id{0}).replicas.empty()
-          && nodes().at(model::node_id{1}).replicas.empty()) {
-            break;
-        }
-
+    auto tick_cb = [&] {
         if (
           !allocation_nodes().at(model::node_id{1})->is_decommissioned()
           && allocation_nodes().at(model::node_id{0})->final_partitions()()
@@ -655,17 +769,9 @@ FIXTURE_TEST(test_two_decommissions, partition_balancer_sim_fixture) {
             set_decommissioning(model::node_id{1});
             print_state();
         }
+    };
 
-        tick();
-        if (should_schedule_balancer_run()) {
-            print_state();
-            run_balancer();
-        }
-    }
-
-    logger.info("finished after {} ticks", cur_tick());
-    print_state();
-
+    BOOST_REQUIRE(run_to_completion(500, tick_cb));
     BOOST_REQUIRE_EQUAL(
       allocation_nodes().at(model::node_id{0})->allocated_partitions()(), 0);
     BOOST_REQUIRE_EQUAL(
@@ -673,7 +779,7 @@ FIXTURE_TEST(test_two_decommissions, partition_balancer_sim_fixture) {
 }
 
 FIXTURE_TEST(test_counts_rebalancing, partition_balancer_sim_fixture) {
-    for (size_t i = 0; i < 3; ++i) {
+    for (model::node_id::type i = 0; i < 3; ++i) {
         add_node(model::node_id{i}, 1000_GiB, 4);
     }
 
@@ -690,21 +796,179 @@ FIXTURE_TEST(test_counts_rebalancing, partition_balancer_sim_fixture) {
     add_node(model::node_id{4}, 1000_GiB, 8);
     add_node_to_rebalance(model::node_id{4});
 
-    print_state();
-
-    for (size_t i = 0; i < 100000; ++i) {
-        tick();
-        if (should_schedule_balancer_run()) {
-            print_state();
-            run_balancer();
-
-            if (last_run_in_progress_updates() == 0) {
-                break;
-            }
-        }
-    }
-
-    print_state();
+    BOOST_REQUIRE(run_to_completion(2000));
     validate_even_replica_distribution();
     validate_even_topic_distribution();
+}
+
+FIXTURE_TEST(
+  test_heterogeneous_racks_full_disk, partition_balancer_sim_fixture) {
+    for (model::node_id::type i = 0; i < 3; ++i) {
+        add_node(
+          model::node_id{i},
+          1000_GiB,
+          4,
+          model::rack_id{ssx::sformat("rack_{}", i)});
+    }
+    add_node(model::node_id{3}, 1000_GiB, 4, model::rack_id{"rack_0"});
+
+    add_topic("topic_1", 50, 3, 18_GiB);
+
+    // Nodes 0 and 3 are in rack_0 and 1 and 2 are each in racks of their own.
+    // We expect 1 and 2 to go over 80% disk limit and the balancer to fix this
+    // (even though some rack constraint violations are introduced).
+
+    BOOST_REQUIRE(run_to_completion(100));
+    for (const auto& [id, node] : nodes()) {
+        BOOST_REQUIRE(double(node.used) / node.total < 0.8);
+    }
+}
+
+FIXTURE_TEST(test_smol, partition_balancer_sim_fixture) {
+    for (model::node_id::type i = 0; i < 4; ++i) {
+        add_node(model::node_id{i}, 100_GiB);
+    }
+
+    add_topic("topic_1", 3, 3, 1_GiB, 100_MiB);
+    add_topic("topic_2", 3, 3, 1_GiB, 100_MiB);
+
+    for (model::node_id::type i = 4; i < 6; ++i) {
+        add_node(model::node_id{i}, 100_GiB);
+        add_node_to_rebalance(model::node_id{i});
+    }
+
+    BOOST_REQUIRE(run_to_completion(10));
+}
+
+FIXTURE_TEST(test_heterogeneous_topics, partition_balancer_sim_fixture) {
+    for (model::node_id::type i = 0; i < 9; ++i) {
+        add_node(model::node_id{i}, 300_GiB);
+    }
+
+    // Add 2 topics with drastically different partition sizes.
+    // We expect the result to be nevertheless balanced thanks to topic-aware
+    // balancing.
+    add_topic("topic_1", 200, 3, 2_GiB, 200_MiB);
+    add_topic("topic_2", 800, 3, 10_MiB, 1_MiB);
+
+    for (model::node_id::type i = 9; i < 12; ++i) {
+        add_node(model::node_id{i}, 300_GiB);
+        add_node_to_rebalance(model::node_id{i});
+    }
+
+    BOOST_REQUIRE(run_to_completion(1000));
+
+    validate_even_topic_distribution();
+    validate_even_replica_distribution();
+}
+
+FIXTURE_TEST(test_many_topics, partition_balancer_sim_fixture) {
+    for (model::node_id::type i = 0; i < 4; ++i) {
+        add_node(model::node_id{i}, 100_GiB);
+    }
+
+    for (size_t i = 0; i < 100; ++i) {
+        // Many topics, each with just a few partitions - this is the hard case
+        // for topic-aware balancing. We expect overall replica distribution to
+        // be even anyway.
+
+        auto n_partitions = random_generators::get_int(2, 5);
+
+        // take mean topic partition sizes from a bimodal distribution - 20% of
+        // the topics will be big.
+        auto partition_size = random_generators::get_int(0, 4) == 0 ? 1_GiB
+                                                                    : 10_MiB;
+
+        add_topic(
+          ssx::sformat("topic_{}", i),
+          n_partitions,
+          3,
+          partition_size,
+          partition_size / 10);
+    }
+
+    for (model::node_id::type i = 4; i < 6; ++i) {
+        add_node(model::node_id{i}, 100_GiB);
+        add_node_to_rebalance(model::node_id{i});
+    }
+
+    BOOST_REQUIRE(run_to_completion(1000));
+
+    validate_even_replica_distribution();
+}
+
+FIXTURE_TEST(test_replica_pair_frequency, partition_balancer_sim_fixture) {
+    for (model::node_id::type i = 0; i < 3; ++i) {
+        add_node(model::node_id{i}, 300_GiB);
+    }
+    add_topic("topic_1", 150, 3, 1_GiB);
+
+    for (model::node_id::type i = 3; i < 6; ++i) {
+        add_node(model::node_id{i}, 300_GiB);
+        add_node_to_rebalance(model::node_id{i});
+    }
+
+    add_topic("topic_2", 150, 3, 1_GiB);
+    logger.info("topic_2 created");
+    validate_topic_replica_pair_frequencies("topic_2");
+
+    BOOST_REQUIRE(run_to_completion(1000));
+    logger.info("first rebalance finished");
+    validate_even_replica_distribution();
+    validate_replica_pair_frequencies();
+
+    for (model::node_id::type i = 6; i < 9; ++i) {
+        add_node(model::node_id{i}, 300_GiB);
+        add_node_to_rebalance(model::node_id{i});
+    }
+
+    BOOST_REQUIRE(run_to_completion(1000));
+    logger.info("second rebalance finished");
+    validate_even_replica_distribution();
+    validate_replica_pair_frequencies();
+}
+
+FIXTURE_TEST(test_mixed_replication_factors, partition_balancer_sim_fixture) {
+    add_node(model::node_id{0}, 100_GiB, 1);
+    add_node(model::node_id{1}, 400_GiB, 1);
+    add_node(model::node_id{2}, 100_GiB, 1);
+    /**
+     * Corner case from real deployment with the following configuration of
+     * topics:
+     * - partitions:  1, rf: 3, topic_count:  96
+     * - partitions:  5, rf: 1, topic_count: 118
+     * - partitions: 16, rf: 3, topic_count:   1
+     * - partitions:  5, rf: 3, topic_count:  36
+     * - partitions: 25, rf: 3, topic_count:  16
+     * - partitions:  3, rf: 3, topic_count:   2
+     * - partitions:  1, rf: 1, topic_count:  37
+     * - partitions: 10, rf: 1, topic_count:   1
+     */
+    for (int i = 0; i < 96; ++i) {
+        add_topic(fmt::format("topic_1_3_{}", i), 1, 3, 10_MiB);
+    }
+    for (int i = 0; i < 118; ++i) {
+        add_topic(fmt::format("topic_5_1_{}", i), 5, 1, 10_MiB);
+    }
+
+    add_topic("topic_10_1", 10, 1, 10_MiB);
+    for (int i = 0; i < 36; ++i) {
+        add_topic(fmt::format("topic_5_3_{}", i), 5, 3, 10_MiB);
+    }
+    for (int i = 0; i < 16; ++i) {
+        add_topic(fmt::format("topic_25_1_{}", i), 25, 3, 10_MiB);
+    }
+    for (int i = 0; i < 2; ++i) {
+        add_topic(fmt::format("topic_3_3_{}", i), 3, 3, 10_MiB);
+    }
+
+    for (int i = 0; i < 37; ++i) {
+        add_topic(fmt::format("topic_1_1_{}", i), 3, 3, 10_MiB);
+    }
+
+    add_node(model::node_id{4}, 300_GiB, 1);
+    add_node_to_rebalance(model::node_id{4});
+    BOOST_REQUIRE(run_to_completion(total_replicas() * 3));
+    set_decommissioning(model::node_id{4});
+    BOOST_REQUIRE(run_to_completion(total_replicas() * 3));
 }

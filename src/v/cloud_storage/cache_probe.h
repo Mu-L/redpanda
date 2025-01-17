@@ -10,8 +10,8 @@
 
 #pragma once
 
+#include "metrics/metrics.h"
 #include "model/fundamental.h"
-#include "ssx/metrics.h"
 
 #include <seastar/core/metrics_registration.hh>
 
@@ -37,9 +37,15 @@ public:
     void put_started() { ++_cur_in_progress_files; }
     void put_ended() { --_cur_in_progress_files; }
 
+    void set_tracker_size(uint64_t size) { _tracker_size = size; }
+
     void fast_trim() { ++_fast_trims; }
     void exhaustive_trim() { ++_exhaustive_trims; }
+    void carryover_trim() { ++_carryover_trims; }
     void failed_trim() { ++_failed_trims; }
+    void in_mem_trim() { ++_in_mem_trims; }
+
+    void tracker_sync() { ++_tracker_syncs; }
 
 private:
     uint64_t _num_puts = 0;
@@ -52,15 +58,18 @@ private:
     int64_t _cur_num_files = 0;
     int64_t _hwm_num_files = 0;
     int64_t _cur_in_progress_files = 0;
+    uint64_t _tracker_size{0};
 
     int64_t _fast_trims{0};
     int64_t _exhaustive_trims{0};
+    int64_t _carryover_trims{0};
     int64_t _failed_trims{0};
+    int64_t _in_mem_trims{0};
 
-    ssx::metrics::metric_groups _metrics
-      = ssx::metrics::metric_groups::make_internal();
-    ssx::metrics::metric_groups _public_metrics
-      = ssx::metrics::metric_groups::make_public();
+    uint64_t _tracker_syncs{0};
+
+    metrics::internal_metric_groups _metrics;
+    metrics::public_metric_groups _public_metrics;
 };
 
 } // namespace cloud_storage

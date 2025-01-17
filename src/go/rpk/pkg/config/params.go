@@ -10,6 +10,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -28,11 +29,13 @@ import (
 	"golang.org/x/exp/maps"
 	"golang.org/x/term"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
 	rpknet "github.com/redpanda-data/redpanda/src/go/rpk/pkg/net"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
 )
 
 const (
@@ -51,21 +54,29 @@ const (
 
 	// This block contains names X flags that are used for backcompat.
 	// All new X flags are defined directly into the xflags slice.
-	xKafkaBrokers       = "brokers"
-	xKafkaTLSEnabled    = "tls.enabled"
-	xKafkaCACert        = "tls.ca"
-	xKafkaClientCert    = "tls.cert"
-	xKafkaClientKey     = "tls.key"
-	xKafkaSASLMechanism = "sasl.mechanism"
-	xKafkaSASLUser      = "user"
-	xKafkaSASLPass      = "pass"
-	xAdminHosts         = "admin.hosts"
-	xAdminTLSEnabled    = "admin.tls.enabled"
-	xAdminCACert        = "admin.tls.ca"
-	xAdminClientCert    = "admin.tls.cert"
-	xAdminClientKey     = "admin.tls.key"
-	xCloudClientID      = "cloud.client_id"
-	xCloudClientSecret  = "cloud.client_secret"
+	xKafkaBrokers              = "brokers"
+	xKafkaTLSEnabled           = "tls.enabled"
+	xKafkaTLSInsecure          = "tls.insecure_skip_verify"
+	xKafkaCACert               = "tls.ca"
+	xKafkaClientCert           = "tls.cert"
+	xKafkaClientKey            = "tls.key"
+	xKafkaSASLMechanism        = "sasl.mechanism"
+	xKafkaSASLUser             = "user"
+	xKafkaSASLPass             = "pass"
+	xAdminHosts                = "admin.hosts"
+	xAdminTLSEnabled           = "admin.tls.enabled"
+	xAdminTLSInsecure          = "admin.tls.insecure_skip_verify"
+	xAdminCACert               = "admin.tls.ca"
+	xAdminClientCert           = "admin.tls.cert"
+	xAdminClientKey            = "admin.tls.key"
+	xCloudClientID             = "cloud.client_id"
+	xCloudClientSecret         = "cloud.client_secret"
+	xSchemaRegistryHosts       = "registry.hosts"
+	xSchemaRegistryTLSEnabled  = "registry.tls.enabled"
+	xSchemaRegistryTLSInsecure = "registry.tls.insecure_skip_verify"
+	xSchemaRegistryCACert      = "registry.tls.ca"
+	xSchemaRegistryClientCert  = "registry.tls.cert"
+	xSchemaRegistryClientKey   = "registry.tls.key"
 )
 
 const (
@@ -73,6 +84,8 @@ const (
 	xkindCloudAuth        // configuration for the current cloud_auth
 	xkindGlobal           // configuration for rpk.yaml globals
 )
+
+const currentRpkYAMLVersion = 6
 
 type xflag struct {
 	path        string
@@ -115,6 +128,13 @@ func mkAdminTLS(a *RpkAdminAPI) *TLS {
 	return a.TLS
 }
 
+func mkSchemaRegistryTLS(a *RpkSchemaRegistryAPI) *TLS {
+	if a.TLS == nil {
+		a.TLS = new(TLS)
+	}
+	return a.TLS
+}
+
 var xflags = map[string]xflag{
 	xKafkaBrokers: {
 		"kafka_api.brokers",
@@ -129,9 +149,23 @@ var xflags = map[string]xflag{
 		"kafka_api.tls.enabled",
 		"true",
 		xkindProfile,
-		func(v string, y *RpkYaml) error {
+		func(_ string, y *RpkYaml) error {
 			p := y.Profile(y.CurrentProfile)
 			mkKafkaTLS(&p.KafkaAPI)
+			return nil
+		},
+	},
+	xKafkaTLSInsecure: {
+		"kafka_api.tls.insecure_skip_verify",
+		"false",
+		xkindProfile,
+		func(v string, y *RpkYaml) error {
+			p := y.Profile(y.CurrentProfile)
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return err
+			}
+			mkKafkaTLS(&p.KafkaAPI).InsecureSkipVerify = b
 			return nil
 		},
 	},
@@ -210,9 +244,23 @@ var xflags = map[string]xflag{
 		"admin_api.tls.enabled",
 		"false",
 		xkindProfile,
-		func(v string, y *RpkYaml) error {
+		func(_ string, y *RpkYaml) error {
 			p := y.Profile(y.CurrentProfile)
 			mkAdminTLS(&p.AdminAPI)
+			return nil
+		},
+	},
+	xAdminTLSInsecure: {
+		"admin_api.tls.insecure_skip_verify",
+		"false",
+		xkindProfile,
+		func(v string, y *RpkYaml) error {
+			p := y.Profile(y.CurrentProfile)
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return err
+			}
+			mkAdminTLS(&p.AdminAPI).InsecureSkipVerify = b
 			return nil
 		},
 	},
@@ -246,13 +294,81 @@ var xflags = map[string]xflag{
 			return nil
 		},
 	},
-
+	xSchemaRegistryHosts: {
+		"schema_registry.addresses",
+		"127.8.8.4,126.1.3.4:9093,localhost,example.com",
+		xkindProfile,
+		func(v string, y *RpkYaml) error {
+			p := y.Profile(y.CurrentProfile)
+			return splitCommaIntoStrings(v, &p.SR.Addresses)
+		},
+	},
+	xSchemaRegistryTLSEnabled: {
+		"schema_registry.tls.enabled",
+		"false",
+		xkindProfile,
+		func(_ string, y *RpkYaml) error {
+			p := y.Profile(y.CurrentProfile)
+			mkSchemaRegistryTLS(&p.SR)
+			return nil
+		},
+	},
+	xSchemaRegistryTLSInsecure: {
+		"schema_registry.tls.insecure_skip_verify",
+		"false",
+		xkindProfile,
+		func(v string, y *RpkYaml) error {
+			p := y.Profile(y.CurrentProfile)
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return err
+			}
+			mkSchemaRegistryTLS(&p.SR).InsecureSkipVerify = b
+			return nil
+		},
+	},
+	xSchemaRegistryCACert: {
+		"schema_registry.tls.ca_file",
+		"noextension",
+		xkindProfile,
+		func(v string, y *RpkYaml) error {
+			p := y.Profile(y.CurrentProfile)
+			mkSchemaRegistryTLS(&p.SR).TruststoreFile = v
+			return nil
+		},
+	},
+	xSchemaRegistryClientCert: {
+		"schema_registry.tls.cert_file",
+		"cert.pem",
+		xkindProfile,
+		func(v string, y *RpkYaml) error {
+			p := y.Profile(y.CurrentProfile)
+			mkSchemaRegistryTLS(&p.SR).CertFile = v
+			return nil
+		},
+	},
+	xSchemaRegistryClientKey: {
+		"schema_registry.tls.key_file",
+		"key.pem",
+		xkindProfile,
+		func(v string, y *RpkYaml) error {
+			p := y.Profile(y.CurrentProfile)
+			mkSchemaRegistryTLS(&p.SR).KeyFile = v
+			return nil
+		},
+	},
 	xCloudClientID: {
 		"client_id",
 		"anystring",
 		xkindCloudAuth,
 		func(v string, y *RpkYaml) error {
-			auth := y.Auth(y.CurrentCloudAuth)
+			var auth *RpkCloudAuth
+			if p := y.Profile(y.CurrentProfile); p != nil {
+				auth = p.VirtualAuth()
+			}
+			if auth == nil {
+				auth = y.CurrentAuth()
+			}
 			auth.ClientID = v
 			return nil
 		},
@@ -262,7 +378,13 @@ var xflags = map[string]xflag{
 		"anysecret",
 		xkindCloudAuth,
 		func(v string, y *RpkYaml) error {
-			auth := y.Auth(y.CurrentCloudAuth)
+			var auth *RpkCloudAuth
+			if p := y.Profile(y.CurrentProfile); p != nil {
+				auth = p.VirtualAuth()
+			}
+			if auth == nil {
+				auth = y.CurrentAuth()
+			}
 			auth.ClientSecret = v
 			return nil
 		},
@@ -286,6 +408,15 @@ var xflags = map[string]xflag{
 			b, err := strconv.ParseBool(v)
 			y.Globals.NoDefaultCluster = b
 			return err
+		},
+	},
+
+	"globals.command_timeout": {
+		"globals.command_timeout",
+		"30s",
+		xkindGlobal,
+		func(v string, y *RpkYaml) error {
+			return y.Globals.CommandTimeout.UnmarshalText([]byte(v))
 		},
 	},
 
@@ -410,6 +541,9 @@ type Params struct {
 	loggerOnce sync.Once
 	logger     *zap.Logger
 
+	// Formatter is used to format rpk's output (json/yaml/text)
+	Formatter OutFormatter
+
 	// BACKCOMPAT FLAGS
 	brokers           []string
 	user              string
@@ -444,6 +578,9 @@ tls.enabled=true
   You can use this if you have well known certificates setup on your Kafka API.
   If you use mTLS, specifying mTLS certificate filepaths automatically opts
   into TLS enabled.
+
+tls.insecure_skip_verify=false
+  A boolean that disables rpk from verifying the broker's certificate chain.
 
 tls.ca=/path/to/ca.pem
   A filepath to a PEM encoded CA certificate file to talk to your broker's
@@ -483,6 +620,9 @@ admin.tls.enabled=false
   If you use mTLS, specifying mTLS certificate filepaths automatically opts
   into TLS enabled.
 
+admin.tls.insecure_skip_verify=false
+  A boolean that disables rpk from verifying the broker's certificate chain.
+
 admin.tls.ca=/path/to/ca.pem
   A filepath to a PEM encoded CA certificate file to talk to your broker's
   Admin API listeners with mTLS. You may also need this if your listeners are
@@ -497,11 +637,42 @@ admin.tls.key=/path/to/key.pem
   A filepath to a PEM encoded client key file to talk to your broker's Admin
   API listeners with mTLS.
 
+registry.hosts=localhost:8081,rp.example.com:8081
+  A comma separated list of host:ports that rpk talks to for the schema registry
+  API. By default, this is 127.0.0.1:8081.
+
+registry.tls.enabled=false
+  A boolean that enables rpk to speak TLS to your broker's schema registry API
+  listeners. You can use this if you have well known certificates setup on your
+  schema registry API. If you use mTLS, specifying mTLS certificate filepaths
+  automatically opts into TLS enabled.
+
+registry.tls.insecure_skip_verify=false
+  A boolean that disables rpk from verifying the broker's certificate chain.
+
+registry.tls.ca=/path/to/ca.pem
+  A filepath to a PEM encoded CA certificate file to talk to your broker's
+  schema registry API listeners with mTLS. You may also need this if your
+  listeners are using a certificate by a well known authority that is not yet
+  bundled on your operating system.
+
+registry.tls.cert=/path/to/cert.pem
+  A filepath to a PEM encoded client certificate file to talk to your broker's
+  schema registry API listeners with mTLS.
+
+registry.tls.key=/path/to/key.pem
+  A filepath to a PEM encoded client key file to talk to your broker's schema
+  registry API listeners with mTLS.
+
 cloud.client_id=somestring
   An oauth client ID to use for authenticating with the Redpanda Cloud API.
+  Overrides the client ID in the current profile if it is for a cloud cluster,
+  otherwise overrides the default cloud auth client ID.
 
 cloud.client_secret=somelongerstring
   An oauth client secret to use for authenticating with the Redpanda Cloud API.
+  Overrides the client secret in the current profile if it is for a cloud
+  cluster, otherwise overrides the default cloud auth client secret.
 
 globals.prompt="%n"
   A format string to use for the default prompt; see 'rpk profile prompt' for
@@ -511,18 +682,22 @@ globals.no_default_cluster=false
   A boolean that disables rpk from talking to localhost:9092 if no other
   cluster is specified.
 
+globals.command_timeout=30s
+  A duration that rpk will wait for a command to complete before timing out,
+  for certain commands.
+
 globals.dial_timeout=3s
   A duration that rpk will wait for a connection to be established before
   timing out.
 
-globals.request_timeout_overhead=10s
+globals.request_timeout_overhead=5s
   A duration that limits how long rpk waits for responses, *on top* of any
   request-internal timeout. For example, ListOffsets has no Timeout field so
   if request_timeout_overhead is 10s, rpk will wait for 10s for a response.
   However, JoinGroup has a RebalanceTimeoutMillis field, so the 10s is applied
   on top of the rebalance timeout.
 
-globals.retry_timeout=30s
+globals.retry_timeout=11s
   This timeout specifies how long rpk will retry Kafka API requests. This
   timeout is evaluated before any backoff -- if a request fails, we first check
   if the retry timeout has elapsed and if so, we stop retrying. If not, we wait
@@ -544,6 +719,7 @@ globals.kafka_protocol_request_client_id=rpk
 func ParamsList() string {
 	return `brokers=comma,delimited,host:ports
 tls.enabled=boolean
+tls.insecure_skip_verify=boolean
 tls.ca=/path/to/ca.pem
 tls.cert=/path/to/cert.pem
 tls.key=/path/to/key.pem
@@ -552,13 +728,21 @@ user=username
 pass=password
 admin.hosts=comma,delimited,host:ports
 admin.tls.enabled=boolean
+admin.tls.insecure_skip_verify=boolean
 admin.tls.ca=/path/to/ca.pem
 admin.tls.cert=/path/to/cert.pem
 admin.tls.key=/path/to/key.pem
+registry.hosts=comma,delimited,host:ports
+registry.tls.enabled=boolean
+registry.tls.insecure_skip_verify=boolean
+registry.tls.ca=/path/to/ca.pem
+registry.tls.cert=/path/to/cert.pem
+registry.tls.key=/path/to/key.pem
 cloud.client_id=somestring
 cloud.client_secret=somelongerstring
 globals.prompt="%n"
 globals.no_default_cluster=boolean
+globals.command_timeout=(30s,1m)
 globals.dial_timeout=duration(3s,1m,2h)
 globals.request_timeout_overhead=duration(10s,1m,2h)
 globals.retry_timeout=duration(30s,1m,2h)
@@ -646,54 +830,63 @@ func (p *Params) InstallCloudFlags(cmd *cobra.Command) {
 	cmd.MarkFlagsRequiredTogether(FlagClientID, FlagClientSecret)
 }
 
+func (p *Params) InstallFormatFlag(cmd *cobra.Command) {
+	pf := cmd.PersistentFlags()
+
+	pf.StringVar(&p.Formatter.Kind, "format", "text", fmt.Sprintf("Output format (%v)", strings.Join((&OutFormatter{}).SupportedFormats(), ",")))
+	cmd.RegisterFlagCompletionFunc("format", func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
+		return (&OutFormatter{}).SupportedFormats(), cobra.ShellCompDirectiveNoSpace
+	})
+}
+
 func (p *Params) backcompatFlagsToOverrides() {
 	if len(p.brokers) > 0 {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xKafkaBrokers, strings.Join(p.brokers, ",")))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xKafkaBrokers, strings.Join(p.brokers, ","))}, p.FlagOverrides...)
 	}
 	if p.user != "" {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xKafkaSASLUser, p.user))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xKafkaSASLUser, p.user)}, p.FlagOverrides...)
 	}
 	if p.password != "" {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xKafkaSASLPass, p.password))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xKafkaSASLPass, p.password)}, p.FlagOverrides...)
 	}
 	if p.saslMechanism != "" {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xKafkaSASLMechanism, p.saslMechanism))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xKafkaSASLMechanism, p.saslMechanism)}, p.FlagOverrides...)
 	}
 
 	if p.enableKafkaTLS {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%t", xKafkaTLSEnabled, p.enableKafkaTLS))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%t", xKafkaTLSEnabled, p.enableKafkaTLS)}, p.FlagOverrides...)
 	}
 	if p.kafkaCAFile != "" {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xKafkaCACert, p.kafkaCAFile))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xKafkaCACert, p.kafkaCAFile)}, p.FlagOverrides...)
 	}
 	if p.kafkaCertFile != "" {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xKafkaClientCert, p.kafkaCertFile))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xKafkaClientCert, p.kafkaCertFile)}, p.FlagOverrides...)
 	}
 	if p.kafkaKeyFile != "" {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xKafkaClientKey, p.kafkaKeyFile))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xKafkaClientKey, p.kafkaKeyFile)}, p.FlagOverrides...)
 	}
 
 	if len(p.adminURLs) > 0 {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xAdminHosts, strings.Join(p.adminURLs, ",")))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xAdminHosts, strings.Join(p.adminURLs, ","))}, p.FlagOverrides...)
 	}
 	if p.enableAdminTLS {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%t", xAdminTLSEnabled, p.enableAdminTLS))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%t", xAdminTLSEnabled, p.enableAdminTLS)}, p.FlagOverrides...)
 	}
 	if p.adminCAFile != "" {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xAdminCACert, p.adminCAFile))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xAdminCACert, p.adminCAFile)}, p.FlagOverrides...)
 	}
 	if p.adminCertFile != "" {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xAdminClientCert, p.adminCertFile))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xAdminClientCert, p.adminCertFile)}, p.FlagOverrides...)
 	}
 	if p.adminKeyFile != "" {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xAdminClientKey, p.adminKeyFile))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xAdminClientKey, p.adminKeyFile)}, p.FlagOverrides...)
 	}
 
 	if p.cloudClientID != "" {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xCloudClientID, p.cloudClientID))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xCloudClientID, p.cloudClientID)}, p.FlagOverrides...)
 	}
 	if p.cloudClientSecret != "" {
-		p.FlagOverrides = append(p.FlagOverrides, fmt.Sprintf("%s=%s", xCloudClientSecret, p.cloudClientSecret))
+		p.FlagOverrides = append([]string{fmt.Sprintf("%s=%s", xCloudClientSecret, p.cloudClientSecret)}, p.FlagOverrides...)
 	}
 }
 
@@ -743,9 +936,6 @@ func (p *Params) Load(fs afero.Fs) (*Config, error) {
 		}()
 	}
 
-	if err := p.backcompatOldCloudYaml(fs); err != nil {
-		return nil, err
-	}
 	if err := p.readRpkConfig(fs, c); err != nil {
 		return nil, err
 	}
@@ -753,12 +943,22 @@ func (p *Params) Load(fs afero.Fs) (*Config, error) {
 		return nil, err
 	}
 
+	c.migrateProfileNamespace()                          // migrate old cloud_cluster.namespace to cloud_cluster.resource_group.
+	if err := c.promptDeleteOldRpkYaml(fs); err != nil { // delete auths with no org/orgID, and profiles with no auth
+		return nil, err
+	}
+	if err := c.cleanupBadYaml(fs); err != nil {
+		return nil, err
+	}
+	c.ensureVirtualHasDefaults() // cleanupBadYaml deletes our defaults, this is an easier fix than trying to do it "right"
+
 	c.mergeRpkIntoRedpanda(true)     // merge actual rpk.yaml KafkaAPI,AdminAPI,Tuners into redpanda.yaml rpk section
 	c.addUnsetRedpandaDefaults(true) // merge from actual redpanda.yaml redpanda section to rpk section
 	c.ensureRpkProfile()             // ensure Virtual rpk.yaml has a loaded profile
 	c.ensureRpkCloudAuth()           // ensure Virtual rpk.yaml has a current auth
 	c.mergeRedpandaIntoRpk()         // merge redpanda.yaml rpk section back into rpk.yaml KafkaAPI,AdminAPI,Tuners (picks up redpanda.yaml extras sections were empty)
 	p.backcompatFlagsToOverrides()
+	c.addConfigToProfiles()
 	if err := p.processOverrides(c); err != nil { // override rpk.yaml profile from env&flags
 		return nil, err
 	}
@@ -766,7 +966,6 @@ func (p *Params) Load(fs afero.Fs) (*Config, error) {
 	c.addUnsetRedpandaDefaults(false) // merge from Virtual redpanda.yaml redpanda section to rpk section (picks up original redpanda.yaml defaults)
 	c.mergeRedpandaIntoRpk()          // merge from redpanda.yaml rpk section back to rpk.yaml, picks up final redpanda.yaml defaults
 	c.fixSchemePorts()                // strip any scheme, default any missing ports
-	c.addConfigToProfiles()
 	c.parseDevOverrides()
 
 	if !c.rpkYaml.Globals.NoDefaultCluster {
@@ -781,67 +980,72 @@ func (p *Params) SugarLogger() *zap.SugaredLogger {
 	return p.Logger().Sugar()
 }
 
+// BuildLogger returns the zap logger, p.Logger should be preferred.
+// Use BuildLogger when you need to force the logger re-creation.
+func (p *Params) BuildLogger() *zap.Logger {
+	if !p.DebugLogs {
+		return zap.NewNop()
+	}
+
+	// Now the zap config. The log time is effectively time.TimeMillisOnly.
+	// We disable logging the callsite and sampling, we shorten the log
+	// level to three letters, and we only add color if this is a
+	// terminal.
+	zcfg := zap.NewProductionConfig()
+	zcfg.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
+	zcfg.DisableCaller = true
+	zcfg.DisableStacktrace = true
+	zcfg.Sampling = nil
+	zcfg.Encoding = "console"
+	zcfg.EncoderConfig.EncodeTime = zapcore.TimeEncoder(func(t time.Time, pae zapcore.PrimitiveArrayEncoder) {
+		pae.AppendString(t.Format("15:04:05.000"))
+	})
+	zcfg.EncoderConfig.EncodeDuration = zapcore.StringDurationEncoder
+	zcfg.EncoderConfig.ConsoleSeparator = "  "
+
+	// https://en.wikipedia.org/wiki/ANSI_escape_code#Colors
+	const (
+		red     = 31
+		yellow  = 33
+		blue    = 34
+		magenta = 35
+	)
+
+	// Zap's OutputPaths bydefault is []string{"stderr"}, so we
+	// only need to check os.Stderr.
+	tty := term.IsTerminal(int(os.Stderr.Fd()))
+	color := func(n int, s string) string {
+		if !tty {
+			return s
+		}
+		return fmt.Sprintf("\x1b[%dm%s\x1b[0m", n, s)
+	}
+	colors := map[zapcore.Level]string{
+		zapcore.ErrorLevel: color(red, "ERROR"),
+		zapcore.WarnLevel:  color(yellow, "WARN"),
+		zapcore.InfoLevel:  color(blue, "INFO"),
+		zapcore.DebugLevel: color(magenta, "DEBUG"),
+	}
+	zcfg.EncoderConfig.EncodeLevel = func(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
+		switch l {
+		case zapcore.ErrorLevel,
+			zapcore.WarnLevel,
+			zapcore.InfoLevel,
+			zapcore.DebugLevel:
+		default:
+			l = zapcore.ErrorLevel
+		}
+		enc.AppendString(colors[l])
+	}
+
+	logger, _ := zcfg.Build() // this configuration does not error
+	return logger
+}
+
 // Logger parses returns the corresponding zap logger or a NopLogger.
 func (p *Params) Logger() *zap.Logger {
 	p.loggerOnce.Do(func() {
-		if !p.DebugLogs {
-			p.logger = zap.NewNop()
-			return
-		}
-
-		// Now the zap config. We want to to the console and make the logs
-		// somewhat nice. The log time is effectively time.TimeMillisOnly.
-		// We disable logging the callsite and sampling, we shorten the log
-		// level to three letters, and we only add color if this is a
-		// terminal.
-		zcfg := zap.NewProductionConfig()
-		zcfg.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
-		zcfg.DisableCaller = true
-		zcfg.DisableStacktrace = true
-		zcfg.Sampling = nil
-		zcfg.Encoding = "console"
-		zcfg.EncoderConfig.EncodeTime = zapcore.TimeEncoder(func(t time.Time, pae zapcore.PrimitiveArrayEncoder) {
-			pae.AppendString(t.Format("15:04:05.000"))
-		})
-		zcfg.EncoderConfig.EncodeDuration = zapcore.StringDurationEncoder
-		zcfg.EncoderConfig.ConsoleSeparator = "  "
-
-		// https://en.wikipedia.org/wiki/ANSI_escape_code#Colors
-		const (
-			red     = 31
-			yellow  = 33
-			blue    = 34
-			magenta = 35
-		)
-
-		// Zap's OutputPaths bydefault is []string{"stderr"}, so we
-		// only need to check os.Stderr.
-		tty := term.IsTerminal(int(os.Stderr.Fd()))
-		color := func(n int, s string) string {
-			if !tty {
-				return s
-			}
-			return fmt.Sprintf("\x1b[%dm%s\x1b[0m", n, s)
-		}
-		colors := map[zapcore.Level]string{
-			zapcore.ErrorLevel: color(red, "ERROR"),
-			zapcore.WarnLevel:  color(yellow, "WARN"),
-			zapcore.InfoLevel:  color(blue, "INFO"),
-			zapcore.DebugLevel: color(magenta, "DEBUG"),
-		}
-		zcfg.EncoderConfig.EncodeLevel = func(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
-			switch l {
-			case zapcore.ErrorLevel,
-				zapcore.WarnLevel,
-				zapcore.InfoLevel,
-				zapcore.DebugLevel:
-			default:
-				l = zapcore.ErrorLevel
-			}
-			enc.AppendString(colors[l])
-		}
-
-		p.logger, _ = zcfg.Build() // this configuration does not error
+		p.logger = p.BuildLogger()
 	})
 	return p.logger
 }
@@ -856,84 +1060,6 @@ func readFile(fs afero.Fs, path string) (string, []byte, error) {
 		return abs, nil, err
 	}
 	return abs, file, err
-}
-
-func (*Params) backcompatOldCloudYaml(fs afero.Fs) error {
-	def, err := DefaultRpkYamlPath()
-	if err != nil {
-		//nolint:nilerr // This error only happens if the user unset $HOME, and
-		// if they do that, we will avoid failing / avoid backcompat here.
-		return nil
-	}
-
-	// Read and parse the old file. If it does not exist, that's great.
-	oldPath := filepath.Join(filepath.Dir(def), "__cloud.yaml")
-	_, raw, err := readFile(fs, oldPath)
-	if err != nil {
-		if errors.Is(err, afero.ErrFileNotFound) {
-			return nil
-		}
-		return fmt.Errorf("unable to backcompat __cloud.yaml file: %v", err)
-	}
-	var old struct {
-		ClientID     string `yaml:"client_id"`
-		ClientSecret string `yaml:"client_secret"`
-		AuthToken    string `yaml:"auth_token"`
-	}
-	if err := yaml.Unmarshal(raw, &old); err != nil {
-		return fmt.Errorf("unable to yaml decode %s: %v", oldPath, err)
-	}
-
-	// For the rpk.yaml, if it does not exist, we will create it.
-	// We only support the default path, not any --config override.
-	// We do not want to migrate into some custom path.
-	_, rawRpkYaml, err := readFile(fs, def)
-	if err != nil && !errors.Is(err, afero.ErrFileNotFound) {
-		return fmt.Errorf("unable to read %s: %v", def, err)
-	}
-	var rpkYaml RpkYaml
-	if errors.Is(err, afero.ErrFileNotFound) {
-		rpkYaml = emptyVirtualRpkYaml()
-	} else {
-		if err := yaml.Unmarshal(rawRpkYaml, &rpkYaml); err != nil {
-			return fmt.Errorf("unable to yaml decode %s: %v", def, err)
-		}
-		if rpkYaml.Version < 1 {
-			return fmt.Errorf("%s is not in the expected rpk.yaml format", def)
-		} else if rpkYaml.Version > 1 {
-			return fmt.Errorf("%s is using a newer rpk.yaml format than we understand, please upgrade rpk", def)
-		}
-	}
-	rpkYaml.fileLocation = def
-
-	var exists bool
-	for _, a := range rpkYaml.CloudAuths {
-		if a.ClientID == old.ClientID && a.ClientSecret == old.ClientSecret {
-			exists = true
-			break
-		}
-	}
-	if !exists {
-		a := RpkCloudAuth{
-			Name:         "for_byoc",
-			Description:  "Client ID and Secret for BYOC",
-			ClientID:     old.ClientID,
-			ClientSecret: old.ClientSecret,
-			AuthToken:    old.AuthToken,
-		}
-		rpkYaml.PushAuth(a)
-		if rpkYaml.CurrentCloudAuth == "" {
-			rpkYaml.CurrentCloudAuth = a.Name
-		}
-		if err := rpkYaml.Write(fs); err != nil {
-			return fmt.Errorf("unable to migrate %s to %s: %v", oldPath, def, err)
-		}
-	}
-	// If we fail at removing the old file, that's ok. We will try again
-	// the next time this command runs.
-	fs.Remove(oldPath)
-
-	return nil
 }
 
 func (p *Params) readRpkConfig(fs afero.Fs, c *Config) error {
@@ -973,10 +1099,13 @@ func (p *Params) readRpkConfig(fs afero.Fs, c *Config) error {
 		}
 		c.rpkYaml = before // this config is not an rpk.yaml; preserve our defaults
 		return nil
-	} else if c.rpkYaml.Version > 1 {
+	} else if c.rpkYaml.Version < currentRpkYAMLVersion {
+		c.rpkYaml.Version = currentRpkYAMLVersion
+	} else if c.rpkYaml.Version > currentRpkYAMLVersion {
 		return fmt.Errorf("%s is using a newer rpk.yaml format than we understand, please upgrade rpk", def)
 	}
 	yaml.Unmarshal(file, &c.rpkYamlActual)
+	c.rpkYamlActual.Version = c.rpkYaml.Version
 
 	if p.Profile != "" {
 		if c.rpkYaml.Profile(p.Profile) == nil {
@@ -1029,6 +1158,214 @@ func (p *Params) readRedpandaConfig(fs afero.Fs, c *Config) error {
 	return nil
 }
 
+func (c *Config) promptDeleteOldRpkYaml(fs afero.Fs) error {
+	if !c.rpkYamlExists {
+		return nil
+	}
+	var deleteAuthNames []string
+	var deleteProfileNames []string
+	containsAuth := func(name string) bool {
+		for _, delName := range deleteAuthNames {
+			if delName == name {
+				return true
+			}
+		}
+		return false
+	}
+	for _, a := range c.rpkYamlActual.CloudAuths {
+		if a.Organization == "" || a.OrgID == "" {
+			deleteAuthNames = append(deleteAuthNames, a.Name)
+			continue
+		}
+	}
+	for _, p := range c.rpkYamlActual.Profiles {
+		cc := &p.CloudCluster
+		if !p.FromCloud {
+			continue
+		}
+		a := c.rpkYamlActual.LookupAuth(cc.AuthOrgID, cc.AuthKind)
+		if a == nil || containsAuth(a.Name) {
+			deleteProfileNames = append(deleteProfileNames, p.Name)
+			continue
+		}
+	}
+
+	if len(deleteAuthNames) == 0 && len(deleteProfileNames) == 0 {
+		return nil
+	}
+
+	if !isatty.IsTerminal(os.Stdin.Fd()) && !isatty.IsCygwinTerminal(os.Stdin.Fd()) {
+		return nil
+	}
+	if !isatty.IsTerminal(os.Stdout.Fd()) && !isatty.IsCygwinTerminal(os.Stdout.Fd()) {
+		return nil
+	}
+
+	if len(deleteAuthNames) > 0 {
+		fmt.Print(`rpk has found cloud authentications that are missing their organization or
+organization ID fields. Either you previously logged into the cloud via an old
+rpk, or the underlying rpk.yaml file was manually modified to remove these
+fields.
+
+rpk needs to remove these auths, meaning you will need to log in again via
+'rpk cloud login'.
+
+Affected auths:
+`)
+		for _, name := range deleteAuthNames {
+			fmt.Printf("  %s\n", name)
+		}
+		fmt.Println()
+	}
+	if len(deleteProfileNames) > 0 {
+		fmt.Print(`rpk has found cloud profiles that do not have an attached authentication name.
+Either you previously logged into the cloud via an old rpk, or the underlying
+rpk.yaml file was manually modified to remove fields.
+
+rpk needs to remove these profiles, meaning you will need to create them again via
+'rpk profile create --from-cluster'.
+
+Affected profiles:
+`)
+		for _, name := range deleteProfileNames {
+			fmt.Printf("  %s\n", name)
+		}
+		fmt.Println()
+	}
+	confirm, err := out.Confirm("Confirm deletion of auths or profiles?")
+	if err != nil {
+		return fmt.Errorf("unable to confirm deletion: %w", err)
+	}
+	if !confirm {
+		return fmt.Errorf("deletion of old auths or profiles rejected, please use an older rpk")
+	}
+
+	delAuths := make(map[string]struct{})
+	for _, name := range deleteAuthNames {
+		delAuths[name] = struct{}{}
+	}
+	delProfiles := make(map[string]struct{})
+	for _, name := range deleteProfileNames {
+		delProfiles[name] = struct{}{}
+	}
+
+	for _, y := range []*RpkYaml{&c.rpkYaml, &c.rpkYamlActual} {
+		keepAuths := y.CloudAuths[:0]
+		for _, a := range y.CloudAuths {
+			if _, ok := delAuths[a.Name]; ok {
+				continue
+			}
+			keepAuths = append(keepAuths, a)
+		}
+		y.CloudAuths = keepAuths
+		keepProfiles := y.Profiles[:0]
+		for _, p := range y.Profiles {
+			if _, ok := delProfiles[p.Name]; ok {
+				continue
+			}
+			keepProfiles = append(keepProfiles, p)
+		}
+		y.Profiles = keepProfiles
+	}
+	if err := c.rpkYamlActual.Write(fs); err != nil {
+		return fmt.Errorf("unable to write rpk.yaml: %w", err)
+	}
+	return nil
+}
+
+func (c *Config) cleanupBadYaml(fs afero.Fs) error {
+	if !c.rpkYamlExists {
+		return nil
+	}
+
+	both := func(fn func(y *RpkYaml)) {
+		fn(&c.rpkYamlActual)
+		fn(&c.rpkYaml)
+	}
+
+	// We
+	// * Delete duplicate auths
+	// * Delete duplicate profiles
+	// * Delete any auth that is kind == uninitialized
+	// * Delete any auth that is missing any of name,org,orgID
+	// * Clear the current profile if the referred profile does not exist
+	// * Clear the current auth if the referred auth does not exist
+	// * For all profiles, clear CloudCluster.Auth{OrgID,Kind} if the referred auth does not exist
+	jActBefore, _ := yaml.Marshal(c.rpkYamlActual)
+	both(func(y *RpkYaml) {
+		dupeFirstAuth := make(map[string]struct{})
+		keepAuths := y.CloudAuths[:0]
+		for _, a := range y.CloudAuths {
+			if a.Kind == CloudAuthUninitialized { // empty string
+				continue
+			}
+			if a.Name == "" || a.Organization == "" || a.OrgID == "" {
+				continue
+			}
+			if _, ok := dupeFirstAuth[a.Name]; ok {
+				continue
+			}
+			dupeFirstAuth[a.Name] = struct{}{}
+			keepAuths = append(keepAuths, a)
+		}
+		y.CloudAuths = keepAuths
+
+		dupeFirstProfile := make(map[string]struct{})
+		keepProfiles := y.Profiles[:0]
+		for _, p := range y.Profiles {
+			if _, ok := dupeFirstProfile[p.Name]; ok {
+				continue
+			}
+			if y.LookupAuth(p.CloudCluster.AuthOrgID, p.CloudCluster.AuthKind) == nil {
+				p.CloudCluster.AuthOrgID = ""
+				p.CloudCluster.AuthKind = ""
+			}
+			dupeFirstProfile[p.Name] = struct{}{}
+			keepProfiles = append(keepProfiles, p)
+		}
+		y.Profiles = keepProfiles
+
+		if y.Profile(y.CurrentProfile) == nil {
+			y.CurrentProfile = ""
+		}
+		if y.CurrentAuth() == nil {
+			y.CurrentCloudAuthOrgID = ""
+			y.CurrentCloudAuthKind = ""
+		}
+	})
+	jActAfter, _ := yaml.Marshal(c.rpkYamlActual)
+	if !bytes.Equal(jActBefore, jActAfter) {
+		if err := c.rpkYamlActual.Write(fs); err != nil {
+			return fmt.Errorf("unable to write rpk.yaml: %w", err)
+		}
+	}
+	return nil
+}
+
+// We take a lazy approach with deleting bad yaml, which also deletes
+// defaults from the virtual yaml. We add them back here. We could be
+// smarter and avoiding deleting virtual defaults to begin with, but
+// well, this is easy.
+func (c *Config) ensureVirtualHasDefaults() {
+	y := &c.rpkYaml
+	def, _ := defaultVirtualRpkYaml() // must succeed, succeeded previously
+	if len(y.CloudAuths) == 0 {
+		y.CloudAuths = def.CloudAuths
+	}
+	if y.CurrentCloudAuthOrgID == "" {
+		y.CurrentCloudAuthOrgID = def.CurrentCloudAuthOrgID
+	}
+	if y.CurrentCloudAuthKind == "" {
+		y.CurrentCloudAuthKind = def.CurrentCloudAuthKind
+	}
+	if len(y.Profiles) == 0 {
+		y.Profiles = def.Profiles
+	}
+	if y.CurrentProfile == "" {
+		y.CurrentProfile = def.CurrentProfile
+	}
+}
+
 // We merge rpk.yaml files into our Virtual redpanda.yaml rpk section,
 // only if the rpk section contains relevant bits of information.
 //
@@ -1052,6 +1389,9 @@ func (c *Config) mergeRpkIntoRedpanda(actual bool) {
 	if !reflect.DeepEqual(p.AdminAPI, RpkAdminAPI{}) {
 		dst.AdminAPI = p.AdminAPI
 	}
+	if !reflect.DeepEqual(p.SR, RpkSchemaRegistryAPI{}) {
+		dst.SR = p.SR
+	}
 }
 
 // This function ensures a current profile exists in the Virtual rpk.yaml.
@@ -1072,20 +1412,24 @@ func (c *Config) ensureRpkProfile() {
 }
 
 // This function ensures a current auth exists in the Virtual rpk.yaml.
+// This does not touch an auth that is pointed to by the current profile.
+// Users of virtual auth are expected to first check the profile auth, then
+// check the default auth.
 func (c *Config) ensureRpkCloudAuth() {
 	dst := &c.rpkYaml
-	auth := dst.Auth(dst.CurrentCloudAuth)
+	auth := dst.CurrentAuth()
 	if auth != nil {
 		return
 	}
 
 	def := DefaultRpkCloudAuth()
-	dst.CurrentCloudAuth = def.Name
-	auth = dst.Auth(dst.CurrentCloudAuth)
+	dst.CurrentCloudAuthOrgID = def.OrgID
+	dst.CurrentCloudAuthKind = CloudAuthUninitialized
+	auth = dst.CurrentAuth()
 	if auth != nil {
 		return
 	}
-	dst.PushAuth(def)
+	dst.PushNewAuth(def)
 }
 
 func (c *Config) ensureBrokerAddrs() {
@@ -1097,6 +1441,9 @@ func (c *Config) ensureBrokerAddrs() {
 		if len(dst.Rpk.AdminAPI.Addresses) == 0 {
 			dst.Rpk.AdminAPI.Addresses = []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(DefaultAdminPort))}
 		}
+		if len(dst.Rpk.SR.Addresses) == 0 {
+			dst.Rpk.SR.Addresses = []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(DefaultSchemaRegPort))}
+		}
 	}
 	{
 		dst := c.rpkYaml.Profile(c.rpkYaml.CurrentProfile) // must exist by this function
@@ -1105,6 +1452,9 @@ func (c *Config) ensureBrokerAddrs() {
 		}
 		if len(dst.AdminAPI.Addresses) == 0 {
 			dst.AdminAPI.Addresses = []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(DefaultAdminPort))}
+		}
+		if len(dst.SR.Addresses) == 0 {
+			dst.SR.Addresses = []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(DefaultSchemaRegPort))}
 		}
 	}
 }
@@ -1123,6 +1473,9 @@ func (c *Config) mergeRedpandaIntoRpk() {
 	}
 	if reflect.DeepEqual(p.AdminAPI, RpkAdminAPI{}) {
 		p.AdminAPI = src.AdminAPI
+	}
+	if reflect.DeepEqual(p.SR, RpkSchemaRegistryAPI{}) {
+		p.SR = src.SR
 	}
 }
 
@@ -1289,6 +1642,23 @@ func (c *Config) fixSchemePorts() error {
 			return fmt.Errorf("unable to fix admin address %v: unsupported scheme %q", a, scheme)
 		}
 	}
+	for i, a := range p.SR.Addresses {
+		scheme, host, port, err := rpknet.SplitSchemeHostPort(a)
+		if err != nil {
+			return fmt.Errorf("unable to fix schema registry address %v: %w", a, err)
+		}
+		switch scheme {
+		case "":
+			if port == "" {
+				port = strconv.Itoa(DefaultSchemaRegPort)
+			}
+			p.SR.Addresses[i] = net.JoinHostPort(host, port)
+		case "http", "https":
+			continue // keep whatever port exists; empty ports will default to 80 or 443
+		default:
+			return fmt.Errorf("unable to fix schema registry address %v: unsupported scheme %q", a, scheme)
+		}
+	}
 	return nil
 }
 
@@ -1298,6 +1668,21 @@ func (c *Config) addConfigToProfiles() {
 	}
 	for i := range c.rpkYamlActual.Profiles {
 		c.rpkYamlActual.Profiles[i].c = c
+	}
+}
+
+func (c *Config) migrateProfileNamespace() {
+	for i := range c.rpkYaml.Profiles {
+		if c.rpkYaml.Profiles[i].CloudCluster.Namespace != "" && c.rpkYaml.Profiles[i].CloudCluster.ResourceGroup == "" {
+			c.rpkYaml.Profiles[i].CloudCluster.ResourceGroup = c.rpkYaml.Profiles[i].CloudCluster.Namespace
+			c.rpkYaml.Profiles[i].CloudCluster.Namespace = ""
+		}
+	}
+	for i := range c.rpkYamlActual.Profiles {
+		if c.rpkYamlActual.Profiles[i].CloudCluster.Namespace != "" && c.rpkYamlActual.Profiles[i].CloudCluster.ResourceGroup == "" {
+			c.rpkYamlActual.Profiles[i].CloudCluster.ResourceGroup = c.rpkYamlActual.Profiles[i].CloudCluster.Namespace
+			c.rpkYamlActual.Profiles[i].CloudCluster.Namespace = ""
+		}
 	}
 }
 
@@ -1449,7 +1834,11 @@ func Set[T any](p *T, key, value string) error {
 		case "false":
 			value = "null"
 		default:
-			return fmt.Errorf("%s must be true or {}", key)
+			// If the final tag is 'tls', it might be a value. So we continue
+			// and handle below.
+			if finalTag != "tls" {
+				return fmt.Errorf("%s must be true or {}", key)
+			}
 		}
 		if finalTag == "enabled" {
 			tags = tags[:len(tags)-1]

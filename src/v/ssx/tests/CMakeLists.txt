@@ -8,8 +8,34 @@ rp_test(
     thread_worker.cc
     sleep_abortable_test.cc
     task_local_ptr_test.cc
+    watchdog_test.cc
   DEFINITIONS BOOST_TEST_DYN_LINK
   LIBRARIES v::seastar_testing_main v::ssx
+  LABELS ssx
+)
+
+rp_test(
+  UNIT_TEST
+  GTEST
+  BINARY_NAME ssx_gunit
+  SOURCES
+    async_algorithm_test.cc
+    event_test.cc
+    work_queue_test.cc
+    when_all_test.cc
+  LIBRARIES v::gtest_main v::ssx
+  LABELS ssx
+)
+
+rp_test(
+  UNIT_TEST
+  BINARY_NAME ssx_multi_thread
+  SOURCES
+    abort_source_test.cc
+    sharded_ptr_test.cc
+    single_sharded_test.cc
+  LIBRARIES v::seastar_testing_main
+  ARGS "-- -c 2"
   LABELS ssx
 )
 

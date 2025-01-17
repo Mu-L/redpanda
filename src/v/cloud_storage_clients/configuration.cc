@@ -12,27 +12,36 @@
 
 #include "cloud_storage_clients/logger.h"
 #include "config/configuration.h"
+#include "config/tls_config.h"
 #include "net/tls.h"
+#include "net/tls_certificate_probe.h"
+#include "utils/functional.h"
+
+#include <seastar/net/tls.hh>
 
 namespace {
 
 ss::future<ss::shared_ptr<ss::tls::certificate_credentials>>
 build_tls_credentials(
+  ss::sstring name,
   std::optional<cloud_storage_clients::ca_trust_file> trust_file,
   ss::logger& log) {
     ss::tls::credentials_builder cred_builder;
-    // NOTE: this is a pre-defined gnutls priority string that
-    // picks the ciphersuites with 128-bit ciphers which
-    // leads to up to 10x improvement in upload speed, compared
-    // to 256-bit ciphers
-    cred_builder.set_priority_string("PERFORMANCE");
+    cred_builder.set_cipher_string(
+      {config::tlsv1_2_cipher_string.data(),
+       config::tlsv1_2_cipher_string.size()});
+    cred_builder.set_ciphersuites(
+      {config::tlsv1_3_ciphersuites.data(),
+       config::tlsv1_3_ciphersuites.size()});
+    cred_builder.set_minimum_tls_version(
+      from_config(config::shard_local_cfg().tls_min_version()));
     if (trust_file.has_value()) {
         auto file = trust_file.value();
         vlog(log.info, "Use non-default trust file {}", file());
         co_await cred_builder.set_x509_trust_file(
           file().string(), ss::tls::x509_crt_format::PEM);
     } else {
-        // Use GnuTLS defaults, might not work on all systems
+        // Use system defaults, might not work on all systems
         auto ca_file = co_await net::find_ca_file();
         if (ca_file) {
             vlog(
@@ -44,12 +53,20 @@ build_tls_credentials(
         } else {
             vlog(
               log.info,
-              "Trust file can't be detected automatically, using GnuTLS "
+              "Trust file can't be detected automatically, using system "
               "default");
             co_await cred_builder.set_system_trust();
         }
     }
-    co_return co_await cred_builder.build_reloadable_certificate_credentials();
+    if (auto crl_file
+        = config::shard_local_cfg().cloud_storage_crl_file.value();
+        crl_file.has_value()) {
+        co_await cred_builder.set_x509_crl_file(
+          *crl_file, ss::tls::x509_crt_format ::PEM);
+    }
+    co_return co_await net::build_reloadable_credentials_with_probe<
+      ss::tls::certificate_credentials>(
+      std::move(cred_builder), "cloud_storage_client", std::move(name));
 };
 
 } // namespace
@@ -68,30 +85,74 @@ ss::future<s3_configuration> s3_configuration::make_configuration(
   const std::optional<cloud_roles::public_key_str>& pkey,
   const std::optional<cloud_roles::private_key_str>& skey,
   const cloud_roles::aws_region_name& region,
+  const bucket_name& bucket,
+  std::optional<cloud_storage_clients::s3_url_style> url_style,
+  bool node_is_in_fips_mode,
   const default_overrides& overrides,
   net::metrics_disabled disable_metrics,
   net::public_metrics_disabled disable_public_metrics) {
     s3_configuration client_cfg;
-    const auto endpoint_uri = [&]() -> ss::sstring {
-        if (overrides.endpoint) {
-            return overrides.endpoint.value();
+
+    if (url_style.has_value()) {
+        vassert(
+          !node_is_in_fips_mode
+            || url_style.value() == s3_url_style::virtual_host,
+          "node is in fips mode, but url_style is not set to virtual_host");
+        client_cfg.url_style = url_style.value();
+    } else {
+        // If the url style in not specified, it will be determined with
+        // self configuration.
+        client_cfg.requires_self_configuration = true;
+        // fips mode needs to build the endpoint in virtual host mode, so force
+        // the value and attempt self_configuration to check that the TS service
+        // can be reached in virtual_host mode
+        if (node_is_in_fips_mode) {
+            vlog(
+              client_config_log.info,
+              "in fips mode, url_style set to {}",
+              s3_url_style::virtual_host);
+            url_style = s3_url_style::virtual_host;
+            client_cfg.url_style = s3_url_style::virtual_host;
         }
-        return ssx::sformat("s3.{}.amazonaws.com", region());
-    }();
-    client_cfg.tls_sni_hostname = endpoint_uri;
+    }
+
+    // if overrides.endpoint is not specified, build the default base endpoint.
+    // for fips mode the it uses the `s3-fips` subdomain.
+    const auto base_endpoint_uri = overrides.endpoint.value_or(
+      endpoint_url{ssx::sformat(
+        "{}.{}.amazonaws.com",
+        node_is_in_fips_mode ? "s3-fips" : "s3",
+        region())});
+
+    // if url_style is virtual_host, the complete url for s3 is
+    // [bucket].[s3hostname]. s3client will form the complete_endpoint
+    // independently, to allow for self_configuration.
+    const auto complete_endpoint_uri
+      = url_style == s3_url_style::virtual_host
+          ? ssx::sformat("{}.{}", bucket(), base_endpoint_uri())
+          : base_endpoint_uri();
+
+    client_cfg.tls_sni_hostname = complete_endpoint_uri;
 
     // Setup credentials for TLS
     client_cfg.access_key = pkey;
     client_cfg.secret_key = skey;
     client_cfg.region = region;
-    client_cfg.uri = access_point_uri(endpoint_uri);
+    // defer host creation to client, after it has performed self_configure to
+    // discover if the backend is in `virtual_host` or `path mode`
+    client_cfg.uri = access_point_uri(base_endpoint_uri);
+
     if (overrides.disable_tls == false) {
         client_cfg.credentials = co_await build_tls_credentials(
-          overrides.trust_file, s3_log);
+          "s3", overrides.trust_file, s3_log);
     }
 
+    // When using virtual host addressing, the client must connect to
+    // the s3 endpoint with the bucket name, e.g.
+    // <bucket>.s3.<region>.amazonaws.com.  This is especially required
+    // for S3 FIPS endpoints: <bucket>.s3-fips.<region>.amazonaws.com
     client_cfg.server_addr = net::unresolved_address(
-      client_cfg.uri(),
+      complete_endpoint_uri,
       overrides.port ? *overrides.port : default_port,
       ss::net::inet_address::family::INET);
     client_cfg.disable_metrics = disable_metrics;
@@ -100,7 +161,7 @@ ss::future<s3_configuration> s3_configuration::make_configuration(
       disable_metrics,
       disable_public_metrics,
       region,
-      endpoint_url{endpoint_uri});
+      endpoint_url{complete_endpoint_uri});
     client_cfg.max_idle_time = overrides.max_idle_time
                                  ? *overrides.max_idle_time
                                  : default_max_idle_time;
@@ -111,8 +172,8 @@ std::ostream& operator<<(std::ostream& o, const s3_configuration& c) {
     o << "{access_key:"
       << c.access_key.value_or(cloud_roles::public_key_str{""})
       << ",region:" << c.region() << ",secret_key:****"
-      << ",access_point_uri:" << c.uri() << ",server_addr:" << c.server_addr
-      << ",max_idle_time:"
+      << ",url_style:" << c.url_style << ",access_point_uri:" << c.uri()
+      << ",server_addr:" << c.server_addr << ",max_idle_time:"
       << std::chrono::duration_cast<std::chrono::milliseconds>(c.max_idle_time)
            .count()
       << "}";
@@ -127,6 +188,8 @@ ss::future<abs_configuration> abs_configuration::make_configuration(
   net::public_metrics_disabled disable_public_metrics) {
     abs_configuration client_cfg;
 
+    client_cfg.requires_self_configuration = true;
+
     const auto endpoint_uri = [&]() -> ss::sstring {
         if (overrides.endpoint) {
             return overrides.endpoint.value();
@@ -134,13 +197,18 @@ ss::future<abs_configuration> abs_configuration::make_configuration(
         return ssx::sformat("{}.blob.core.windows.net", storage_account_name());
     }();
 
+    // The ABS TLS server misbehaves and does not send an EOF
+    // when prompted to close the connection. Thus, skip the wait
+    // in order to avoid Seastar's hardcoded 10s wait.
+    client_cfg.wait_for_tls_server_eof = false;
+
     client_cfg.tls_sni_hostname = endpoint_uri;
     client_cfg.storage_account_name = storage_account_name;
     client_cfg.shared_key = shared_key;
     client_cfg.uri = access_point_uri{endpoint_uri};
     if (overrides.disable_tls == false) {
         client_cfg.credentials = co_await build_tls_credentials(
-          overrides.trust_file, abs_log);
+          "abs", overrides.trust_file, abs_log);
     }
 
     client_cfg.server_addr = net::unresolved_address(
@@ -160,15 +228,118 @@ ss::future<abs_configuration> abs_configuration::make_configuration(
     co_return client_cfg;
 }
 
+abs_configuration abs_configuration::make_adls_configuration() const {
+    abs_configuration adls_config{*this};
+
+    const auto endpoint_uri = [&]() -> ss::sstring {
+        auto adls_endpoint_override
+          = config::shard_local_cfg().cloud_storage_azure_adls_endpoint.value();
+        if (adls_endpoint_override.has_value()) {
+            return adls_endpoint_override.value();
+        }
+        return ssx::sformat("{}.dfs.core.windows.net", storage_account_name());
+    }();
+
+    adls_config.tls_sni_hostname = endpoint_uri;
+    adls_config.uri = access_point_uri{endpoint_uri};
+
+    auto adls_port_override
+      = config::shard_local_cfg().cloud_storage_azure_adls_port();
+    adls_config.server_addr = net::unresolved_address{
+      endpoint_uri,
+      adls_port_override.has_value() ? *adls_port_override : default_port};
+
+    return adls_config;
+}
+
+void apply_self_configuration_result(
+  client_configuration& cfg, const client_self_configuration_output& res) {
+    std::visit(
+      [&res](auto& cfg) -> void {
+          using cfg_type = std::decay_t<decltype(cfg)>;
+          if constexpr (std::is_same_v<s3_configuration, cfg_type>) {
+              vassert(
+                std::holds_alternative<s3_self_configuration_result>(res),
+                "Incompatible client configuration {} and self configuration "
+                "result {}",
+                cfg,
+                res);
+
+              cfg.url_style
+                = std::get<s3_self_configuration_result>(res).url_style;
+
+          } else if constexpr (std::is_same_v<abs_configuration, cfg_type>) {
+              vassert(
+                std::holds_alternative<abs_self_configuration_result>(res),
+                "Incompatible client configuration {} and self configuration "
+                "result {}",
+                cfg,
+                res);
+
+              cfg.is_hns_enabled
+                = std::get<abs_self_configuration_result>(res).is_hns_enabled;
+          } else {
+              static_assert(always_false_v<cfg_type>, "Unknown client type");
+          }
+      },
+      cfg);
+}
+
 std::ostream& operator<<(std::ostream& o, const abs_configuration& c) {
     o << "{storage_account_name: " << c.storage_account_name()
-      << "shared_key:****"
-      << ",access_point_uri:" << c.uri() << ",server_addr:" << c.server_addr
-      << ",max_idle_time:"
+      << ", shared_key:" << (c.shared_key.has_value() ? "****" : "none")
+      << ", access_point_uri:" << c.uri() << ", server_addr:" << c.server_addr
+      << ", max_idle_time:"
       << std::chrono::duration_cast<std::chrono::milliseconds>(c.max_idle_time)
            .count()
-      << "}";
+      << ", is_hns_enabled:" << c.is_hns_enabled << "}";
     return o;
+}
+
+std::ostream&
+operator<<(std::ostream& o, const abs_self_configuration_result& r) {
+    o << "{is_hns_enabled: " << r.is_hns_enabled << "}";
+    return o;
+}
+
+std::ostream&
+operator<<(std::ostream& o, const s3_self_configuration_result& r) {
+    o << "{s3_url_style: " << r.url_style << "}";
+    return o;
+}
+
+std::ostream&
+operator<<(std::ostream& o, const client_self_configuration_output& r) {
+    return std::visit(
+      [&o](const auto& self_cfg) -> std::ostream& {
+          using cfg_type = std::decay_t<decltype(self_cfg)>;
+          if constexpr (std::
+                          is_same_v<s3_self_configuration_result, cfg_type>) {
+              return o << "{s3_self_configuration_result: " << self_cfg << "}";
+          } else if constexpr (std::is_same_v<
+                                 abs_self_configuration_result,
+                                 cfg_type>) {
+              return o << "{abs_self_configuration_result: " << self_cfg << "}";
+          } else {
+              static_assert(always_false_v<cfg_type>, "Unknown client type");
+          }
+      },
+      r);
+}
+
+model::cloud_storage_backend
+infer_backend_from_uri(const access_point_uri& uri) {
+    auto result
+      = string_switch<model::cloud_storage_backend>(uri())
+          .match_expr("google", model::cloud_storage_backend::google_s3_compat)
+          .match_expr(R"(127\.0\.0\.1)", model::cloud_storage_backend::aws)
+          .match_expr("localhost", model::cloud_storage_backend::aws)
+          .match_expr("minio", model::cloud_storage_backend::minio)
+          .match_expr("amazon", model::cloud_storage_backend::aws)
+          .match_expr(
+            "oraclecloud", model::cloud_storage_backend::oracle_s3_compat)
+          .default_match(model::cloud_storage_backend::unknown);
+    return result;
 }
 
 model::cloud_storage_backend infer_backend_from_configuration(
@@ -204,20 +375,21 @@ model::cloud_storage_backend infer_backend_from_configuration(
           "as google_s3_compat",
           cloud_storage_credentials_source);
         return model::cloud_storage_backend::google_s3_compat;
+    case model::cloud_credentials_source::azure_aks_oidc_federation:
+    case model::cloud_credentials_source::azure_vm_instance_metadata:
+        vlog(
+          client_config_log.info,
+          "cloud_storage_backend derived from cloud_credentials_source {} "
+          "as azure",
+          cloud_storage_credentials_source);
+        return model::cloud_storage_backend::azure;
     case model::cloud_credentials_source::config_file:
         break;
     }
 
     auto& s3_config = std::get<s3_configuration>(client_config);
     const auto& uri = s3_config.uri;
-
-    auto result
-      = string_switch<model::cloud_storage_backend>(uri())
-          .match_expr("google", model::cloud_storage_backend::google_s3_compat)
-          .match_expr(R"(127\.0\.0\.1)", model::cloud_storage_backend::aws)
-          .match_expr("minio", model::cloud_storage_backend::minio)
-          .match_expr("amazon", model::cloud_storage_backend::aws)
-          .default_match(model::cloud_storage_backend::unknown);
+    auto result = infer_backend_from_uri(uri);
 
     vlog(
       client_config_log.info,
@@ -226,6 +398,21 @@ model::cloud_storage_backend infer_backend_from_configuration(
       uri());
 
     return result;
+}
+
+std::ostream& operator<<(std::ostream& o, const client_configuration& c) {
+    return std::visit(
+      [&o](const auto& cfg) -> std::ostream& {
+          using cfg_type = std::decay_t<decltype(cfg)>;
+          if constexpr (std::is_same_v<s3_configuration, cfg_type>) {
+              return o << "{s3_configuration: " << cfg << "}";
+          } else if constexpr (std::is_same_v<abs_configuration, cfg_type>) {
+              return o << "{abs_configuration: " << cfg << "}";
+          } else {
+              static_assert(always_false_v<cfg_type>, "Unknown client type");
+          }
+      },
+      c);
 }
 
 } // namespace cloud_storage_clients

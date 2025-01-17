@@ -10,7 +10,7 @@
 
 #pragma once
 
-#include "seastarx.h"
+#include "base/seastarx.h"
 
 #include <seastar/core/sstring.hh>
 #include <seastar/http/httpd.hh>
@@ -24,6 +24,7 @@ namespace http_test_utils {
 struct response {
     using status_type = ss::http::reply::status_type;
     ss::sstring body;
+    std::vector<std::pair<ss::sstring, ss::sstring>> headers;
     status_type status;
 };
 
@@ -45,7 +46,6 @@ struct request_info {
      */
     ss::sstring q_list_type;
     ss::sstring q_prefix;
-    ss::sstring h_prefix;
     bool has_q_delete;
 
     explicit request_info(const ss::http::request& req)
@@ -55,7 +55,6 @@ struct request_info {
       , content_length(req.content_length) {
         q_list_type = req.get_query_param("list-type");
         q_prefix = req.get_query_param("prefix");
-        h_prefix = req.get_header("prefix");
         has_q_delete = req.query_parameters.contains("delete");
     }
 
@@ -95,6 +94,10 @@ struct registered_urls {
 
             void then_reply_with(
               ss::sstring content, ss::http::reply::status_type status);
+
+            void then_reply_with(
+              std::vector<std::pair<ss::sstring, ss::sstring>> headers,
+              ss::http::reply::status_type status);
 
             add_mapping_when& with_method(ss::httpd::operation_type m);
 

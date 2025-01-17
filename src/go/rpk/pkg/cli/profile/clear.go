@@ -26,9 +26,9 @@ This small command clears the current profile, which can be useful to unset an
 prod cluster profile.
 `,
 		Args: cobra.ExactArgs(0),
-		Run: func(_ *cobra.Command, args []string) {
+		Run: func(_ *cobra.Command, _ []string) {
 			cfg, err := p.Load(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
 			y, ok := cfg.ActualRpkYaml()
 			if !ok {
 				return

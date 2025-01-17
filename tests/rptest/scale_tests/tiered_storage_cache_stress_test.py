@@ -6,7 +6,10 @@
 # As of the Change Date specified in that file, in accordance with
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
+import sys
+from dataclasses import dataclass
 
+from rptest.services.metrics_check import MetricCheck
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.services.cluster import cluster
 from rptest.services.kgo_verifier_services import KgoVerifierProducer, KgoVerifierSeqConsumer, KgoVerifierRandomConsumer
@@ -19,11 +22,25 @@ from ducktape.mark import matrix
 import time
 from enum import Enum
 
+S3_ERROR_LOGS = ['unexpected REST API error "Internal Server Error" detected']
+
 
 class LimitMode(str, Enum):
     bytes = 'bytes'
     objects = 'objects'
     both = 'both'
+
+
+@dataclass
+class CacheExpectations:
+    tracker_size: int = 0
+    min_mem_trims: int = 0
+    max_mem_trims: int = sys.maxsize
+    min_fast_trims: int = 0
+    max_fast_trims: int = sys.maxsize
+    min_exhaustive_trims: int = 0
+    max_exhaustive_trims: int = sys.maxsize
+    num_syncs: int = 0
 
 
 class TieredStorageCacheStressTest(RedpandaTest):
@@ -32,7 +49,7 @@ class TieredStorageCacheStressTest(RedpandaTest):
 
     # Anywhere we calculate an expected runtime based on an expected bandwidth,
     # use this grace factor to make timeouts reasonably permissive.
-    runtime_grace_factor = 2.0
+    runtime_grace_factor = 4.0
 
     def __init__(self, test_context, *args, **kwargs):
 
@@ -46,6 +63,12 @@ class TieredStorageCacheStressTest(RedpandaTest):
             self.segment_upload_interval,
             'cloud_storage_manifest_max_upload_interval_sec':
             self.manifest_upload_interval,
+            'disable_public_metrics': False,
+            'cloud_storage_cache_check_interval': 500,
+            # We're consuming from leader node and expect specific changes in
+            # its local cache. Disable leader balancer so that our expectations
+            # are valid.
+            "enable_leader_balancer": False,
         }
         self.redpanda.set_extra_rp_conf(extra_rp_conf)
 
@@ -91,8 +114,6 @@ class TieredStorageCacheStressTest(RedpandaTest):
                     hwm_size = int(sample.value)
                 elif sample.name == "redpanda_cloud_storage_cache_space_hwm_files":
                     hwm_objects = int(sample.value)
-                #else:
-                #    self.logger.debug(sample.name)
         assert hwm_size is not None, "Cache HWM metric not found"
 
         any_cache_usage = (usage['cloud_storage_cache_bytes'] > 0
@@ -153,7 +174,7 @@ class TieredStorageCacheStressTest(RedpandaTest):
             self.redpanda, [topic_name],
             self.manifest_upload_interval + self.segment_upload_interval + 30)
 
-    @cluster(num_nodes=4)
+    @cluster(num_nodes=4, log_allow_list=S3_ERROR_LOGS)
     @matrix(limit_mode=[LimitMode.bytes, LimitMode.objects, LimitMode.both],
             log_segment_size=[1024 * 1024, 128 * 1024 * 1024])
     def streaming_cache_test(self, limit_mode, log_segment_size):
@@ -283,7 +304,7 @@ class TieredStorageCacheStressTest(RedpandaTest):
         # At least one node should have _something_ in its cache, or something is wrong with our test
         assert any(nodes_cache_used) is True
 
-    @cluster(num_nodes=4)
+    @cluster(num_nodes=4, log_allow_list=S3_ERROR_LOGS)
     def tiny_cache_test(self):
         """
         Verify stability and eventual progress when running with an absurdly small cache.
@@ -359,18 +380,9 @@ class TieredStorageCacheStressTest(RedpandaTest):
                                         cache_size,
                                         max_objects=None)
 
-    @cluster(num_nodes=4)
-    def garbage_objects_test(self):
-        """
-        Verify that if there are a large number of small files which do not pair
-        with data chunks, we still trim them when cache space is low.
-
-        This test is a reproducer for issues where the cache needs trimming but there
-        are not data objects present to cue the fast trim process to delete indices etc,
-        and we must fall back to exhaustive trim, such as:
-        https://github.com/redpanda-data/redpanda/issues/11835
-        """
-
+    def run_test_with_cache_prefilled(self, cache_prefill_command: str,
+                                      prefill_count: int,
+                                      expectations: CacheExpectations):
         segment_size = 128 * 1024 * 1024
         msg_size = 16384
         data_size = segment_size * 10
@@ -382,15 +394,11 @@ class TieredStorageCacheStressTest(RedpandaTest):
         for n in self.redpanda.nodes:
             self.redpanda.clean_node(n)
 
-        # Pre-populate caches with garbage files.
-        garbage_count = 100
+        # Pre-populate caches with files.
         for node in self.redpanda.nodes:
-            node.account.ssh_output(
-                f"mkdir -p {self.redpanda.cache_dir} ; for n in `seq 1 {garbage_count}`; do "
-                f"dd if=/dev/urandom bs=1k count=4 of={self.redpanda.cache_dir}/garbage_$n.bin ; done",
-                combine_stderr=False)
+            node.account.ssh(cache_prefill_command.format(prefill_count))
 
-        cache_object_limit = garbage_count // 2
+        cache_object_limit = prefill_count // 2
 
         # Set cache size to 50 objects
         si_settings = SISettings(
@@ -403,6 +411,7 @@ class TieredStorageCacheStressTest(RedpandaTest):
         # Bring up redpanda
 
         self.redpanda.set_si_settings(si_settings)
+
         self.redpanda.start(clean_nodes=False)
 
         # Cache startup should have registered the garbage objects in stats
@@ -410,10 +419,32 @@ class TieredStorageCacheStressTest(RedpandaTest):
         for node in self.redpanda.nodes:
             usage = admin.get_local_storage_usage(node)
             assert usage[
-                'cloud_storage_cache_objects'] >= garbage_count, f"Node {node.name} has unexpectedly few objects {usage['cloud_storage_cache_objects']} < {garbage_count}"
+                'cloud_storage_cache_objects'] >= prefill_count, \
+                (f"Node {node.name} has unexpectedly few objects "
+                 f"{usage['cloud_storage_cache_objects']} < {prefill_count}")
 
         # Inject data
         self._create_topic(topic_name, 1, segment_size)
+
+        trim_metrics = [
+            'redpanda_cloud_storage_cache_trim_in_mem_trims_total',
+            'redpanda_cloud_storage_cache_trim_fast_trims_total',
+            'redpanda_cloud_storage_cache_trim_exhaustive_trims_total',
+            'redpanda_cloud_storage_cache_space_tracker_syncs_total',
+            'redpanda_cloud_storage_cache_space_tracker_size'
+        ]
+        m = MetricCheck(self.redpanda.logger,
+                        self.redpanda,
+                        self.redpanda.partitions(topic_name)[0].leader,
+                        trim_metrics,
+                        metrics_endpoint=MetricsEndpoint.PUBLIC_METRICS)
+
+        m.expect([('redpanda_cloud_storage_cache_space_tracker_syncs_total',
+                   lambda a, b: a == expectations.num_syncs == b)])
+
+        m.expect([('redpanda_cloud_storage_cache_space_tracker_size',
+                   lambda a, b: a == expectations.tracker_size == b)])
+
         self._produce_and_quiesce(topic_name, msg_size, data_size,
                                   expect_bandwidth)
 
@@ -436,4 +467,69 @@ class TieredStorageCacheStressTest(RedpandaTest):
         # reduce in number to the point that the read is able to proceed
         usage = admin.get_local_storage_usage(leader_node)
         assert usage[
-            'cloud_storage_cache_objects'] <= cache_object_limit, f"Node {leader_node.name} has unexpectedly many objects {usage['cloud_storage_cache_objects']} > {cache_object_limit}"
+            'cloud_storage_cache_objects'] <= cache_object_limit, \
+            (f"Node {leader_node.name} has unexpectedly many objects "
+             f"{usage['cloud_storage_cache_objects']} > {cache_object_limit}")
+
+        m.expect([('redpanda_cloud_storage_cache_trim_in_mem_trims_total',
+                   lambda a, b: a == 0 and expectations.max_mem_trims >= b >=
+                   expectations.min_mem_trims)])
+        m.expect([('redpanda_cloud_storage_cache_trim_fast_trims_total',
+                   lambda a, b: a == 0 and expectations.max_fast_trims >= b >=
+                   expectations.min_fast_trims)])
+        m.expect([('redpanda_cloud_storage_cache_trim_exhaustive_trims_total',
+                   lambda a, b: a == 0 and expectations.max_exhaustive_trims >=
+                   b >= expectations.min_exhaustive_trims)])
+
+    @cluster(num_nodes=4, log_allow_list=S3_ERROR_LOGS)
+    def garbage_objects_test(self):
+        """
+        Verify that if there are a large number of small files which do not pair
+        with data chunks, we still trim them when cache space is low.
+
+        This test is a reproducer for issues where the cache needs trimming but there
+        are no data objects present to cue the fast trim process to delete indices etc,
+        and we must fall back to exhaustive trim, such as:
+        https://github.com/redpanda-data/redpanda/issues/11835
+        """
+
+        prefill_count = 100
+        expectations = CacheExpectations(
+            num_syncs=1,
+            # The tracker will add all non-index/tx/tmp files during startup sync
+            tracker_size=prefill_count,
+            # Tracker based trim should be enough to acquire space
+            min_mem_trims=1,
+            min_fast_trims=0,
+            max_fast_trims=0,
+            min_exhaustive_trims=0,
+            max_exhaustive_trims=0)
+        self.run_test_with_cache_prefilled(
+            f"mkdir -p {self.redpanda.cache_dir} ; "
+            "for n in `seq 1 {}`; do "
+            f"dd if=/dev/urandom bs=1k count=4 of={self.redpanda.cache_dir}/garbage_$n.bin ; done",
+            prefill_count, expectations)
+
+    @cluster(num_nodes=4, log_allow_list=S3_ERROR_LOGS)
+    def test_indices_dominate_cache(self):
+        """
+        Ensures that if the cache is filled with index and tx objects alone,
+        trimming still works.
+        """
+
+        prefill_count = 100
+        expectations = CacheExpectations(
+            num_syncs=1,
+            # Neither index nor tx files will be added to tracker during startup sync
+            tracker_size=0,
+            # Since orphan index and tx files are only cleaned up in exhaustive trim,
+            # all three trims have to run to acquire space
+            min_mem_trims=1,
+            min_fast_trims=1,
+            min_exhaustive_trims=1)
+        self.run_test_with_cache_prefilled(
+            f"mkdir -pv {self.redpanda.cache_dir}; "
+            "for n in `seq 1 {}`; do "
+            f"touch {self.redpanda.cache_dir}/garbage_$n.index && "
+            f"touch {self.redpanda.cache_dir}/garbage_$n.tx; "
+            "done", prefill_count, expectations)

@@ -11,14 +11,15 @@
 #pragma once
 
 #include "cloud_storage/base_manifest.h"
+#include "cloud_storage/fwd.h"
 #include "cloud_storage/types.h"
+#include "container/fragmented_vector.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
+#include "model/record.h"
 #include "model/timestamp.h"
 #include "segment_meta_cstore.h"
-#include "serde/envelope.h"
-#include "serde/serde.h"
-#include "utils/fragmented_vector.h"
+#include "serde/rw/envelope.h"
 #include "utils/tracking_allocator.h"
 
 #include <seastar/core/iostream.hh>
@@ -42,10 +43,6 @@ struct partition_manifest_path_components {
     operator<<(std::ostream& s, const partition_manifest_path_components& c);
 };
 
-/// Parse partition manifest path and return components
-std::optional<partition_manifest_path_components>
-get_partition_manifest_path_components(const std::filesystem::path& path);
-
 struct segment_name_components {
     model::offset base_offset;
     model::term_id term;
@@ -59,18 +56,8 @@ struct segment_name_components {
 std::optional<segment_name_components>
 parse_segment_name(const segment_name& name);
 
-/// Segment file name in S3
-remote_segment_path generate_remote_segment_path(
-  const model::ntp&,
-  model::initial_revision_id,
-  const segment_name&,
-  model::term_id archiver_term);
-
 /// Generate correct S3 segment name based on term and base offset
 segment_name generate_local_segment_name(model::offset o, model::term_id t);
-
-remote_manifest_path generate_partition_manifest_path(
-  const model::ntp&, model::initial_revision_id, manifest_format);
 
 // This structure can be impelenented
 // to allow access to private fields of the manifest.
@@ -103,6 +90,17 @@ public:
 
         segment_name_format sname_format{segment_name_format::v1};
 
+        auto serde_fields() {
+            return std::tie(
+              ntp_revision,
+              base_offset,
+              committed_offset,
+              archiver_term,
+              segment_term,
+              size_bytes,
+              sname_format);
+        }
+
         auto operator<=>(const lw_segment_meta&) const = default;
 
         static lw_segment_meta convert(const segment_meta& m);
@@ -114,17 +112,11 @@ public:
     using value = segment_meta;
     using segment_map = segment_meta_cstore;
     using spillover_manifest_map = segment_meta_cstore;
-    using replaced_segments_list = std::vector<lw_segment_meta>;
+    using replaced_segments_list = fragmented_vector<lw_segment_meta>;
     using const_iterator = segment_map::const_iterator;
 
     /// Generate segment name to use in the cloud
     static segment_name generate_remote_segment_name(const value& val);
-    /// Generate segment path to use in the cloud
-    static remote_segment_path
-    generate_remote_segment_path(const model::ntp& ntp, const value& val);
-    /// Generate segment path to use locally
-    static local_segment_path
-    generate_local_segment_path(const model::ntp& ntp, const value& val);
 
     /// Create empty manifest that supposed to be updated later
     partition_manifest();
@@ -152,7 +144,12 @@ public:
       model::offset_delta archive_start_offset_delta,
       model::offset archive_clean_offset,
       uint64_t archive_size_bytes,
-      const fragmented_vector<segment_t>& spillover)
+      const fragmented_vector<segment_t>& spillover,
+      model::timestamp last_partition_scrub,
+      std::optional<model::offset> last_scrubbed_offset,
+      anomalies detected_anomalies,
+      model::producer_id highest_producer_id,
+      model::offset last_applied_offset)
       : _ntp(std::move(ntp))
       , _rev(rev)
       , _mem_tracker(std::move(manifest_mem_tracker))
@@ -165,7 +162,12 @@ public:
       , _archive_start_offset_delta(archive_start_offset_delta)
       , _archive_clean_offset(archive_clean_offset)
       , _start_kafka_offset_override(start_kafka_offset)
-      , _archive_size_bytes(archive_size_bytes) {
+      , _archive_size_bytes(archive_size_bytes)
+      , _last_partition_scrub(last_partition_scrub)
+      , _last_scrubbed_offset(last_scrubbed_offset)
+      , _detected_anomalies(std::move(detected_anomalies))
+      , _highest_producer_id(highest_producer_id)
+      , _applied_offset(last_applied_offset) {
         for (auto nm : replaced) {
             auto key = parse_segment_name(nm.name);
             vassert(
@@ -195,26 +197,11 @@ public:
         }
     }
 
-    /// Manifest object name in S3
-    std::pair<manifest_format, remote_manifest_path>
-    get_manifest_format_and_path() const override;
+    virtual remote_manifest_path
+    get_manifest_path(const remote_path_provider&) const;
 
-    remote_manifest_path get_manifest_path(manifest_format fmt) const {
-        switch (fmt) {
-        case manifest_format::json:
-            return get_legacy_manifest_format_and_path().second;
-        case manifest_format::serde:
-            return get_manifest_format_and_path().second;
-        }
-    }
-
-    remote_manifest_path get_manifest_path() const override {
-        return get_manifest_format_and_path().second;
-    }
-
-    /// Manifest object name before feature::cloud_storage_manifest_format_v2
-    std::pair<manifest_format, remote_manifest_path>
-    get_legacy_manifest_format_and_path() const;
+    static ss::sstring filename() { return "manifest.bin"; }
+    virtual ss::sstring get_manifest_filename() const { return filename(); }
 
     /// Get NTP
     const model::ntp& get_ntp() const;
@@ -243,6 +230,10 @@ public:
     /// manifest, start kafka offset override and start offset of the archive.
     std::optional<kafka::offset> full_log_start_kafka_offset() const;
 
+    /// Return start offset that takes into account the STM manifest's start
+    /// and the archive start offsets.
+    std::optional<model::offset> full_log_start_offset() const;
+
     /// Get starting offset of the current manifest (doesn't take into account
     /// spillover manifests)
     std::optional<model::offset> get_start_offset() const;
@@ -260,8 +251,10 @@ public:
     /// Find the earliest segment that has max timestamp >= t
     std::optional<segment_meta> timequery(model::timestamp t) const;
 
-    remote_segment_path generate_segment_path(const segment_meta&) const;
-    remote_segment_path generate_segment_path(const lw_segment_meta&) const;
+    remote_segment_path generate_segment_path(
+      const segment_meta&, const remote_path_provider&) const;
+    remote_segment_path generate_segment_path(
+      const lw_segment_meta&, const remote_path_provider&) const;
 
     /// Return an iterator to the first addressable segment (i.e. base offset
     /// is greater than or equal to the start offset). If no such segment
@@ -280,6 +273,9 @@ public:
     // Return the tracked amount of memory associated with the segments in this
     // manifest, or 0 if the memory is not being tracked.
     size_t segments_metadata_bytes() const;
+
+    // Return very rough estimate of the size of the serialized manifest
+    size_t estimate_serialized_size() const;
 
     /// Return map that contains spillover manifests.
     /// It stores 'segment_meta' objects but the meaning of fields are
@@ -323,12 +319,38 @@ public:
     bool contains(const key& key) const;
     bool contains(const segment_name& name) const;
 
-    /// Add new segment to the manifest
-    bool add(segment_meta meta);
-    bool add(const segment_name& name, const segment_meta& meta);
+    /// Check if the provided offset range matches any segment in the manifest
+    /// exactly.
+    bool segment_with_offset_range_exists(
+      model::offset base, model::offset committed) const;
+
+    struct add_segment_meta_result {
+        // size in bytes of the segment(s) that has been replaced by this
+        // operation (might be 0 for appends)
+        size_t bytes_replaced_range{};
+        // size in bytes of the segment referenced by the input segment_meta
+        size_t bytes_new_range{};
+    };
+
+    /// Add new segment to the manifest.
+    /// Returns the result of the operation,
+    /// in terms of delta of cloud storage size.
+    /// If `meta` causes an append operation, bytes_replaced will be 0,
+    /// and if it causes a replace operation, bytes_replaced will be
+    /// the size of the replaced segments.
+    /// The return value is std::nullopt if `meta` cannot be added.
+    /// Currently this is the case if the remote path for `meta` is the
+    /// same of a segment already in the manifest.
+    /// See safe_segment_meta_to_add()
+    std::optional<add_segment_meta_result> add(segment_meta meta);
+    std::optional<add_segment_meta_result>
+    add(const segment_name& name, const segment_meta& meta);
 
     /// Return 'true' if the segment meta can be added safely
-    bool safe_segment_meta_to_add(const segment_meta& meta);
+    bool safe_segment_meta_to_add(const segment_meta& meta) const;
+    /// Return number of segments (counting from the beginning of the list) that
+    /// can be added safely.
+    size_t safe_segment_meta_to_add(std::vector<segment_meta> list) const;
 
     /// \brief Truncate the manifest (remove entries from the manifest)
     ///
@@ -339,6 +361,9 @@ public:
     /// \return manifest that contains only removed segments
     partition_manifest truncate(model::offset starting_rp_offset);
     partition_manifest truncate();
+
+    /// Clone the entire manifest
+    partition_manifest clone() const;
 
     /// \brief Truncate the manifest (remove entries from the manifest)
     ///
@@ -388,6 +413,15 @@ public:
     /// thought.
     void unsafe_reset();
 
+    /// \brief Use the given producer ID to track the highest used so far by
+    /// this partition.
+    ///
+    /// \returns true if the highest producer ID was moved
+    bool advance_highest_producer_id(model::producer_id);
+    model::producer_id highest_producer_id() const {
+        return _highest_producer_id;
+    }
+
     /// Get segment if available or nullopt
     std::optional<segment_meta> get(const key& key) const;
     std::optional<segment_meta> get(const segment_name& name) const;
@@ -409,12 +443,12 @@ public:
     /// Serialize manifest object
     ///
     /// \return asynchronous input_stream with the serialized json
-    ss::future<serialized_data_stream> serialize() const override;
+    ss::future<iobuf> serialize_buf() const override;
 
     /// Serialize manifest object
     ///
     /// \param out output stream that should be used to output the json
-    void serialize_json(std::ostream& out) const;
+    void serialize_json(std::ostream& out, bool include_segments = true) const;
 
     // Serialize the manifest to an ss::output_stream in JSON format
     /// \param out output stream to serialize into; must be kept alive
@@ -433,14 +467,22 @@ public:
     const_iterator segment_containing(kafka::offset o) const;
 
     // Return collection of segments that were replaced in lightweight format.
-    std::vector<partition_manifest::lw_segment_meta>
+    fragmented_vector<partition_manifest::lw_segment_meta>
     lw_replaced_segments() const;
 
     /// Return collection of segments that were replaced by newer segments.
-    std::vector<segment_meta> replaced_segments() const;
+    fragmented_vector<segment_meta> replaced_segments() const;
 
     /// Return the number of replaced segments currently awaiting deletion.
     size_t replaced_segments_count() const;
+
+    model::timestamp last_partition_scrub() const;
+
+    std::optional<model::offset> last_scrubbed_offset() const;
+
+    const anomalies& detected_anomalies() const;
+
+    void reset_scrubbing_metadata();
 
     /// Removes all replaced segments from the manifest.
     /// Method 'replaced_segments' will return empty value
@@ -476,6 +518,16 @@ public:
 
     kafka::offset get_start_kafka_offset_override() const;
 
+    /// Get offset of the last applied STM command
+    model::offset get_applied_offset() const noexcept {
+        return _applied_offset;
+    }
+
+    /// Advance last applied STM command offset
+    void advance_applied_offset(model::offset o) noexcept {
+        _applied_offset = std::max(_applied_offset, o);
+    }
+
     auto serde_fields() {
         // this list excludes _mem_tracker, which is not serialized
         return std::tie(
@@ -493,7 +545,11 @@ public:
           _archive_clean_offset,
           _start_kafka_offset_override,
           _archive_size_bytes,
-          _spillover_manifests);
+          _spillover_manifests,
+          _last_partition_scrub,
+          _last_scrubbed_offset,
+          _highest_producer_id,
+          _applied_offset);
     }
     auto serde_fields() const {
         // this list excludes _mem_tracker, which is not serialized
@@ -512,7 +568,11 @@ public:
           _archive_clean_offset,
           _start_kafka_offset_override,
           _archive_size_bytes,
-          _spillover_manifests);
+          _spillover_manifests,
+          _last_partition_scrub,
+          _last_scrubbed_offset,
+          _highest_producer_id,
+          _applied_offset);
     }
 
     /// Compare two manifests for equality. Don't compare the mem_tracker.
@@ -524,7 +584,14 @@ public:
 
     iobuf to_iobuf() const;
 
+    void process_anomalies(
+      model::timestamp scrub_timestamp,
+      std::optional<model::offset> last_scrubbed_offset,
+      scrub_status status,
+      anomalies detected);
+
 private:
+    ss::sstring display_name() const;
     std::optional<kafka::offset> compute_start_kafka_offset_local() const;
 
     void set_start_offset(model::offset start_offset);
@@ -605,11 +672,34 @@ private:
     uint64_t _archive_size_bytes{0};
     /// Map of spillover manifests that were uploaded to S3
     spillover_manifest_map _spillover_manifests;
+    // Timestamps at which the last partition scrub completed
+    model::timestamp _last_partition_scrub;
+    // Last offset proccessed in the most recent scrubber run.
+    // Null if the last scrub reached the end of the log.
+    // Note that this offset is not linear. The scrubber will process
+    // each manifest from newest to oldest and the data within each
+    // manifest is processed from oldest to newest.
+    std::optional<model::offset> _last_scrubbed_offset;
 
     // The starting offset for a Kafka batch in the segment that corresponds
     // with `_start_offset`. This value is computed from
     // `compute_start_kafka_offset_local` and is not in the serialized manifest.
     mutable std::optional<kafka::offset> _cached_start_kafka_offset_local;
+
+    anomalies _detected_anomalies;
+
+    // Highest producer ID used by this partition. This gets aggregated across
+    // all partitions during cluster recovery time to determine a new starting
+    // id_allocator ID that is higher than any used so far.
+    model::producer_id _highest_producer_id;
+
+    // Offset of the last applied archival command.
+    // Similar to insync_offset but includes only archival commands. The
+    // insync offset is incremented after processing every batch (even if it's
+    // skipped by the STM).
+    model::offset _applied_offset;
 };
+
+std::ostream& operator<<(std::ostream& o, const partition_manifest& f);
 
 } // namespace cloud_storage

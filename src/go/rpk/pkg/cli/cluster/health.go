@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -40,13 +41,16 @@ following conditions are met:
 		Args: cobra.ExactArgs(0),
 		Run: func(cmd *cobra.Command, _ []string) {
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
-			out.CheckExitCloudAdmin(p)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
+			config.CheckExitCloudAdmin(p)
 
-			cl, err := adminapi.NewClient(fs, p)
+			cl, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
-			var lastOverview adminapi.ClusterHealthOverview
+			// --exit-when-healthy only makes sense with --watch, so we enable
+			// watch if --exit-when-healthy is provided.
+			watch = exit || watch
+			var lastOverview rpadmin.ClusterHealthOverview
 			for {
 				ret, err := cl.GetHealthOverview(cmd.Context())
 				out.MaybeDie(err, "unable to request cluster health: %v", err)
@@ -65,20 +69,41 @@ following conditions are met:
 	p.InstallSASLFlags(cmd)
 
 	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "Blocks and writes out all cluster health changes")
-	cmd.Flags().BoolVarP(&exit, "exit-when-healthy", "e", false, "When used with watch, exits after cluster is back in healthy state")
+	cmd.Flags().BoolVarP(&exit, "exit-when-healthy", "e", false, "Exits when the cluster is back in a healthy state")
 	return cmd
 }
 
-func printHealthOverview(hov *adminapi.ClusterHealthOverview) {
+func printHealthOverview(hov *rpadmin.ClusterHealthOverview) {
 	types.Sort(hov)
 	out.Section("CLUSTER HEALTH OVERVIEW")
-	overviewFormat := `Healthy:                     %v
-Unhealthy reasons:           %v
-Controller ID:               %v
-All nodes:                   %v
-Nodes down:                  %v
-Leaderless partitions:       %v
-Under-replicated partitions: %v
-`
-	fmt.Printf(overviewFormat, hov.IsHealthy, hov.UnhealthyReasons, hov.ControllerID, hov.AllNodes, hov.NodesDown, hov.LeaderlessPartitions, hov.UnderReplicatedPartitions)
+
+	// leaderless partitions and under-replicated counts are available starting
+	// v23.3.
+	lp := "Leaderless partitions:"
+	urp := "Under-replicated partitions:"
+	if hov.LeaderlessCount != nil {
+		lp = fmt.Sprintf("Leaderless partitions (%v):", *hov.LeaderlessCount)
+		if *hov.LeaderlessCount > len(hov.LeaderlessPartitions) {
+			hov.LeaderlessPartitions = append(hov.LeaderlessPartitions, "...truncated")
+		}
+	}
+	if hov.UnderReplicatedCount != nil {
+		urp = fmt.Sprintf("Under-replicated partitions (%v):", *hov.UnderReplicatedCount)
+		if *hov.UnderReplicatedCount > len(hov.UnderReplicatedPartitions) {
+			hov.UnderReplicatedPartitions = append(hov.UnderReplicatedPartitions, "...truncated")
+		}
+	}
+
+	tw := out.NewTable()
+	defer tw.Flush()
+	tw.Print("Healthy:", hov.IsHealthy)
+	tw.Print("Unhealthy reasons:", hov.UnhealthyReasons)
+	tw.Print("Controller ID:", hov.ControllerID)
+	tw.Print("All nodes:", hov.AllNodes)
+	tw.Print("Nodes down:", hov.NodesDown)
+	if hov.NodesInRecoveryMode != nil {
+		tw.Print("Nodes in recovery mode:", hov.NodesInRecoveryMode)
+	}
+	tw.Print(lp, hov.LeaderlessPartitions)
+	tw.Print(urp, hov.UnderReplicatedPartitions)
 }

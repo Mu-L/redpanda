@@ -11,14 +11,15 @@
 #pragma once
 
 #include "cluster/fwd.h"
+#include "metrics/metrics.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "ssx/metrics.h"
 #include "utils/stable_iterator_adaptor.h"
 
 #include <seastar/core/sharded.hh>
 
 #include <absl/container/btree_set.h>
+#include <absl/container/flat_hash_set.h>
 
 namespace cluster {
 
@@ -63,12 +64,16 @@ public:
     /// Called when the replica set of an ntp changes. Note that this doesn't
     /// account for in-progress moves - the function is called only once when
     /// the move is started.
-    void handle_ntp_update(
+    void handle_ntp_move_begin_or_cancel(
       const model::ns&,
       const model::topic&,
       model::partition_id,
       const std::vector<model::broker_shard>& prev,
       const std::vector<model::broker_shard>& next);
+
+    void handle_ntp_move_finish(
+      const model::ntp& ntp, const std::vector<model::broker_shard>& replicas);
+    void handle_ntp_delete(const model::ntp& ntp);
 
     void add_node_to_rebalance(model::node_id id) {
         _nodes_to_rebalance.insert(id);
@@ -86,11 +91,11 @@ private:
     struct probe {
         explicit probe(const partition_balancer_state&);
 
-        void setup_metrics(ssx::metrics::metric_groups&);
+        void setup_metrics(metrics::metric_groups_base&);
 
         const partition_balancer_state& _parent;
-        ssx::metrics::metric_groups _metrics;
-        ssx::metrics::metric_groups _public_metrics;
+        metrics::internal_metric_groups _metrics;
+        metrics::public_metric_groups _public_metrics;
     };
 
 private:

@@ -13,15 +13,13 @@
 
 #include "cluster/types.h"
 #include "compat/check.h"
+#include "compat/cluster_json.h"
 #include "compat/get_node_health_generator.h"
 #include "compat/json.h"
 
 namespace compat {
 
-GEN_COMPAT_CHECK_SERDE_ONLY(
-  cluster::get_node_health_request,
-  { json_write(filter); },
-  { json_read(filter); });
+EMPTY_COMPAT_CHECK_SERDE_ONLY(cluster::get_node_health_request);
 
 template<>
 struct compat_check<cluster::get_node_health_reply> {
@@ -47,7 +45,7 @@ struct compat_check<cluster::get_node_health_reply> {
 
     static std::vector<compat_binary>
     to_binary(cluster::get_node_health_reply obj) {
-        return {compat_binary::serde(obj)};
+        return {compat_binary::serde(std::move(obj))};
     }
 
     static void

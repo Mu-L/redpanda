@@ -12,7 +12,10 @@ package config
 import (
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
+	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -50,25 +53,46 @@ func newSetCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 This command is provided for use in scripts.  For interactive editing, or bulk
 changes, use the 'edit' and 'import' commands respectively.
 
+You may also use <key>=<value> notation for setting configuration properties:
+
+  rpk cluster config set log_retention_ms=-1
+
 If an empty string is given as the value, the property is reset to its default.`,
-		Args: cobra.ExactArgs(2),
+		Args: cobra.MinimumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			key := args[0]
-			value := args[1]
+			var key, value string
+			if len(args) == 1 && strings.Contains(args[0], "=") {
+				kv := strings.SplitN(args[0], "=", 2)
+				key, value = kv[0], kv[1]
+			} else if len(args) == 2 {
+				key, value = args[0], args[1]
+			} else {
+				out.Die("invalid arguments: %v, please use one of 'rpk cluster config set <key> <value>' or 'rpk cluster config set <key>=<value>'", args)
+			}
 
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
-			out.CheckExitCloudAdmin(p)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
+			config.CheckExitCloudAdmin(p)
 
-			client, err := adminapi.NewClient(fs, p)
+			client, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			schema, err := client.ClusterConfigSchema(cmd.Context())
 			out.MaybeDie(err, "unable to query config schema: %v", err)
 
 			meta, ok := schema[key]
+
 			if !ok {
-				out.Die("Unknown property %q", key)
+				// loop over schema, try to find key in the Aliases,
+				for _, v := range schema {
+					if slices.Contains(v.Aliases, key) {
+						meta, ok = v, true
+						break
+					}
+				}
+				if !ok {
+					out.Die("Unknown property %q", key)
+				}
 			}
 
 			upsert := make(map[string]interface{})
@@ -99,7 +123,7 @@ If an empty string is given as the value, the property is reset to its default.`
 			}
 
 			result, err := client.PatchClusterConfig(cmd.Context(), upsert, remove)
-			if he := (*adminapi.HTTPResponseError)(nil); errors.As(err, &he) {
+			if he := (*rpadmin.HTTPResponseError)(nil); errors.As(err, &he) {
 				// Special case 400 (validation) errors with friendly output
 				// about which configuration properties were invalid.
 				if he.Response.StatusCode == 400 {

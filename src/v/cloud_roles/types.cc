@@ -59,8 +59,20 @@ std::ostream& operator<<(std::ostream& os, const aws_credentials& ac) {
     return os;
 }
 
-std::ostream& operator<<(std::ostream& os, const credentials& c) {
-    ss::visit(c, [&os](auto creds) { os << creds; });
+std::ostream& operator<<(std::ostream& os, const abs_credentials& ac) {
+    fmt::print(
+      os,
+      "abs_credentials{{storage_account: **{}**, shared_key: **{}**}}",
+      ac.storage_account().size(),
+      ac.shared_key().size());
+    return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const abs_oauth_credentials& ac) {
+    fmt::print(
+      os,
+      "abs_oauth_credentials{{oauth_token:**{}**}}",
+      ac.oauth_token().size());
     return os;
 }
 
@@ -69,6 +81,16 @@ operator<<(std::ostream& os, const api_response_parse_error& err) {
     fmt::print(os, "api_response_parse_error{{reason:{}}}", err.reason);
     return os;
 }
+
+// tmp trick to ensure that we are not calling into infinite recursion if
+// there is a new credential but no operator<<
+template<std::same_as<credentials> Cred>
+std::ostream& operator<<(std::ostream& os, const Cred& c) {
+    ss::visit(c, [&os](const auto& creds) { os << creds; });
+    return os;
+}
+
+template std::ostream& operator<<(std::ostream& os, const credentials& c);
 
 bool is_retryable(const std::system_error& ec) {
     auto code = ec.code();
@@ -92,9 +114,13 @@ api_request_error make_abort_error(const std::exception& ex) {
     };
 }
 
-api_request_error make_abort_error(ss::sstring reason) {
+api_request_error
+make_abort_error(ss::sstring reason, boost::beast::http::status status) {
     return api_request_error{
-      .reason = reason, .error_kind = api_request_error_kind::failed_abort};
+      .status = status,
+      .reason = reason,
+      .error_kind = api_request_error_kind::failed_abort,
+    };
 }
 
 api_request_error make_retryable_error(const std::exception& ex) {
@@ -104,9 +130,12 @@ api_request_error make_retryable_error(const std::exception& ex) {
     };
 }
 
-api_request_error make_retryable_error(ss::sstring reason) {
+api_request_error
+make_retryable_error(ss::sstring reason, boost::beast::http::status status) {
     return api_request_error{
-      .reason = reason, .error_kind = api_request_error_kind::failed_retryable};
+      .status = status,
+      .reason = reason,
+      .error_kind = api_request_error_kind::failed_retryable};
 }
 
 } // namespace cloud_roles

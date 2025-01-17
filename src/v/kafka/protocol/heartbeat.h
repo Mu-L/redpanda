@@ -10,12 +10,11 @@
  */
 
 #pragma once
+#include "base/seastarx.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/heartbeat_request.h"
 #include "kafka/protocol/schemata/heartbeat_response.h"
-#include "kafka/types.h"
 #include "model/fundamental.h"
-#include "seastarx.h"
 
 #include <seastar/core/future.hh>
 
@@ -52,8 +51,8 @@ struct heartbeat_response final {
 
     explicit heartbeat_response(error_code error)
       : data({
-        .error_code = error,
-      }) {}
+          .error_code = error,
+        }) {}
 
     heartbeat_response(const heartbeat_request&, error_code error)
       : heartbeat_response(error) {}

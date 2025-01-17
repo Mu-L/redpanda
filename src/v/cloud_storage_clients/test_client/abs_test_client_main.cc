@@ -8,13 +8,14 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
+#include "base/seastarx.h"
+#include "base/vlog.h"
 #include "bytes/iobuf.h"
+#include "cloud_roles/refresh_credentials.h"
 #include "cloud_roles/types.h"
 #include "cloud_storage_clients/abs_client.h"
 #include "http/client.h"
-#include "seastarx.h"
 #include "syschecks/syschecks.h"
-#include "vlog.h"
 
 #include <seastar/core/app-template.hh>
 #include <seastar/core/file.hh>
@@ -37,13 +38,14 @@
 #include <boost/optional/optional.hpp>
 #include <boost/outcome/detail/value_storage.hpp>
 #include <boost/system/system_error.hpp>
-#include <gnutls/gnutls.h>
 
 #include <chrono>
 #include <exception>
 #include <optional>
 #include <stdexcept>
 #include <string>
+
+using namespace std::chrono_literals;
 
 static ss::logger test_log{"test"};
 
@@ -65,15 +67,17 @@ void cli_opts(boost::program_options::options_description_easy_init opt) {
       po::value<std::string>()->default_value("test-container"),
       "ABS Container");
 
-    opt(
-      "shared-key",
-      po::value<std::string>()->default_value(""),
-      "ABS Shared Key");
+    opt("shared-key", po::value<std::string>(), "ABS Shared Key");
 
     opt(
-      "in",
-      po::value<std::string>()->default_value(""),
-      "file to read data for ABS blob");
+      "client-id",
+      po::value<std::string>(),
+      "Azure vm user-assigned managed identity for ABS"),
+
+      opt(
+        "in",
+        po::value<std::string>()->default_value(""),
+        "file to read data for ABS blob");
 
     opt(
       "out",
@@ -97,6 +101,7 @@ void cli_opts(boost::program_options::options_description_easy_init opt) {
     opt("port", po::value<uint16_t>(), "alternative port for the api endpoint");
 
     opt("disable-tls", "disable tls for this connection");
+    opt("hns-enabled", "HNS enabled for the storage account");
 }
 
 struct test_conf {
@@ -106,6 +111,7 @@ struct test_conf {
     std::vector<cloud_storage_clients::object_key> blobs;
 
     cloud_storage_clients::abs_configuration client_cfg;
+    std::optional<ss::sstring> managed_identity_client_id;
 
     std::string in;
     std::string out;
@@ -131,8 +137,16 @@ struct fmt::formatter<test_conf> : public fmt::formatter<std::string_view> {
 };
 
 test_conf cfg_from(boost::program_options::variables_map& m) {
-    auto shared_key = cloud_roles::private_key_str(
-      m["shared-key"].as<std::string>());
+    auto maybe_shared_key
+      = m.contains("shared-key")
+          ? std::optional<cloud_roles::private_key_str>{m["shared-key"]
+                                                          .as<std::string>()}
+          : std::optional<cloud_roles::private_key_str>{std::nullopt};
+    auto maybe_client_id
+      = m.contains("client-id")
+          ? std::optional<ss::sstring>{m["client-id"].as<std::string>()}
+          : std::optional<ss::sstring>{std::nullopt};
+
     auto storage_acc = cloud_roles::storage_account(
       m["storage-account"].as<std::string>());
     auto container = cloud_storage_clients::bucket_name(
@@ -146,7 +160,7 @@ test_conf cfg_from(boost::program_options::variables_map& m) {
 
     cloud_storage_clients::abs_configuration client_cfg
       = cloud_storage_clients::abs_configuration::make_configuration(
-          shared_key,
+          maybe_shared_key,
           storage_acc,
           cloud_storage_clients::default_overrides{
             .endpoint =
@@ -165,7 +179,10 @@ test_conf cfg_from(boost::program_options::variables_map& m) {
             }(),
             .disable_tls = m.contains("disable-tls") > 0,
           })
-          .get0();
+          .get();
+    if (m.contains("hns-enabled")) {
+        client_cfg.is_hns_enabled = true;
+    }
     vlog(test_log.info, "connecting to {}", client_cfg.server_addr);
     return test_conf{
       .storage_account = storage_acc,
@@ -178,12 +195,13 @@ test_conf cfg_from(boost::program_options::variables_map& m) {
               keys.begin(),
               keys.end(),
               std::back_inserter(out),
-              [](auto const& ks) {
+              [](const auto& ks) {
                   return cloud_storage_clients::object_key(ks);
               });
             return out;
         }(),
       .client_cfg = std::move(client_cfg),
+      .managed_identity_client_id = maybe_client_id,
       .in = m["in"].as<std::string>(),
       .out = m["out"].as<std::string>(),
       .delete_blob = m.count("delete") > 0,
@@ -194,8 +212,8 @@ test_conf cfg_from(boost::program_options::variables_map& m) {
 // TODO(vlad): factor this out
 static std::pair<ss::input_stream<char>, uint64_t>
 get_input_file_as_stream(const std::filesystem::path& path) {
-    auto file = ss::open_file_dma(path.native(), ss::open_flags::ro).get0();
-    auto size = file.size().get0();
+    auto file = ss::open_file_dma(path.native(), ss::open_flags::ro).get();
+    auto size = file.size().get();
     return std::make_pair(ss::make_file_input_stream(std::move(file), 0), size);
 }
 
@@ -213,13 +231,18 @@ make_credentials(const cloud_storage_clients::abs_configuration& cfg) {
       cloud_roles::make_credentials_applier(cloud_roles::abs_credentials{
         cfg.storage_account_name, cfg.shared_key.value()}));
 }
+static ss::lw_shared_ptr<cloud_roles::apply_credentials>
+make_credentials(cloud_roles::credentials creds) {
+    return ss::make_lw_shared(
+      cloud_roles::make_credentials_applier(std::move(creds)));
+}
 
 static ss::output_stream<char>
 get_output_file_as_stream(const std::filesystem::path& path) {
     auto file = ss::open_file_dma(
                   path.native(), ss::open_flags::rw | ss::open_flags::create)
-                  .get0();
-    return ss::make_file_output_stream(std::move(file)).get0();
+                  .get();
+    return ss::make_file_output_stream(std::move(file)).get();
 }
 
 int main(int args, char** argv, char** env) {
@@ -236,8 +259,58 @@ int main(int args, char** argv, char** env) {
             cloud_storage_clients::abs_configuration abs_cfg = lcfg.client_cfg;
             vlog(test_log.info, "config:{}", lcfg);
             vlog(test_log.info, "constructing client");
-            auto credentials_applier = make_credentials(abs_cfg);
-            client.start(abs_cfg, credentials_applier).get();
+            if (abs_cfg.shared_key.has_value()) {
+                auto credentials_applier = make_credentials(abs_cfg);
+                client.start(abs_cfg, credentials_applier).get();
+            } else {
+                auto cred_src = model::cloud_credentials_source{};
+                if (lcfg.managed_identity_client_id.has_value()) {
+                    // try to get an oauth token from IMDSv2 on Azure VM via
+                    // user-assigned managed identity set client-id for
+                    // refresher
+                    config::shard_local_cfg()
+                      .cloud_storage_azure_managed_identity_id.set_value(
+                        lcfg.managed_identity_client_id);
+                    cred_src = model::cloud_credentials_source::
+                      azure_vm_instance_metadata;
+                } else {
+                    // try AKS OIDC authentication (available only inside azure
+                    // kubernetes)
+                    cred_src = model::cloud_credentials_source::
+                      azure_aks_oidc_federation;
+                }
+                // create and start a refresher
+                auto as = ss::abort_source{};
+                auto creds = std::optional<cloud_roles::credentials>{};
+                auto refresher = cloud_roles::make_refresh_credentials(
+                  cred_src,
+                  as,
+                  [&](cloud_roles::credentials c) {
+                      creds = std::move(c);
+                      return ss::now();
+                  },
+                  {});
+                refresher.start();
+
+                // wait for data to be available
+                auto start = ss::lowres_clock::now();
+                while (ss::lowres_clock::now() < start + 20s) {
+                    if (creds.has_value()) {
+                        break;
+                    }
+                    ss::sleep(1s).get();
+                }
+
+                vassert(
+                  creds.has_value(),
+                  "failed to get oauth token from Azure VM via user-assigned "
+                  "managed identity");
+                as.abort_requested();
+                refresher.stop().get();
+
+                client.start(abs_cfg, make_credentials(creds.value())).get();
+            }
+
             vlog(test_log.info, "connecting");
             client
               .invoke_on(
@@ -254,7 +327,7 @@ int main(int args, char** argv, char** env) {
                                                 lcfg.container,
                                                 lcfg.blobs.front(),
                                                 http::default_connect_timeout)
-                                              .get0();
+                                              .get();
                         if (result) {
                             auto resp = result.value()->as_input_stream();
                             vlog(test_log.info, "response: OK");
@@ -281,7 +354,7 @@ int main(int args, char** argv, char** env) {
                                                 payload_size,
                                                 std::move(payload),
                                                 http::default_connect_timeout)
-                                              .get0();
+                                              .get();
                         if (!result) {
                             vlog(
                               test_log.error,

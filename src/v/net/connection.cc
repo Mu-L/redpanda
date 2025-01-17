@@ -9,12 +9,16 @@
 
 #include "net/connection.h"
 
+#include "base/seastarx.h"
 #include "net/exceptions.h"
-#include "rpc/service.h"
+#include "net/types.h"
+#include "ssx/abort_source.h"
 
 #include <seastar/core/future.hh>
+#include <seastar/net/tls.hh>
 
-#include <gnutls/gnutls.h>
+#include <exception>
+#include <system_error>
 
 namespace net {
 
@@ -24,25 +28,27 @@ namespace net {
  * indirectly as errors from the TLS layer.
  */
 bool is_reconnect_error(const std::system_error& e) {
-    auto v = e.code().value();
+    const auto v = e.code().value();
+    static const std::array ss_tls_reconnect_errors{
+      ss::tls::ERROR_PUSH,
+      ss::tls::ERROR_PULL,
+      ss::tls::ERROR_UNEXPECTED_PACKET,
+      ss::tls::ERROR_INVALID_SESSION,
+      ss::tls::ERROR_UNSUPPORTED_VERSION,
+      ss::tls::ERROR_NO_CIPHER_SUITES,
+      ss::tls::ERROR_PREMATURE_TERMINATION,
+      ss::tls::ERROR_DECRYPTION_FAILED,
+      ss::tls::ERROR_MAC_VERIFY_FAILED,
+      ss::tls::ERROR_WRONG_VERSION_NUMBER,
+      ss::tls::ERROR_HTTP_REQUEST,
+      ss::tls::ERROR_HTTPS_PROXY_REQUEST};
 
-    // The name() of seastar's gnutls_error_category class
-    constexpr std::string_view gnutls_category_name{"GnuTLS"};
-
-    if (e.code().category().name() == gnutls_category_name) {
-        switch (v) {
-        case GNUTLS_E_PUSH_ERROR:
-        case GNUTLS_E_PULL_ERROR:
-        case GNUTLS_E_UNEXPECTED_PACKET:
-        case GNUTLS_E_INVALID_SESSION:
-        case GNUTLS_E_UNSUPPORTED_VERSION_PACKET:
-        case GNUTLS_E_NO_CIPHER_SUITES:
-        case GNUTLS_E_PREMATURE_TERMINATION:
-            return true;
-        default:
-            return false;
-        }
-    } else {
+    if (e.code().category() == ss::tls::error_category()) {
+        return absl::c_any_of(
+          ss_tls_reconnect_errors, [v](int ec) { return v == ec; });
+    } else if (
+      e.code().category() == std::system_category()
+      || e.code().category() == std::generic_category()) {
         switch (v) {
         case ECONNREFUSED:
         case ENETUNREACH:
@@ -52,10 +58,17 @@ bool is_reconnect_error(const std::system_error& e) {
         case ECONNABORTED:
         case EAGAIN:
         case EPIPE:
+        case EHOSTUNREACH:
+        case EHOSTDOWN:
+        case ENETRESET:
+        case ENETDOWN:
             return true;
         default:
             return false;
         }
+    } else {
+        // We don't know what the error category is at this point
+        return false;
     }
     __builtin_unreachable();
 }
@@ -69,8 +82,8 @@ bool is_reconnect_error(const std::system_error& e) {
  */
 std::optional<ss::sstring> is_disconnect_exception(std::exception_ptr e) {
     try {
-        rethrow_exception(e);
-    } catch (std::system_error& e) {
+        std::rethrow_exception(e);
+    } catch (const std::system_error& e) {
         if (is_reconnect_error(e)) {
             return e.code().message();
         }
@@ -80,15 +93,20 @@ std::optional<ss::sstring> is_disconnect_exception(std::exception_ptr e) {
         // Happens on unclean client disconnect, when io_iterator_consumer
         // gets fewer bytes than it wanted
         return "short read";
-    } catch (const rpc::rpc_internal_body_parsing_exception&) {
+    } catch (const net::parsing_exception& e) {
         // Happens on unclean client disconnect, typically wrapping
-        // an out_of_range
-        return "parse error";
+        // an out_of_range.
+        // Also raised from the kafka protocol layer on bad header
+        return ssx::sformat("parse error: {}", e.what());
     } catch (const invalid_request_error& e) {
         if (std::strlen(e.what())) {
             return fmt::format("invalid request: {}", e.what());
         }
         return "invalid request";
+    } catch (const ssx::connection_aborted_exception&) {
+        return "connection aborted";
+    } catch (const ssx::shutdown_requested_exception&) {
+        return "shutdown requested";
     } catch (const ss::nested_exception& e) {
         if (auto err = is_disconnect_exception(e.inner)) {
             return err;
@@ -106,7 +124,7 @@ std::optional<ss::sstring> is_disconnect_exception(std::exception_ptr e) {
 
 bool is_auth_error(std::exception_ptr e) {
     try {
-        rethrow_exception(e);
+        std::rethrow_exception(e);
     } catch (const authentication_exception& e) {
         return true;
     } catch (...) {
@@ -122,14 +140,19 @@ connection::connection(
   ss::connected_socket f,
   ss::socket_address a,
   server_probe& p,
-  std::optional<size_t> in_max_buffer_size)
+  std::optional<size_t> in_max_buffer_size,
+  bool tls_enabled,
+  ss::logger* log)
   : addr(a)
   , _hook(hook)
   , _name(std::move(name))
   , _fd(std::move(f))
+  , _local_addr(_fd.local_address())
   , _in(_fd.input())
   , _out(_fd.output())
-  , _probe(p) {
+  , _probe(p)
+  , _tls_enabled(tls_enabled)
+  , _log(log) {
     if (in_max_buffer_size.has_value()) {
         auto in_config = ss::connected_socket_input_stream_config{};
         in_config.max_buffer_size = in_max_buffer_size.value();
@@ -149,7 +172,7 @@ void connection::shutdown_input() {
         _fd.shutdown_input();
     } catch (...) {
         _probe.connection_close_error();
-        rpc::rpclog.debug(
+        _log->debug(
           "Failed to shutdown connection: {}", std::current_exception());
     }
 }

@@ -16,7 +16,7 @@ from rptest.services.admin import Admin
 from rptest.util import wait_until_result
 from rptest.utils.mode_checks import skip_debug_mode
 from rptest.clients.default import DefaultClient
-from rptest.services.redpanda import make_redpanda_service, CHAOS_LOG_ALLOW_LIST, MetricsEndpoint
+from rptest.services.redpanda import SISettings, make_redpanda_service, CHAOS_LOG_ALLOW_LIST, MetricsEndpoint
 from rptest.services.failure_injector import make_failure_injector, FailureSpec
 from rptest.services.admin_ops_fuzzer import AdminOperationsFuzzer
 from rptest.services.kgo_verifier_services import KgoVerifierProducer
@@ -658,8 +658,8 @@ class PartitionBalancerTest(PartitionBalancerService):
                 "health_monitor_max_metadata_age": 3000,
                 "log_segment_size": 104857600,  # 100 MiB
                 "retention_local_target_capacity_percent": 100.0,
-                "disk_reservation_percent": 0.0,
-                "retention_local_trim_interval": 3000
+                "retention_local_trim_interval": 3000,
+                "disk_reservation_percent": 0.0
             },
             environment={"__REDPANDA_TEST_DISK_SIZE": disk_size})
 
@@ -722,6 +722,12 @@ class PartitionBalancerTest(PartitionBalancerService):
             nonlocal ready_appeared_at
             if s["status"] == "ready":
                 if ready_appeared_at is None:
+                    # Disable leader balancer after partition balancer has finished its work,
+                    # because leadership transfers will create new segments that can cause disk
+                    # usage to go over limit again even after we've verified that everything
+                    # is stable.
+                    self.redpanda.set_cluster_config(
+                        {"enable_leader_balancer": False})
                     ready_appeared_at = time.time()
                 else:
                     # ready status is stable for 11 seconds, should be enough for 3 ticks to pass
@@ -742,19 +748,170 @@ class PartitionBalancerTest(PartitionBalancerService):
             # and partition balancing is not invoked yet
             assert used_ratio < 0.81
 
+    @cluster(num_nodes=6, log_allow_list=CHAOS_LOG_ALLOW_LIST)
+    def test_nodes_with_reclaimable_space(self):
+        """
+        Test partition balancer cooperation with space management policy
+        """
+
+        skip_reason = None
+        if not self.test_context.globals.get('use_xfs_partitions', False):
+            skip_reason = "looks like we are not using separate partitions for each node"
+        elif os.environ.get('BUILD_TYPE', None) == 'debug':
+            skip_reason = "debug builds are too slow"
+
+        if skip_reason:
+            self.logger.warn("skipping test: " + skip_reason)
+            # avoid the "Test requested 6 nodes, used only 0" error
+            self.redpanda = make_redpanda_service(self.test_context, 0)
+            self.test_context.cluster.alloc(ClusterSpec.simple_linux(6))
+            return
+        si_settings = None
+        segment_size = 5 * 1024 * 1024  # 5MB
+        disk_size = 10 * 1024 * 1024 * 1024  # 10GB
+        partition_count = 30
+
+        # configure local retention to be below the balancer threshold
+        local_retention_percents = 50
+        local_retention_bytes = int(
+            (disk_size * (local_retention_percents / 100.0)) / partition_count)
+
+        si_settings = SISettings(
+            test_context=self.test_context,
+            log_segment_size=segment_size,
+            cloud_storage_segment_max_upload_interval_sec=5,
+            cloud_storage_manifest_max_upload_interval_sec=3,
+            cloud_storage_cache_size=1024 * 1024 * 1024,
+            retention_local_strict=False)
+
+        self.start_redpanda(
+            num_nodes=5,
+            extra_rp_conf={
+                "storage_min_free_bytes": 10 * 1024 * 1024,
+                "raft_learner_recovery_rate": 100_000_000,
+                "health_monitor_max_metadata_age": 3000,
+                "log_segment_size": segment_size,
+                "retention_local_trim_interval": 100,
+                # add disk reservation to buffer
+                "disk_reservation_percent": 20.0,
+                "partition_autobalancing_max_disk_usage_percent": 70,
+                'retention_local_target_capacity_percent': 100,
+                'storage_space_alert_free_threshold_percent': 0,
+                "retention_local_strict": False,
+                "partition_autobalancing_mode": "off"
+            },
+            environment={"__REDPANDA_TEST_DISK_SIZE": disk_size},
+            si_settings=si_settings)
+
+        self.topic = TopicSpec(partition_count=partition_count)
+        self.topic.redpanda_remote_read = True
+        self.topic.redpanda_remote_write = True
+        self.client().create_topic(self.topic)
+        self.client().alter_topic_config(
+            self.topic.name, TopicSpec.PROPERTY_RETENTION_LOCAL_TARGET_BYTES,
+            local_retention_bytes)
+
+        def get_avg_disk_usage():
+            node_disk_sizes = {
+                n.account.hostname: self.redpanda.get_node_disk_usage(n)
+                for n in self.redpanda.nodes
+            }
+
+            for n, sz in node_disk_sizes.items():
+                self.logger.info(
+                    f"node: {n} used disk size: {sz/(1024*1024):.2f} MB, usage: {100.0*sz/disk_size:.2f} %"
+                )
+
+            return sum(node_disk_sizes.values()) / len(
+                self.redpanda.nodes) / disk_size
+
+        msg_size = 102_400
+        produce_batch_size = ceil(disk_size / msg_size / 30)
+        # produce up to 80 percentes of disk used
+        while get_avg_disk_usage() < 0.79:
+            producer = KgoVerifierProducer(self.test_context,
+                                           self.redpanda,
+                                           self.topic,
+                                           msg_size=msg_size,
+                                           msg_count=produce_batch_size)
+            producer.start(clean=False)
+            producer.wait_for_acks(produce_batch_size,
+                                   timeout_sec=120,
+                                   backoff_sec=5)
+            producer.stop()
+            producer.free()
+
+        def print_disk_usage_per_node():
+            for n in self.redpanda.nodes:
+                disk_usage = self.redpanda.get_node_disk_usage(n)
+                self.logger.info(
+                    f"node {self.redpanda.idx(n)}: "
+                    f"disk used percentage: {int(100.0 * disk_usage/disk_size)}"
+                )
+
+        # turn the partition balancer on
+        self.redpanda.set_cluster_config(
+            {"partition_autobalancing_mode": "continuous"})
+
+        # Wait until the balancer is active and stable for a few ticks in a row
+        ready_appeared_at = None
+
+        # even tho the disk size is above the balancer threshold there should be enough reclaimable space that the balancer remains inactive
+        def is_ready_and_stable(s):
+            print_disk_usage_per_node()
+            nonlocal ready_appeared_at
+            if s["status"] == "ready":
+                if ready_appeared_at is None:
+                    # Disable leader balancer after partition balancer has finished its work,
+                    # because leadership transfers will create new segments that can cause disk
+                    # usage to go over limit again even after we've verified that everything
+                    # is stable.
+                    self.redpanda.set_cluster_config(
+                        {"enable_leader_balancer": False})
+                    ready_appeared_at = time.time()
+                else:
+                    # ready status is stable for 11 seconds, should be enough for 3 ticks to pass
+                    return time.time() - ready_appeared_at > 11.0
+            else:
+                ready_appeared_at = None
+
+        self.wait_until_status(is_ready_and_stable)
+        # check the partition balancer can still work with the disk
+        # having reclaimable space but no free space
+        with self.NodeStopper(self) as ns:
+            ns.make_unavailable(random.choice(self.redpanda.nodes),
+                                failure_types=[FailureSpec.FAILURE_KILL])
+
+            # Wait until the balancer manages to move partitions from the killed node.
+            def is_in_progress(s):
+                print_disk_usage_per_node()
+                return s["status"] == "in_progress"
+
+            self.wait_until_status(is_in_progress)
+
+            def is_ready(s):
+                print_disk_usage_per_node()
+                return s["status"] == "ready"
+
+            self.wait_until_status(is_ready)
+            self.check_no_replicas_on_node(ns.cur_failure.node)
+
+            # bring failed node up
+            ns.make_available()
+
+        self.wait_until_status(is_ready_and_stable)
+
     @skip_debug_mode
     @cluster(num_nodes=7, log_allow_list=CHAOS_LOG_ALLOW_LIST)
     @matrix(kill_same_node=[True, False])
     def test_maintenance_mode(self, kill_same_node):
         """
-        Test interaction with maintenance mode: the balancer should not schedule
-        any movements as long as there is a node in maintenance mode.
+        Test interaction with maintenance mode: the mode should not interfere
+        with partition balancer.
         Test scenario is as follows:
         * enable maintenance mode on some node
         * kill a node (the same or some other)
-        * check that we don't move any partitions and node switched to maintenance
-          mode smoothly
-        * turn maintenance mode off, check that partition balancing resumes
+        * check that balancing works
         """
         self.start_redpanda(num_nodes=5)
 
@@ -773,7 +930,7 @@ class PartitionBalancerTest(PartitionBalancerService):
         node_id = self.redpanda.idx(node)
 
         rpk = RpkTool(self.redpanda)
-        admin = Admin(self.redpanda)
+        admin = Admin(self.redpanda, retry_codes=[503, 504])
 
         rpk.cluster_maintenance_enable(node, wait=True)
         # the node should now report itself in maintenance mode
@@ -798,7 +955,6 @@ class PartitionBalancerTest(PartitionBalancerService):
                 ])
 
             ns.make_unavailable(to_kill)
-            self.wait_until_status(lambda s: s["status"] == "stalled")
 
             if kill_same_node:
                 ns.make_available()
@@ -807,8 +963,6 @@ class PartitionBalancerTest(PartitionBalancerService):
                        timeout_sec=120,
                        backoff_sec=10)
 
-            # return back to normal
-            rpk.cluster_maintenance_disable(node)
             # use raw admin interface to avoid waiting for the killed node
             admin.patch_cluster_config(
                 {"raft_learner_recovery_rate": 100_000_000})
@@ -988,3 +1142,123 @@ class PartitionBalancerTest(PartitionBalancerService):
                                          target_id=transfer_to_idx)
 
             self.wait_until_ready()
+
+    @skip_debug_mode
+    @cluster(num_nodes=7, log_allow_list=CHAOS_LOG_ALLOW_LIST)
+    def test_recovery_mode_rebalance_finish(self):
+        """
+        Test that rebalancing on node add correctly finishes
+        if some (but not all) nodes were in recovery mode.
+        """
+
+        # start first 3 nodes and create some partitions on them
+        self.start_redpanda(num_nodes=5,
+                            num_started_nodes=3,
+                            new_bootstrap=True)
+        self.topic = TopicSpec(partition_count=50)
+        self.client().create_topic(self.topic)
+
+        self.start_producer(1)
+        self.start_consumer(1)
+        self.await_startup()
+
+        # restart seed nodes in recovery mode
+        seed_nodes = self.redpanda.nodes[:3]
+        self.redpanda.restart_nodes(
+            seed_nodes,
+            auto_assign_node_id=True,
+            omit_seeds_on_idx_one=False,
+            override_cfg_params={"recovery_mode_enabled": True})
+
+        # add 2 more nodes and make sure the balancer runs on one of them
+        # (it can't run on seed nodes because of recovery mode)
+        joiner_nodes = self.redpanda.nodes[3:]
+        for node in joiner_nodes:
+            self.redpanda.start_node(node,
+                                     auto_assign_node_id=True,
+                                     omit_seeds_on_idx_one=False)
+        self.redpanda.wait_for_membership(first_start=False)
+
+        admin = Admin(self.redpanda)
+
+        admin.transfer_leadership_to(namespace='redpanda',
+                                     topic='controller',
+                                     partition=0,
+                                     target_id=self.redpanda.node_id(
+                                         joiner_nodes[0]))
+
+        # the balancer will stall because not all partitions are moveable
+        self.wait_until_status(lambda s: s["status"] == "stalled")
+
+        # restart seed nodes in normal mode
+        self.redpanda.restart_nodes(seed_nodes, auto_assign_node_id=True)
+        self.redpanda.wait_for_membership(first_start=False)
+
+        self.wait_until_ready()
+
+        # check that partition counts are balanced
+        partition_counts = [
+            len(admin.get_partitions(node=n)) for n in self.redpanda.nodes
+        ]
+        self.logger.info(f"partition counts: {partition_counts}")
+        avg = sum(partition_counts) / len(partition_counts)
+        assert all(abs(c - avg) / avg < 0.05 for c in partition_counts), \
+            "partition counts not balanced"
+
+        self.run_validation(consumer_timeout_sec=CONSUMER_TIMEOUT)
+
+    @cluster(num_nodes=7, log_allow_list=CHAOS_LOG_ALLOW_LIST)
+    @matrix(disable_license=[True, False])
+    def test_partition_autobalancer_sanction(self, disable_license):
+        def partitions_in_node(node_id):
+            return self.node2partition_count().get(node_id, 0)
+
+        if disable_license:
+            environment = dict(__REDPANDA_DISABLE_BUILTIN_TRIAL_LICENSE='1')
+        else:
+            environment = dict()
+
+        self.start_redpanda(num_nodes=5, environment=environment)
+
+        self.topic = TopicSpec(partition_count=20)
+        self.client().create_topic(self.topic)
+
+        self.start_producer(1)
+        self.start_consumer(1)
+        self.await_startup()
+
+        with self.NodeStopper(self) as ns:
+            to_kill = random.choice(self.redpanda.nodes)
+
+            kill_id = int(self.redpanda.node_id(to_kill))
+            partitions_in_node_before = partitions_in_node(kill_id)
+            assert partitions_in_node_before != 0, f"Invalid Setup: Initial node partitions is \"{partitions_in_node_before}\""
+
+            ns.make_unavailable(to_kill,
+                                failure_types=[FailureSpec.FAILURE_KILL])
+
+            time.sleep(30)
+
+            admin = Admin(self.redpanda,
+                          retry_codes=[503, 504],
+                          retries_amount=10)
+            status = admin.get_partition_balancer_status(timeout=10)
+
+            partitions_in_node_after = partitions_in_node(kill_id)
+
+            s = status['status']
+            assert s == 'ready', f"Expected status == 'ready' but got '{s}' instead"
+
+            unavailable = status['violations'].get('unavailable_nodes', [])
+            if disable_license:
+                assert len( unavailable) == 0, \
+                    f"Expected no nodes in unavailable. unavailable: {unavailable}"
+                assert partitions_in_node_after == partitions_in_node_before
+            else:
+                assert kill_id in unavailable, f"Expected node with id \"{kill_id}\" in unavailable. unavailable: {unavailable}"
+                assert partitions_in_node_after == 0
+
+            # Restore the system to a fully healthy state before validation:
+            # not strictly necessary but simplifies debugging.
+            ns.make_available()
+            self.run_validation(consumer_timeout_sec=CONSUMER_TIMEOUT)

@@ -12,7 +12,6 @@
 #include "cloud_storage/segment_chunk_data_source.h"
 
 #include "cloud_storage/remote_segment.h"
-#include "utils/gate_guard.h"
 
 namespace cloud_storage {
 
@@ -50,7 +49,7 @@ chunk_data_source_impl::~chunk_data_source_impl() {
 }
 
 ss::future<ss::temporary_buffer<char>> chunk_data_source_impl::get() {
-    gate_guard g{_gate};
+    auto g = _gate.hold();
 
     if (!_current_stream) {
         co_await load_stream_for_chunk(_current_chunk_start);
@@ -75,6 +74,11 @@ ss::future<ss::temporary_buffer<char>> chunk_data_source_impl::get() {
 ss::future<>
 chunk_data_source_impl::load_chunk_handle(chunk_start_offset_t chunk_start) {
     try {
+        vlog(
+          _ctxlog.debug,
+          "Hydrating chunk {} with prefetch {}",
+          chunk_start,
+          _prefetch_override);
         _current_data_file = co_await _chunks.hydrate_chunk(
           chunk_start, _prefetch_override);
     } catch (const ss::abort_requested_exception& ex) {
@@ -101,10 +105,20 @@ ss::future<> chunk_data_source_impl::load_stream_for_chunk(
         co_await load_chunk_handle(chunk_start);
     } catch (...) {
         eptr = std::current_exception();
+        vlog(
+          _ctxlog.debug,
+          "Hydrating chunk {} failed with error {}",
+          chunk_start,
+          eptr);
     }
 
     if (eptr) {
         co_await maybe_close_stream();
+        vlog(
+          _ctxlog.debug,
+          "Closed stream after error {} while hydrating chunk start {}",
+          eptr,
+          chunk_start);
         std::rethrow_exception(eptr);
     }
 

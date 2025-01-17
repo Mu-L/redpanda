@@ -16,8 +16,8 @@
 #include "model/record_batch_types.h"
 #include "model/timestamp.h"
 #include "model/validation.h"
-#include "serde/serde.h"
-#include "utils/string_switch.h"
+#include "serde/rw/rw.h"
+#include "strings/string_switch.h"
 #include "utils/to_string.h"
 
 #include <seastar/core/print.hh>
@@ -40,14 +40,14 @@ std::ostream& operator<<(std::ostream& os, timestamp ts) {
 }
 
 void read_nested(
-  iobuf_parser& in, timestamp& ts, size_t const bytes_left_limit) {
+  iobuf_parser& in, timestamp& ts, const size_t bytes_left_limit) {
     serde::read_nested(in, ts._v, bytes_left_limit);
 }
 
 void write(iobuf& out, timestamp ts) { serde::write(out, ts._v); }
 
 std::ostream& operator<<(std::ostream& os, const topic_partition& tp) {
-    fmt::print(os, "{{{}/{}}}", tp.topic, tp.partition);
+    fmt::print(os, "{{{}/{}}}", tp.topic(), tp.partition());
     return os;
 }
 
@@ -57,13 +57,13 @@ std::ostream& operator<<(std::ostream& os, const ntp& n) {
 }
 
 std::ostream& operator<<(std::ostream& o, const model::topic_namespace& tp_ns) {
-    fmt::print(o, "{{{}/{}}}", tp_ns.ns, tp_ns.tp);
+    fmt::print(o, "{{{}/{}}}", tp_ns.ns(), tp_ns.tp());
     return o;
 }
 
 std::ostream&
 operator<<(std::ostream& o, const model::topic_namespace_view& tp_ns) {
-    fmt::print(o, "{{{}/{}}}", tp_ns.ns, tp_ns.tp);
+    fmt::print(o, "{{{}/{}}}", tp_ns.ns(), tp_ns.tp());
     return o;
 }
 
@@ -169,6 +169,10 @@ ss::sstring ntp::path() const {
     return ssx::sformat("{}/{}/{}", ns(), tp.topic(), tp.partition());
 }
 
+ss::sstring topic_namespace::path() const {
+    return ssx::sformat("{}/{}", ns(), tp());
+}
+
 std::filesystem::path ntp::topic_path() const {
     return fmt::format("{}/{}", ns(), tp.topic());
 }
@@ -176,23 +180,32 @@ std::filesystem::path ntp::topic_path() const {
 std::istream& operator>>(std::istream& i, compression& c) {
     ss::sstring s;
     i >> s;
-    c = string_switch<compression>(s)
-          .match_all("none", "uncompressed", compression::none)
-          .match("gzip", compression::gzip)
-          .match("snappy", compression::snappy)
-          .match("lz4", compression::lz4)
-          .match("zstd", compression::zstd)
-          .match("producer", compression::producer);
+    auto tmp = string_switch<std::optional<compression>>(s)
+                 .match_all("none", "uncompressed", compression::none)
+                 .match("gzip", compression::gzip)
+                 .match("snappy", compression::snappy)
+                 .match("lz4", compression::lz4)
+                 .match("zstd", compression::zstd)
+                 .match("producer", compression::producer)
+                 .default_match(std::nullopt);
+
+    if (tmp.has_value()) {
+        c = tmp.value();
+    } else {
+        i.setstate(std::ios_base::failbit);
+    }
+
     return i;
 }
 
 std::ostream& operator<<(std::ostream& o, const model::broker_properties& b) {
     fmt::print(
       o,
-      "{{cores {}, mem_available {}, disk_available {}}}",
+      "{{cores {}, mem_available {}, disk_available {}, in_fips_mode {}}}",
       b.cores,
-      b.available_memory_gb,
+      b.available_memory_bytes,
       b.available_disk_gb,
+      b.in_fips_mode,
       b.mount_paths,
       b.etc_props);
     return o;
@@ -269,10 +282,8 @@ std::ostream& operator<<(std::ostream& o, cleanup_policy_bitflags c) {
         return o;
     }
 
-    auto compaction = (c & model::cleanup_policy_bitflags::compaction)
-                      == model::cleanup_policy_bitflags::compaction;
-    auto deletion = (c & model::cleanup_policy_bitflags::deletion)
-                    == model::cleanup_policy_bitflags::deletion;
+    auto compaction = model::is_compaction_enabled(c);
+    auto deletion = model::is_deletion_enabled(c);
 
     if (compaction && deletion) {
         o << "compact,delete";
@@ -359,6 +370,32 @@ std::ostream& operator<<(std::ostream& o, record_batch_type bt) {
         return o << "batch_type::tx_tm_hosted_trasactions";
     case record_batch_type::prefix_truncate:
         return o << "batch_type::prefix_truncate";
+    case record_batch_type::plugin_update:
+        return o << "batch_type::plugin_update";
+    case record_batch_type::tx_registry:
+        return o << "batch_type::tx_registry";
+    case record_batch_type::cluster_recovery_cmd:
+        return o << "batch_type::cluster_recovery_cmd";
+    case record_batch_type::compaction_placeholder:
+        return o << "batch_type::compaction_placeholder";
+    case record_batch_type::role_management_cmd:
+        return o << "batch_type::role_management_cmd";
+    case record_batch_type::client_quota:
+        return o << "batch_type::client_quota";
+    case record_batch_type::data_migration_cmd:
+        return o << "batch_type::data_migration_cmd";
+    case record_batch_type::group_fence_tx:
+        return o << "batch_type::group_fence_tx";
+    case record_batch_type::partition_properties_update:
+        return o << "batch_type::partition_properties_update";
+    case record_batch_type::datalake_coordinator:
+        return o << "batch_type::datalake_coordinator";
+    case record_batch_type::dl_placeholder:
+        return o << "batch_type::dl_placeholder";
+    case record_batch_type::dl_stm_command:
+        return o << "batch_type::dl_overlay";
+    case record_batch_type::datalake_translation_state:
+        return o << "datalake_translation_state";
     }
 
     return o << "batch_type::unknown{" << static_cast<int>(bt) << "}";
@@ -397,6 +434,10 @@ std::ostream& operator<<(std::ostream& os, const cloud_credentials_source& cs) {
         return os << "sts";
     case cloud_credentials_source::gcp_instance_metadata:
         return os << "gcp_instance_metadata";
+    case cloud_credentials_source::azure_aks_oidc_federation:
+        return os << "azure_aks_oidc_federation";
+    case cloud_credentials_source::azure_vm_instance_metadata:
+        return os << "azure_vm_instance_metadata";
     }
 }
 
@@ -427,24 +468,162 @@ std::ostream& operator<<(std::ostream& o, const shadow_indexing_mode& si) {
     return o;
 }
 
-std::ostream& operator<<(std::ostream& o, leader_balancer_mode lbt) {
-    o << leader_balancer_mode_to_string(lbt);
+std::ostream& operator<<(std::ostream& o, const control_record_type& crt) {
+    switch (crt) {
+    case control_record_type::tx_abort:
+        return o << "tx_abort";
+    case control_record_type::tx_commit:
+        return o << "tx_commit";
+    case control_record_type::unknown:
+        return o << "unknown";
+    }
+}
+
+std::ostream& operator<<(std::ostream& o, const batch_identity& bid) {
+    fmt::print(
+      o,
+      "{{pid: {}, first_seq: {}, is_transactional: {}, record_count: {}, "
+      "last_seq: {}}}",
+      bid.pid,
+      bid.first_seq,
+      bid.is_transactional,
+      bid.record_count,
+      bid.last_seq);
     return o;
 }
 
-std::istream& operator>>(std::istream& i, leader_balancer_mode& lbt) {
+std::ostream& operator<<(std::ostream& o, fetch_read_strategy s) {
+    o << fetch_read_strategy_to_string(s);
+    return o;
+}
+
+std::istream& operator>>(std::istream& i, fetch_read_strategy& strat) {
     ss::sstring s;
     i >> s;
-    lbt = string_switch<leader_balancer_mode>(s)
-            .match(
-              leader_balancer_mode_to_string(
-                leader_balancer_mode::random_hill_climbing),
-              leader_balancer_mode::random_hill_climbing)
-            .match(
-              leader_balancer_mode_to_string(
-                leader_balancer_mode::greedy_balanced_shards),
-              leader_balancer_mode::greedy_balanced_shards);
+    strat = string_switch<fetch_read_strategy>(s)
+              .match(
+                fetch_read_strategy_to_string(fetch_read_strategy::polling),
+                fetch_read_strategy::polling)
+              .match(
+                fetch_read_strategy_to_string(fetch_read_strategy::non_polling),
+                fetch_read_strategy::non_polling)
+              .match(
+                fetch_read_strategy_to_string(
+                  fetch_read_strategy::non_polling_with_debounce),
+                fetch_read_strategy::non_polling_with_debounce)
+              .match(
+                fetch_read_strategy_to_string(
+                  fetch_read_strategy::non_polling_with_pid),
+                fetch_read_strategy::non_polling_with_pid);
     return i;
+}
+
+std::ostream& operator<<(std::ostream& o, write_caching_mode mode) {
+    o << write_caching_mode_to_string(mode);
+    return o;
+}
+
+std::istream& operator>>(std::istream& i, write_caching_mode& mode) {
+    ss::sstring s;
+    i >> s;
+    auto value = write_caching_mode_from_string(s);
+    if (!value) {
+        i.setstate(std::ios::failbit);
+        return i;
+    }
+    mode = *value;
+    return i;
+}
+
+std::optional<write_caching_mode>
+write_caching_mode_from_string(std::string_view s) {
+    return string_switch<std::optional<write_caching_mode>>(s)
+      .match(
+        model::write_caching_mode_to_string(
+          model::write_caching_mode::default_true),
+        model::write_caching_mode::default_true)
+      .match(
+        model::write_caching_mode_to_string(
+          model::write_caching_mode::default_false),
+        model::write_caching_mode::default_false)
+      .match(
+        model::write_caching_mode_to_string(
+          model::write_caching_mode::disabled),
+        model::write_caching_mode::disabled)
+      .default_match(std::nullopt);
+}
+
+std::ostream& operator<<(std::ostream& os, recovery_validation_mode vm) {
+    using enum recovery_validation_mode;
+    switch (vm) {
+    case check_manifest_existence:
+        return os << "check_manifest_existence";
+    case check_manifest_and_segment_metadata:
+        return os << "check_manifest_and_segment_metadata";
+    case no_check:
+        return os << "no_check";
+    }
+}
+
+std::istream& operator>>(std::istream& is, recovery_validation_mode& vm) {
+    using enum recovery_validation_mode;
+    auto s = ss::sstring{};
+    is >> s;
+    try {
+        vm = string_switch<recovery_validation_mode>(s)
+               .match("check_manifest_existence", check_manifest_existence)
+               .match(
+                 "check_manifest_and_segment_metadata",
+                 check_manifest_and_segment_metadata)
+               .match("no_check", no_check);
+    } catch (const std::runtime_error&) {
+        is.setstate(std::ios::failbit);
+    }
+    return is;
+}
+
+std::ostream& operator<<(std::ostream& os, const iceberg_mode& mode) {
+    switch (mode) {
+    case iceberg_mode::disabled:
+        return os << "disabled";
+    case iceberg_mode::key_value:
+        return os << "key_value";
+    case iceberg_mode::value_schema_id_prefix:
+        return os << "value_schema_id_prefix";
+    }
+}
+
+std::istream& operator>>(std::istream& is, iceberg_mode& mode) {
+    using enum iceberg_mode;
+    ss::sstring s;
+    is >> s;
+    try {
+        mode = string_switch<iceberg_mode>(s)
+                 .match("disabled", disabled)
+                 .match("key_value", key_value)
+                 .match("value_schema_id_prefix", value_schema_id_prefix);
+    } catch (const std::runtime_error&) {
+        is.setstate(std::ios::failbit);
+    }
+    return is;
+}
+
+std::ostream& operator<<(std::ostream& os, const fips_mode_flag& f) {
+    return os << to_string_view(f);
+}
+
+std::istream& operator>>(std::istream& is, fips_mode_flag& f) {
+    ss::sstring s;
+    is >> s;
+    f = string_switch<fips_mode_flag>(s)
+          .match(
+            to_string_view(fips_mode_flag::disabled), fips_mode_flag::disabled)
+          .match(
+            to_string_view(fips_mode_flag::enabled), fips_mode_flag::enabled)
+          .match(
+            to_string_view(fips_mode_flag::permissive),
+            fips_mode_flag::permissive);
+    return is;
 }
 
 } // namespace model

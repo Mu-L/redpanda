@@ -10,14 +10,15 @@
 
 #pragma once
 
+#include "base/outcome.h"
+#include "base/seastarx.h"
 #include "cluster/fwd.h"
+#include "cluster/types.h"
 #include "kafka/protocol/errors.h"
 #include "model/fundamental.h"
 #include "model/record_batch_reader.h"
-#include "outcome.h"
 #include "pandaproxy/schema_registry/api.h"
 #include "pandaproxy/schema_registry/schema_id_validation.h"
-#include "seastarx.h"
 
 #include <seastar/core/future.hh>
 
@@ -41,9 +42,8 @@ public:
     schema_id_validator& operator=(const schema_id_validator&) = delete;
     ~schema_id_validator() noexcept;
 
-    using result = ::result<model::record_batch_reader, kafka::error_code>;
-    ss::future<result>
-    operator()(model::record_batch_reader&&, cluster::partition_probe* probe);
+    ss::future<kafka::error_code>
+    operator()(const model::record_batch&, cluster::partition_probe* probe);
 
 private:
     std::unique_ptr<impl> _impl;
@@ -54,14 +54,14 @@ std::optional<schema_id_validator> maybe_make_schema_id_validator(
   const model::topic& topic,
   const cluster::topic_properties& props);
 
-ss::future<schema_id_validator::result> inline maybe_validate_schema_id(
+inline ss::future<kafka::error_code> maybe_validate_schema_id(
   std::optional<schema_id_validator> validator,
-  model::record_batch_reader rbr,
+  const model::record_batch& batch,
   cluster::partition_probe* probe) {
     if (validator) {
-        co_return co_await (*validator)(std::move(rbr), probe);
+        co_return co_await (*validator)(batch, probe);
     }
-    co_return std::move(rbr);
+    co_return kafka::error_code::none;
 }
 
 } // namespace pandaproxy::schema_registry

@@ -9,11 +9,15 @@
 
 #include "raft/state_machine.h"
 
+#include "base/likely.h"
 #include "model/fundamental.h"
 #include "model/record_batch_reader.h"
 #include "raft/consensus.h"
+#include "ssx/future-util.h"
 #include "storage/log.h"
 #include "storage/record_batch_builder.h"
+
+#include <exception>
 
 namespace raft {
 
@@ -29,7 +33,8 @@ ss::future<> state_machine::start() {
     vlog(_log.debug, "Starting state machine for ntp={}", _raft->ntp());
     ssx::spawn_with_gate(_gate, [this] {
         return ss::do_until(
-          [this] { return _gate.is_closed(); }, [this] { return apply(); });
+          [this] { return _as.abort_requested() || _gate.is_closed(); },
+          [this] { return apply(); });
     });
     return ss::now();
 }
@@ -50,7 +55,9 @@ ss::future<> state_machine::handle_raft_snapshot() {
 ss::future<> state_machine::stop() {
     vlog(_log.debug, "Asked to stop state_machine {}", _raft->ntp());
     _waiters.stop();
-    _as.request_abort();
+    if (!_as.abort_requested()) {
+        _as.request_abort();
+    }
     return _gate.close().then([this] {
         vlog(_log.debug, "state_machine is stopped {}", _raft->ntp());
     });
@@ -98,11 +105,11 @@ state_machine::batch_applicator::operator()(model::record_batch batch) {
 
 bool state_machine::stop_batch_applicator() { return _gate.is_closed(); }
 
-model::record_batch_reader make_checkpoint() {
+model::record_batch make_checkpoint() {
     storage::record_batch_builder builder(
       model::record_batch_type::checkpoint, model::offset(0));
     builder.add_raw_kv(iobuf(), iobuf());
-    return model::make_memory_record_batch_reader(std::move(builder).build());
+    return std::move(builder).build();
 }
 
 // FIXME: implement linearizable reads in a way similar to Logcabin
@@ -124,17 +131,29 @@ ss::future<result<replicate_result>> state_machine::quorum_write_empty_batch(
           });
       });
 }
+ss::future<> state_machine::maybe_apply_raft_snapshot() {
+    // a loop here is required as install snapshot request may be processed by
+    // Raft while handling the other snapshot. In this case a new snapshot
+    // should be applied to the STM.
 
+    while (_next < _raft->start_offset()) {
+        try {
+            co_await handle_raft_snapshot();
+        } catch (...) {
+            const auto& e = std::current_exception();
+            if (!ssx::is_shutdown_exception(e)) {
+                vlog(_log.error, "Error applying Raft snapshot - {}", e);
+            }
+            std::rethrow_exception(e);
+        }
+    }
+}
 ss::future<> state_machine::apply() {
     // wait until consensus commit index is >= _next
     return _raft->events()
       .wait(_next, model::no_timeout, _as)
       .then([this] {
-          auto f = ss::now();
-          if (_next < _raft->start_offset()) {
-              f = handle_raft_snapshot();
-          }
-          return f.then([this] {
+          return maybe_apply_raft_snapshot().then([this] {
               /**
                * Raft make_reader method allows callers reading up to
                * last_visible index. In order to make the STMs safe and working
@@ -159,11 +178,11 @@ ss::future<> state_machine::apply() {
             "Timeout in state_machine::apply on ntp {}",
             _raft->ntp());
       })
-      .handle_exception_type([](const ss::abort_requested_exception&) {})
-      .handle_exception_type([](const ss::gate_closed_exception&) {})
       .handle_exception([this](const std::exception_ptr& e) {
-          vlog(
-            _log.info,
+          vlogl(
+            _log,
+            ssx::is_shutdown_exception(e) ? ss::log_level::trace
+                                          : ss::log_level::error,
             "State machine for ntp={} caught exception {}",
             _raft->ntp(),
             e);
@@ -179,22 +198,17 @@ ss::future<result<model::offset>> state_machine::insert_linearizable_barrier(
     /**
      * Inject leader barrier and wait until returned offset is applied
      */
-    return ss::with_timeout(
-             timeout,
-             _raft->linearizable_barrier().then(
-               [this, timeout](result<model::offset> r) {
-                   if (!r) {
-                       return ss::make_ready_future<result<model::offset>>(
-                         r.error());
-                   }
 
-                   // wait for the returned offset to be applied
-                   return wait(r.value(), timeout).then([r] {
-                       return result<model::offset>(r.value());
-                   });
-               }))
-      .handle_exception_type([](const ss::timed_out_error&) {
-          return result<model::offset>(errc::timeout);
+    return _raft->linearizable_barrier(timeout).then(
+      [this, timeout](result<model::offset> r) {
+          if (!r) {
+              return ss::make_ready_future<result<model::offset>>(r.error());
+          }
+
+          // wait for the returned offset to be applied
+          return wait(r.value(), timeout).then([r] {
+              return result<model::offset>(r.value());
+          });
       });
 }
 

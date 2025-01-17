@@ -11,15 +11,19 @@
 
 #pragma once
 
+#include "base/vassert.h"
 #include "bytes/iobuf.h"
+#include "bytes/iobuf_parser.h"
 #include "model/compression.h"
 #include "model/fundamental.h"
 #include "model/record_batch_types.h"
 #include "model/record_utils.h"
 #include "model/timestamp.h"
-#include "serde/envelope.h"
-#include "serde/serde.h"
-#include "vassert.h"
+#include "serde/async.h"
+#include "serde/rw/enum.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/iobuf.h"
+#include "serde/rw/rw.h"
 
 #include <seastar/core/smp.hh>
 #include <seastar/util/optimized_optional.hh>
@@ -81,7 +85,7 @@ public:
       , _val_size(v_len)
       , _value(std::move(v)) {}
 
-    int32_t memory_usage() const {
+    size_t memory_usage() const {
         return sizeof(*this) + _key.size_bytes() + _value.size_bytes();
     }
     record_header share() {
@@ -101,6 +105,15 @@ public:
     iobuf release_value() { return std::exchange(_value, {}); }
     iobuf share_value() { return _value.share(0, _value.size_bytes()); }
 
+    std::optional<iobuf> share_key_opt() {
+        return key_size() < 0 ? std::nullopt
+                              : std::make_optional<iobuf>(share_key());
+    }
+    std::optional<iobuf> share_value_opt() {
+        return value_size() < 0 ? std::nullopt
+                                : std::make_optional<iobuf>(share_value());
+    }
+
     bool operator==(const record_header& rhs) const {
         return _key_size == rhs._key_size && _val_size == rhs._val_size
                && _key == rhs._key && _value == rhs._value;
@@ -109,8 +122,10 @@ public:
     friend std::ostream& operator<<(std::ostream&, const record_header&);
 
 private:
+    // If negative, the key is nil.
     int32_t _key_size{-1};
     iobuf _key;
+    // If negative, the value is nil.
     int32_t _val_size{-1};
     iobuf _value;
 };
@@ -161,18 +176,49 @@ public:
       , _value(std::move(value))
       , _headers(std::move(hdrs)) {}
 
+    record(
+      record_attributes attributes,
+      int64_t timestamp_delta,
+      int32_t offset_delta,
+      iobuf key,
+      iobuf value,
+      std::vector<record_header> hdrs) noexcept
+      : _attributes(attributes)
+      , _timestamp_delta(timestamp_delta)
+      , _offset_delta(offset_delta)
+      , _key_size(static_cast<int32_t>(key.size_bytes()))
+      , _key(std::move(key))
+      , _val_size(static_cast<int32_t>(value.size_bytes()))
+      , _value(std::move(value))
+      , _headers(std::move(hdrs)) {
+        _size_bytes = static_cast<int32_t>(
+          sizeof(model::record_attributes::type)   //
+          + vint::vint_size(_timestamp_delta)      //
+          + vint::vint_size(_offset_delta)         //
+          + _key_size + vint::vint_size(_key_size) //
+          + _val_size + vint::vint_size(_val_size) //
+          + std::accumulate(
+            _headers.begin(),
+            _headers.end(),
+            size_t(0),
+            [](size_t acc, const record_header& h) {
+                return acc + h.memory_usage();
+            }) //
+        );
+    }
+
     // Size in bytes of everything except the size_bytes field.
     int32_t size_bytes() const { return _size_bytes; }
 
     // Used for acquiring units from semaphores limiting
     // memory resources.
-    int32_t memory_usage() const {
+    size_t memory_usage() const {
         return sizeof(*this) + _key.size_bytes() + _value.size_bytes()
                + std::accumulate(
                  _headers.begin(),
                  _headers.end(),
-                 int32_t(0),
-                 [](int32_t acc, const record_header& h) {
+                 size_t(0),
+                 [](size_t acc, const record_header& h) {
                      return acc + h.memory_usage();
                  });
     }
@@ -187,12 +233,26 @@ public:
     const iobuf& key() const { return _key; }
     iobuf release_key() { return std::exchange(_key, {}); }
     iobuf share_key() { return _key.share(0, _key.size_bytes()); }
+    std::optional<iobuf> share_key_opt() {
+        if (!has_key()) {
+            return std::nullopt;
+        }
+        return share_key();
+    }
+    std::optional<iobuf> share_value_opt() {
+        if (!has_value()) {
+            return std::nullopt;
+        }
+        return share_value();
+    }
 
     int32_t value_size() const { return _val_size; }
     const iobuf& value() const { return _value; }
     iobuf release_value() { return std::exchange(_value, {}); }
     iobuf share_value() { return _value.share(0, _value.size_bytes()); }
     bool has_value() const { return _val_size >= 0; }
+    bool has_key() const { return _key_size >= 0; }
+    bool is_tombstone() const { return !has_value(); }
 
     const std::vector<record_header>& headers() const { return _headers; }
     std::vector<record_header>& headers() { return _headers; }
@@ -314,8 +374,6 @@ public:
 
     void set_transactional_type() { _attributes |= transactional_mask; }
 
-    void unset_transactional_type() { _attributes &= ~transactional_mask; }
-
     bool operator==(const record_batch_attributes& other) const {
         return _attributes == other._attributes;
     }
@@ -327,7 +385,7 @@ public:
     record_batch_attributes& operator|=(model::compression c) {
         // clang-format off
         _attributes |=
-        static_cast<std::underlying_type_t<model::compression>>(c) 
+        static_cast<std::underlying_type_t<model::compression>>(c)
             & record_batch_attributes::compression_mask;
         // clang-format on
         return *this;
@@ -344,7 +402,7 @@ public:
     friend inline void read_nested(
       iobuf_parser& in,
       record_batch_attributes& attrs,
-      size_t const bytes_left_limit) {
+      const size_t bytes_left_limit) {
         attrs._attributes = serde::read_nested<uint64_t>(in, bytes_left_limit);
     }
 
@@ -430,17 +488,23 @@ struct record_batch_header
     offset base_offset;
     /// \brief redpanda extension
     record_batch_type type;
-    int32_t crc{0};
+    uint32_t crc{0};
 
     // -- below the CRC are checksummed by the kafka crc. see @crc field
 
     record_batch_attributes attrs;
+
+    // The difference in offset between the first and last offset in the batch.
     int32_t last_offset_delta{0};
     timestamp first_timestamp;
     timestamp max_timestamp;
     int64_t producer_id{0};
     int16_t producer_epoch{0};
     int32_t base_sequence{0};
+
+    // The number of records in the batch. Note, this may not necessarily be
+    // the same as last_offset_delta, which is preserved across compaction,
+    // unlike record_count.
     int32_t record_count{0};
 
     auto serde_fields() {
@@ -496,11 +560,13 @@ using tx_seq = named_type<int64_t, struct tm_tx_seq>;
 using producer_id = named_type<int64_t, struct producer_identity_id>;
 using producer_epoch = named_type<int16_t, struct producer_identity_epoch>;
 
+static constexpr producer_epoch no_producer_epoch{-1};
+static constexpr producer_id no_producer_id{-1};
 struct producer_identity
   : serde::
       envelope<producer_identity, serde::version<0>, serde::compat_version<0>> {
-    int64_t id{-1};
-    int16_t epoch{0};
+    producer_id id{no_producer_id};
+    producer_epoch epoch{0};
 
     producer_identity() noexcept = default;
 
@@ -512,6 +578,15 @@ struct producer_identity
 
     model::producer_epoch get_epoch() const {
         return model::producer_epoch(epoch);
+    }
+
+    static model::producer_identity
+    with_next_epoch(const model::producer_identity pid) {
+        return {pid.id, pid.epoch + producer_epoch(1)};
+    }
+
+    bool has_exhausted_epoch() const {
+        return epoch >= (producer_epoch::max() - producer_epoch{1});
     }
 
     auto operator<=>(const producer_identity&) const = default;
@@ -529,12 +604,28 @@ struct producer_identity
 /// This structure is a part of rm_stm snapshot.
 /// Any change has to be reconciled with the
 /// snapshot (de)serialization logic.
-struct tx_range {
+struct tx_range
+  : serde::envelope<tx_range, serde::version<0>, serde::compat_version<0>> {
+    tx_range() = default;
+
+    tx_range(model::producer_identity pid, model::offset f, model::offset l)
+      : pid(pid)
+      , first(f)
+      , last(l) {}
+
     model::producer_identity pid;
     model::offset first;
     model::offset last;
 
+    auto serde_fields() { return std::tie(pid, first, last); }
+
     auto operator<=>(const tx_range&) const = default;
+    friend std::ostream& operator<<(std::ostream&, const tx_range&);
+
+    template<typename H>
+    friend H AbslHashValue(H h, const tx_range& range) {
+        return H::combine(std::move(h), range.first, range.last, range.pid);
+    }
 };
 
 // Comparator that sorts in ascending order by first offset.
@@ -544,7 +635,7 @@ struct tx_range_cmp {
     }
 };
 
-static constexpr producer_identity unknown_pid{-1, -1};
+inline constexpr producer_identity no_pid{no_producer_id, no_producer_epoch};
 
 struct batch_identity {
     static int32_t increment_sequence(int32_t sequence, int32_t increment) {
@@ -573,10 +664,39 @@ struct batch_identity {
     timestamp max_timestamp;
     bool is_transactional{false};
 
-    bool has_idempotent() { return pid.id >= 0; }
+    bool is_idempotent() const { return pid.id > no_producer_id; }
+
+    friend std::ostream& operator<<(std::ostream&, const batch_identity&);
 };
 
-// 57 bytes
+// A simple iterator for model::record_batch
+//
+// Usage:
+//
+// ```
+// auto it = model::record_batch_iterator::create(batch);
+// while (it.has_next()) {
+//   model::record record = it.next();
+//   // do something with record
+//   co_await ss::coroutine::maybe_yield();
+// }
+// ```
+class record_batch_iterator {
+public:
+    bool has_next() const noexcept;
+
+    model::record next();
+
+    static record_batch_iterator create(const model::record_batch& b);
+
+private:
+    record_batch_iterator(int32_t rc, iobuf_const_parser p);
+
+    int32_t _index = 0;
+    int32_t _record_count;
+    iobuf_const_parser _parser;
+};
+
 constexpr uint32_t packed_record_batch_header_size
   = sizeof(model::record_batch_header::header_crc)          // 4
     + sizeof(model::record_batch_header::size_bytes)        // 4
@@ -591,6 +711,7 @@ constexpr uint32_t packed_record_batch_header_size
     + sizeof(model::record_batch_header::producer_epoch)    // 2
     + sizeof(model::record_batch_header::base_sequence)     // 4
     + sizeof(model::record_batch_header::record_count);     // 4
+static_assert(packed_record_batch_header_size == 61);
 
 class record_batch
   : public serde::envelope<
@@ -671,8 +792,16 @@ public:
     void set_term(model::term_id i) { _header.ctx.term = i; }
     // Size in bytes of the header plus records.
     int32_t size_bytes() const { return _header.size_bytes; }
+    bool contains_transactional_data() const {
+        // A transactional batch can be a
+        // 1. transactional data batch - transactional bit set
+        // 2. transactional control batch (fence, abort etc) - control batch
+        // and pid >= 0
+        return _header.attrs.is_transactional()
+               || (_header.attrs.is_control() && _header.producer_id >= 0);
+    }
 
-    int32_t memory_usage() const {
+    size_t memory_usage() const {
         return sizeof(*this) + _records.size_bytes();
     }
 
@@ -724,41 +853,25 @@ public:
      */
     template<typename Func>
     void for_each_record(Func f) const {
-        verify_iterable();
-        iobuf_const_parser parser(_records);
-        for (auto i = 0; i < _header.record_count; i++) {
-            if constexpr (std::is_same_v<
-                            std::invoke_result_t<Func, model::record>,
-                            void>) {
-                f(model::parse_one_record_copy_from_buffer(parser));
-
+        auto it = record_batch_iterator::create(*this);
+        while (it.has_next()) {
+            if constexpr (std::is_void_v<
+                            std::invoke_result_t<Func, model::record>>) {
+                f(it.next());
             } else {
-                ss::stop_iteration s = f(
-                  model::parse_one_record_copy_from_buffer(parser));
+                ss::stop_iteration s = f(it.next());
                 if (s == ss::stop_iteration::yes) {
                     return;
                 }
             }
         }
-        if (unlikely(parser.bytes_left())) {
-            throw std::out_of_range(fmt::format(
-              "Record iteration stopped with {} bytes remaining",
-              parser.bytes_left()));
-        }
     }
 
     template<typename Func>
     ss::future<> for_each_record_async(Func f) const {
-        verify_iterable();
-        iobuf_const_parser parser(_records);
-        for (auto i = 0; i < _header.record_count; i++) {
-            co_await ss::futurize_invoke(
-              f, model::parse_one_record_copy_from_buffer(parser));
-        }
-        if (unlikely(parser.bytes_left())) {
-            throw std::out_of_range(fmt::format(
-              "Record iteration stopped with {} bytes remaining",
-              parser.bytes_left()));
+        auto it = record_batch_iterator::create(*this);
+        while (it.has_next()) {
+            co_await ss::futurize_invoke(f, it.next());
         }
     }
 
@@ -787,19 +900,20 @@ public:
     auto serde_fields() { return std::tie(_header, _records); }
 
     static model::record_batch
-    serde_direct_read(iobuf_parser& in, size_t const bytes_left_limit) {
+    serde_direct_read(iobuf_parser& in, const serde::header& h) {
         using serde::read_nested;
         auto header = read_nested<model::record_batch_header>(
-          in, bytes_left_limit);
-        auto data = read_nested<iobuf>(in, bytes_left_limit);
+          in, h._bytes_left_limit);
+        auto data = read_nested<iobuf>(in, h._bytes_left_limit);
 
         return {header, std::move(data), tag_ctor_ng()};
     }
 
     static ss::future<model::record_batch>
-    serde_async_direct_read(iobuf_parser& in, size_t const bytes_left_limit) {
+    serde_async_direct_read(iobuf_parser& in, serde::header h) {
         using serde::read_async_nested;
         // TODO: change to coroutine after we upgrade to clang-16
+        auto bytes_left_limit = h._bytes_left_limit;
         return read_async_nested<model::record_batch_header>(
                  in, bytes_left_limit)
           .then([&in, bytes_left_limit](model::record_batch_header header) {
@@ -831,6 +945,7 @@ private:
 
     explicit operator bool() const noexcept { return !empty(); }
     friend class ss::optimized_optional<record_batch>;
+    friend class record_batch_iterator;
 
     template<typename Func>
     friend ss::future<>
@@ -843,18 +958,16 @@ private:
 template<typename Func>
 inline ss::future<>
 for_each_record(const model::record_batch& batch, Func&& f) {
-    batch.verify_iterable();
     return ss::do_with(
-      iobuf_const_parser(batch.data()),
+      record_batch_iterator::create(batch),
       record{},
-      [record_count = batch.record_count(), f = std::forward<Func>(f)](
-        iobuf_const_parser& parser, record& record) mutable {
-          return ss::do_for_each(
-            boost::counting_iterator<int32_t>(0),
-            boost::counting_iterator<int32_t>(record_count),
-            [&parser, &record, f = std::forward<Func>(f)](int32_t) {
-                record = model::parse_one_record_copy_from_buffer(parser);
-                return f(record);
+      [f = std::forward<Func>(f)](
+        record_batch_iterator& it, record& r) mutable {
+          return ss::do_until(
+            [&it]() { return !it.has_next(); },
+            [&it, &r, f = std::forward<Func>(f)]() {
+                r = it.next();
+                return ss::futurize_invoke(f, r);
             });
       });
 }

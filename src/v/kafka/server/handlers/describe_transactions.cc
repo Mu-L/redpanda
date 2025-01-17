@@ -11,6 +11,7 @@
 
 #include "cluster/errc.h"
 #include "cluster/tx_gateway_frontend.h"
+#include "container/fragmented_vector.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/schemata/describe_transactions_request.h"
 #include "kafka/protocol/types.h"
@@ -66,12 +67,12 @@ ss::future<> fill_info_about_tx(
         }
     } else {
         switch (tx_info.error()) {
-        case cluster::tx_errc::not_coordinator:
-        case cluster::tx_errc::partition_not_found:
-        case cluster::tx_errc::stm_not_found:
+        case cluster::tx::errc::not_coordinator:
+        case cluster::tx::errc::partition_not_found:
+        case cluster::tx::errc::stm_not_found:
             tx_info_resp.error_code = kafka::error_code::not_coordinator;
             break;
-        case cluster::tx_errc::tx_id_not_found:
+        case cluster::tx::errc::tx_id_not_found:
             tx_info_resp.error_code
               = kafka::error_code::transactional_id_not_found;
             break;
@@ -79,7 +80,7 @@ ss::future<> fill_info_about_tx(
             vlog(
               klog.warn,
               "Can not find transaction with tx_id:({}) for "
-              "describe_transactions request. Got error (tx_errc): {}",
+              "describe_transactions request. Got error (tx::errc): {}",
               tx_id,
               tx_info.error());
             tx_info_resp.error_code = kafka::error_code::unknown_server_error;
@@ -93,7 +94,7 @@ ss::future<> fill_info_about_tx(
 ss::future<> fill_info_about_transactions(
   cluster::tx_gateway_frontend& tx_frontend,
   describe_transactions_response& response,
-  std::vector<kafka::transactional_id> tx_ids) {
+  chunked_vector<kafka::transactional_id> tx_ids) {
     return ss::max_concurrent_for_each(
       tx_ids, 32, [&response, &tx_frontend](const auto tx_id) -> ss::future<> {
           return fill_info_about_tx(tx_frontend, response, tx_id);
@@ -118,12 +119,26 @@ ss::future<response_ptr> describe_transactions_handler::handle(
           return ctx.authorized(security::acl_operation::describe, tx_id);
       });
 
+    if (!ctx.audit()) {
+        response.data.transaction_states.reserve(
+          request.data.transactional_ids.size());
+        std::transform(
+          request.data.transactional_ids.begin(),
+          request.data.transactional_ids.end(),
+          std::back_inserter(response.data.transaction_states),
+          [](const kafka::transactional_id& id) {
+              return describe_transaction_state{
+                .error_code = error_code::broker_not_available,
+                .transactional_id = id};
+          });
+        co_return co_await ctx.respond(std::move(response));
+    }
+
     std::vector<kafka::transactional_id> unauthorized(
       std::make_move_iterator(unauthorized_it),
       std::make_move_iterator(request.data.transactional_ids.end()));
 
-    request.data.transactional_ids.erase(
-      unauthorized_it, request.data.transactional_ids.end());
+    request.data.transactional_ids.erase_to_end(unauthorized_it);
 
     auto& tx_frontend = ctx.tx_gateway_frontend();
     co_await fill_info_about_transactions(

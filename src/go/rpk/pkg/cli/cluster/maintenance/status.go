@@ -10,6 +10,10 @@
 package maintenance
 
 import (
+	"fmt"
+
+	"github.com/redpanda-data/common-go/rpadmin"
+
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -19,22 +23,30 @@ import (
 
 func newMaintenanceReportTable() *out.TabWriter {
 	headers := []string{
-		"Node-ID", "Draining", "Finished", "Errors",
+		"Node-ID", "Enabled", "Finished", "Errors",
 		"Partitions", "Eligible", "Transferring", "Failed",
 	}
 	return out.NewTable(headers...)
 }
 
-func addBrokerMaintenanceReport(table *out.TabWriter, b adminapi.Broker) {
+func nullableToStr[V any](v *V) string {
+	if v == nil {
+		return "-"
+	}
+
+	return fmt.Sprint(*v)
+}
+
+func addBrokerMaintenanceReport(table *out.TabWriter, b rpadmin.Broker) {
 	table.Print(
 		b.NodeID,
 		b.Maintenance.Draining,
-		b.Maintenance.Finished,
-		b.Maintenance.Errors,
-		b.Maintenance.Partitions,
-		b.Maintenance.Eligible,
-		b.Maintenance.Transferring,
-		b.Maintenance.Failed)
+		nullableToStr(b.Maintenance.Finished),
+		nullableToStr(b.Maintenance.Errors),
+		nullableToStr(b.Maintenance.Partitions),
+		nullableToStr(b.Maintenance.Eligible),
+		nullableToStr(b.Maintenance.Transferring),
+		nullableToStr(b.Maintenance.Failed))
 }
 
 func newStatusCommand(fs afero.Fs, p *config.Params) *cobra.Command {
@@ -47,13 +59,13 @@ This command reports maintenance status for each node in the cluster. The output
 is presented as a table with each row representing a node in the cluster.  The
 output can be used to monitor the progress of node draining.
 
-   NODE-ID  DRAINING  FINISHED  ERRORS  PARTITIONS  ELIGIBLE  TRANSFERRING  FAILED
+   NODE-ID  ENABLED  FINISHED  ERRORS  PARTITIONS  ELIGIBLE  TRANSFERRING  FAILED
    1        false     false     false   0           0         0             0
 
 Field descriptions:
 
         NODE-ID: the node ID
-       DRAINING: true if the node is actively draining leadership
+        ENABLED: true if the node is currently in maintenance mode
        FINISHED: leadership draining has completed
          ERRORS: errors have been encountered while draining
      PARTITIONS: number of partitions whose leadership has moved
@@ -70,12 +82,12 @@ Notes:
      transfer.
 `,
 		Args: cobra.ExactArgs(0),
-		Run: func(cmd *cobra.Command, args []string) {
+		Run: func(cmd *cobra.Command, _ []string) {
 			p, err := p.LoadVirtualProfile(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
-			out.CheckExitCloudAdmin(p)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
+			config.CheckExitCloudAdmin(p)
 
-			client, err := adminapi.NewClient(fs, p)
+			client, err := adminapi.NewClient(cmd.Context(), fs, p)
 			out.MaybeDie(err, "unable to initialize admin client: %v", err)
 
 			brokers, err := client.Brokers(cmd.Context())

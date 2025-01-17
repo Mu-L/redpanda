@@ -26,6 +26,7 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/plugin"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
+	"go.uber.org/zap"
 )
 
 func newInstallCommand(fs afero.Fs, p *config.Params) *cobra.Command {
@@ -42,8 +43,8 @@ exists if you want to download the plugin ahead of time.
 		Args: cobra.ExactArgs(0),
 		Run: func(cmd *cobra.Command, _ []string) {
 			cfg, err := p.Load(fs)
-			out.MaybeDie(err, "unable to load config: %v", err)
-			_, _, installed, err := loginAndEnsurePluginVersion(cmd.Context(), fs, cfg, redpandaID)
+			out.MaybeDie(err, "rpk unable to load config: %v", err)
+			_, _, installed, err := loginAndEnsurePluginVersion(cmd.Context(), fs, cfg, redpandaID, false) // latest is always false, we only want to install the pinned byoc version when using `rpk cloud byoc install`
 			out.MaybeDie(err, "unable to install byoc plugin: %v", err)
 			if !installed {
 				fmt.Print(`
@@ -60,10 +61,11 @@ autocompletion, start a new terminal and tab complete through it!
 		},
 	}
 	cmd.Flags().StringVar(&redpandaID, flagRedpandaID, "", flagRedpandaIDDesc)
+	cmd.MarkFlagRequired(flagRedpandaID)
 	return cmd
 }
 
-func loginAndEnsurePluginVersion(ctx context.Context, fs afero.Fs, cfg *config.Config, redpandaID string) (binPath string, token string, installed bool, rerr error) {
+func loginAndEnsurePluginVersion(ctx context.Context, fs afero.Fs, cfg *config.Config, redpandaID string, isLatest bool) (binPath string, token string, installed bool, rerr error) {
 	// First load our configuration and token.
 	pluginDir, err := plugin.DefaultBinPath()
 	if err != nil {
@@ -73,17 +75,21 @@ func loginAndEnsurePluginVersion(ctx context.Context, fs afero.Fs, cfg *config.C
 	if overrides.CloudToken != "" {
 		token = overrides.CloudToken
 	} else {
-		token, err = oauth.LoadFlow(ctx, fs, cfg, auth0.NewClient(overrides))
+		priorProfile := cfg.ActualProfile()
+		_, authVir, clearedProfile, _, err := oauth.LoadFlow(ctx, fs, cfg, auth0.NewClient(cfg.DevOverrides()), false, false, cfg.DevOverrides().CloudAPIURL)
 		if err != nil {
-			return "", "", false, fmt.Errorf("unable to load the cloud token: %w", err)
+			return "", "", false, fmt.Errorf("unable to load the cloud token: %w. You may need to logout with 'rpk cloud logout --clear-credentials' and try again", err)
 		}
+		oauth.MaybePrintSwapMessage(clearedProfile, priorProfile, authVir)
+		token = authVir.AuthToken
 	}
 
-	byoc, pluginExists := plugin.ListPlugins(fs, []string{pluginDir}).Find("byoc")
-
+	byoc, pluginExists := plugin.ListPlugins(fs, plugin.UserPaths()).Find("byoc")
+	zap.L().Debug("looking for existing byoc plugin", zap.Bool("exists", pluginExists))
 	// If the plugin exists, and we don't want a version check we want to exit
 	// early and avoid calling the Cloud API.
 	if c := overrides.BYOCSkipVersionCheck; pluginExists && (c == "1" || c == "true") {
+		zap.L().Sugar().Warn("overriding byoc plugin version check. RPK_CLOUD_SKIP_VERSION_CHECK is enabled")
 		return byoc.Path, token, false, nil
 	}
 
@@ -94,14 +100,23 @@ func loginAndEnsurePluginVersion(ctx context.Context, fs afero.Fs, cfg *config.C
 	}
 	// Check our current version of the plugin.
 	cl := cloudapi.NewClient(cloudURL, token)
-	cluster, err := cl.Cluster(ctx, redpandaID)
-	if err != nil {
-		return "", "", false, fmt.Errorf("unable to request cluster details for %q: %w", redpandaID, err)
+	var pack cloudapi.InstallPack
+	if isLatest {
+		pack, err = cl.LatestInstallPack(ctx)
+		if err != nil {
+			return "", "", false, fmt.Errorf("unable to get latest installpack: %v", err)
+		}
+	} else {
+		cluster, err := cl.Cluster(ctx, redpandaID)
+		if err != nil {
+			return "", "", false, fmt.Errorf("unable to request cluster details for %q: %w", redpandaID, err)
+		}
+		pack, err = cl.InstallPack(ctx, cluster.Spec.InstallPackVersion)
+		if err != nil {
+			return "", "", false, fmt.Errorf("unable to request install pack details for %q: %v", cluster.Spec.InstallPackVersion, err)
+		}
 	}
-	pack, err := cl.InstallPack(ctx, cluster.Spec.InstallPackVersion)
-	if err != nil {
-		return "", "", false, fmt.Errorf("unable to request install pack details for %q: %v", cluster.Spec.InstallPackVersion, err)
-	}
+
 	name := fmt.Sprintf("byoc-%s-%s", runtime.GOOS, runtime.GOARCH)
 	artifact, found := pack.Artifacts.Find(name)
 	if !found {
@@ -132,12 +147,15 @@ func loginAndEnsurePluginVersion(ctx context.Context, fs afero.Fs, cfg *config.C
 		}
 
 		if strings.HasPrefix(currentSha, expShaPrefix) {
+			zap.L().Sugar().Debug("version check: installed byoc plugin matches expected version")
 			return byoc.Path, token, false, nil // remote version matches, all is good, return token
 		}
+		zap.L().Sugar().Debug("version check: installed byoc plugin does not match expected version")
 	}
 
 	// Remote version is different: download current plugin version and
 	// replace.
+	zap.L().Debug("downloading byoc plugin", zap.String("version", artifact.Version))
 	bin, err := plugin.Download(ctx, artifact.Location, false, expShaPrefix)
 	if err != nil {
 		return "", "", false, fmt.Errorf("unable to replace out of date plugin: %w", err)
@@ -155,6 +173,7 @@ func loginAndEnsurePluginVersion(ctx context.Context, fs afero.Fs, cfg *config.C
 		}
 	}
 
+	zap.L().Sugar().Debugf("writing byoc plugin to %v", pluginDir)
 	path, err := plugin.WriteBinary(fs, "byoc", pluginDir, bin, false, true)
 	if err != nil {
 		return "", "", false, fmt.Errorf("unable to write byoc plugin to disk: %w", err)

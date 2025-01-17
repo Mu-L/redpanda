@@ -14,8 +14,6 @@
 
 #include <seastar/testing/thread_test_case.hh>
 
-#include <bits/stdint-uintn.h>
-
 #include <cstdint>
 using namespace std::chrono_literals;
 
@@ -80,7 +78,7 @@ constexpr uint64_t max_cluster_capacity() {
 FIXTURE_TEST(
   test_dispatching_happy_path_create, topic_table_updates_dispatcher_fixture) {
     create_topics();
-    auto md = table.local().all_topics_metadata();
+    auto& md = table.local().all_topics_metadata();
 
     BOOST_REQUIRE_EQUAL(md.size(), 3);
 
@@ -114,20 +112,18 @@ FIXTURE_TEST(
 FIXTURE_TEST(
   test_dispatching_happy_path_delete, topic_table_updates_dispatcher_fixture) {
     create_topics();
-    dispatcher
-      .apply_update(
-        serialize_cmd(cluster::delete_topic_cmd(
-                        make_tp_ns("test_tp_2"), make_tp_ns("test_tp_2")))
-          .get0())
-      .get0();
-    dispatcher
-      .apply_update(
-        serialize_cmd(cluster::delete_topic_cmd(
-                        make_tp_ns("test_tp_3"), make_tp_ns("test_tp_3")))
-          .get0())
-      .get0();
+    BOOST_REQUIRE(
+      !dispatcher
+         .apply_update(serde_serialize_cmd(cluster::delete_topic_cmd(
+           make_tp_ns("test_tp_2"), make_tp_ns("test_tp_2"))))
+         .get());
+    BOOST_REQUIRE(
+      !dispatcher
+         .apply_update(serde_serialize_cmd(cluster::delete_topic_cmd(
+           make_tp_ns("test_tp_3"), make_tp_ns("test_tp_3"))))
+         .get());
 
-    auto md = table.local().all_topics_metadata();
+    auto& md = table.local().all_topics_metadata();
     BOOST_REQUIRE_EQUAL(md.size(), 1);
 
     BOOST_REQUIRE_EQUAL(md.contains(make_tp_ns("test_tp_1")), true);
@@ -142,23 +138,25 @@ FIXTURE_TEST(
 FIXTURE_TEST(
   test_dispatching_conflicts, topic_table_updates_dispatcher_fixture) {
     create_topics();
-    // discard create delta
-    table.local().wait_for_changes(as).get0();
+
+    std::vector<cluster::topic_table_ntp_delta> deltas;
+    table.local().register_ntp_delta_notification(
+      [&](const auto& d) { deltas.insert(deltas.end(), d.begin(), d.end()); });
 
     auto res_1 = table.local()
                    .apply(
                      cluster::delete_topic_cmd(
                        make_tp_ns("not_exists"), make_tp_ns("not_exists")),
                      model::offset(0))
-                   .get0();
+                   .get();
     BOOST_REQUIRE_EQUAL(res_1, cluster::errc::topic_not_exists);
 
     auto res_2 = table.local()
                    .apply(
                      make_create_topic_cmd("test_tp_1", 2, 3), model::offset(0))
-                   .get0();
+                   .get();
     BOOST_REQUIRE_EQUAL(res_2, cluster::errc::topic_already_exists);
-    BOOST_REQUIRE_EQUAL(table.local().has_pending_changes(), false);
+    BOOST_REQUIRE_EQUAL(deltas.size(), 0);
 
     BOOST_REQUIRE_EQUAL(
       current_cluster_capacity(allocator.local().state().allocation_nodes()),
@@ -172,7 +170,8 @@ FIXTURE_TEST(
     auto check_allocated_counts = [&](std::vector<size_t> expected) {
         std::vector<size_t> counts;
         for (const auto& [id, node] : allocation_nodes) {
-            BOOST_REQUIRE(id() == counts.size() + 1); // 1-based node ids
+            BOOST_REQUIRE(
+              id() == static_cast<int>(counts.size()) + 1); // 1-based node ids
             counts.push_back(node->allocated_partitions());
         }
         logger.debug("allocated counts: {}, expected: {}", counts, expected);
@@ -182,7 +181,8 @@ FIXTURE_TEST(
     auto check_final_counts = [&](std::vector<size_t> expected) {
         std::vector<size_t> counts;
         for (const auto& [id, node] : allocation_nodes) {
-            BOOST_REQUIRE(id() == counts.size() + 1); // 1-based node ids
+            BOOST_REQUIRE(
+              id() == static_cast<int>(counts.size()) + 1); // 1-based node ids
             counts.push_back(node->final_partitions());
         }
         logger.debug("final counts: {}, expected: {}", counts, expected);
@@ -201,7 +201,7 @@ FIXTURE_TEST(
     check_final_counts({4, 4, 4, 0});
 
     // get data needed to move a partition
-    auto get_partition = [&](size_t id) {
+    auto get_partition = [&](model::partition_id::type id) {
         model::ntp ntp{
           create_topic_cmd.key.ns,
           create_topic_cmd.key.tp,
@@ -219,6 +219,7 @@ FIXTURE_TEST(
           });
         BOOST_REQUIRE(it != new_replicas.end());
         it->node_id = model::node_id{4};
+        it->shard = random_generators::get_int(3);
 
         return std::tuple{
           ntp,

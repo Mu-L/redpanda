@@ -9,11 +9,11 @@
 
 #include "storage/segment_reader.h"
 
+#include "base/vassert.h"
+#include "base/vlog.h"
 #include "ssx/future-util.h"
 #include "storage/logger.h"
 #include "storage/segment_utils.h"
-#include "vassert.h"
-#include "vlog.h"
 
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
@@ -333,7 +333,7 @@ concat_segment_reader_view::concat_segment_reader_view(
   size_t end_pos,
   ss::io_priority_class priority_class)
   : _stream(ss::data_source{std::make_unique<concat_segment_data_source_impl>(
-    std::move(segments), start_pos, end_pos, priority_class)}) {}
+      std::move(segments), start_pos, end_pos, priority_class)}) {}
 
 ss::input_stream<char> concat_segment_reader_view::take_stream() {
     auto r = std::move(_stream.value());

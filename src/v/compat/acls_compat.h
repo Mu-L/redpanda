@@ -12,12 +12,14 @@
 
 #include "cluster/types.h"
 #include "compat/acls_generator.h"
+#include "compat/acls_json.h"
 #include "compat/check.h"
+#include "compat/cluster_json.h"
 #include "compat/json.h"
 
 namespace compat {
 
-GEN_COMPAT_CHECK(
+GEN_COMPAT_CHECK_SERDE_ONLY(
   cluster::create_acls_request,
   {
       json_write(data);
@@ -28,17 +30,17 @@ GEN_COMPAT_CHECK(
       json_read(timeout);
   });
 
-GEN_COMPAT_CHECK(
+GEN_COMPAT_CHECK_SERDE_ONLY(
   cluster::create_acls_reply,
   { json_write(results); },
   { json_read(results); });
 
-GEN_COMPAT_CHECK(
+GEN_COMPAT_CHECK_SERDE_ONLY(
   cluster::delete_acls_reply,
   { json_write(results); },
   { json_read(results); });
 
-GEN_COMPAT_CHECK(
+GEN_COMPAT_CHECK_SERDE_ONLY(
   cluster::delete_acls_request,
   {
       json_write(data);

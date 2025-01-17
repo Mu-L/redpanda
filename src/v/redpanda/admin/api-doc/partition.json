@@ -140,6 +140,62 @@
             ]
         },
         {
+            "path": "/v1/partitions/{namespace}/{topic}/{partition}/replicas/{node}",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Update partition replica core",
+                    "type": "void",
+                    "nickname": "set_partition_replica_core",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "node",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "core",
+                            "in": "body",
+                            "required": "true",
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "core": {
+                                        "type": "number"
+                                    }
+                                },
+                                "required": [
+                                    "core"
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+        {
             "path": "/v1/partitions/{namespace}/{topic}/{partition}/transfer_leadership",
             "operations": [
                 {
@@ -236,6 +292,21 @@
                     "summary": "Execute on demand partition rebalance",
                     "type": "void",
                     "nickname": "trigger_partitions_rebalance",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/rebalance_cores",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Trigger core placement rebalancing for partitions in this broker.",
+                    "type": "void",
+                    "nickname": "trigger_partitions_shard_rebalance",
                     "produces": [
                         "application/json"
                     ],
@@ -356,6 +427,43 @@
                     ]
                 }
             ]
+        },
+        {
+            "path": "/v1/partitions/majority_lost",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "List of partitions with lost majority given an input set of dead nodes.",
+                    "type": "void",
+                    "nickname": "majority_lost",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "dead_nodes",
+                            "in": "query",
+                            "required": true,
+                            "type": "string"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/force_recover_from_nodes",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Force recovers partitions from input list of nodes.",
+                    "type": "void",
+                    "nickname": "force_recover_from_nodes",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
         }
     ],
     "models": {
@@ -455,6 +563,9 @@
                         "type": "assignment"
                     },
                     "description": "Replica assignments"
+                },
+                "disabled": {
+                    "type": "boolean"
                 }
             }
         },
@@ -570,6 +681,10 @@
                         "type": "partition_reconciliation_status"
                     },
                     "description": "list of reconciliation statuses per node"
+                },
+                "reconfiguration_policy": {
+                    "type": "string",
+                    "description": "Reconfiguration policy used to perform this update"
                 }
             }
         },
@@ -635,6 +750,52 @@
                 "result": {
                     "type": "string",
                     "description": "Status of operation"
+                }
+            }
+        },
+        "ntp": {
+            "id": "ntp",
+            "description": "Partition metadata",
+            "properties": {
+                "ns": {
+                    "type": "string",
+                    "description": "Namespace"
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic"
+                },
+                "partition": {
+                    "type": "long",
+                    "description": "Partition id"
+                }
+            }
+        },
+        "ntp_with_majority_loss": {
+            "id": "ntp_with_majority_loss",
+            "description": "ntp instance with lost majority due to dead nodes.",
+            "properties": {
+                "ntp": {
+                    "type": "ntp",
+                    "description": "partition"
+                },
+                "topic_revision": {
+                    "type": "long",
+                    "description": "Revision of the topic this ntp is a part of."
+                },
+                "replicas": {
+                    "type": "array",
+                    "items": {
+                        "type": "assignment"
+                    },
+                    "description": "Replica assignments"
+                },
+                "dead_nodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "int"
+                    },
+                    "description:": "List of nodes that are dead and contributing to majority loss of partitions."
                 }
             }
         }

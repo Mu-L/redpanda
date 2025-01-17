@@ -42,48 +42,21 @@ class CloudStorageCheck:
         return self._name
 
 
-def cloud_storage_usage_check(test):
-    # The usage inferred from the uploaded manifest
-    # lags behind the actual reported usage. For this reason,
-    # we maintain a sliding window of reported usages and check whether
-    # the manifest inferred usage can be found in it. A deque size of 10
-    # gives us a look-behind window of roughly 2 seconds (10 * 0.2).
-    # This should be fine since the manifest after every batch of segment uploads
-    # and on prior to each GC operation (housekeeping happens every 1 second).
-    reported_usage_sliding_window = deque(maxlen=10)
+def assert_cloud_storage_usage(test):
+    bucket_view = BucketView(test.redpanda)
+    manifest_usage = bucket_view.cloud_log_size_for_ntp(test.topic, 0)
+    test.logger.debug(
+        f"Cloud log usage inferred from manifests: {manifest_usage}")
 
-    def check():
-        try:
-            bucket_view = BucketView(test.redpanda)
-            manifest_usage = bucket_view.cloud_log_size_for_ntp(test.topic, 0)
-            test.logger.debug(
-                f"Cloud log usage inferred from manifests: {manifest_usage}")
+    reported_usage = test.admin.cloud_storage_usage()
 
-            reported_usage = test.admin.cloud_storage_usage()
-            reported_usage_sliding_window.append(reported_usage)
+    test.logger.info(
+        f"Expected {manifest_usage.total()} bytes of cloud storage usage based on manifest"
+    )
+    test.logger.info(f"Reported usage: {reported_usage}")
 
-            test.logger.info(
-                f"Expected {manifest_usage.total()} bytes of cloud storage usage"
-            )
-            test.logger.info(
-                f"Reported usages in sliding window: {reported_usage_sliding_window}"
-            )
-            return manifest_usage.total() in reported_usage_sliding_window
-        except Exception as e:
-            test.logger.info(f"usage check exception: {e}")
-            raise e
-
-    # Manifests are not immediately uploaded after they are mutated locally.
-    # For example, during cloud storage housekeeping, the manifest is not uploaded
-    # after the 'start_offset' advances, but after the segments are deleted as well.
-    # If a request lands mid-housekeeping, the results will not be consistent with
-    # what's in the uploaded manifest. For this reason, we wait until the two match.
-    wait_until(
-        check,
-        timeout_sec=test.check_timeout,
-        backoff_sec=0.2,
-        err_msg="Reported cloud storage usage did not match the actual usage",
-        retry_on_exc=True)
+    assert manifest_usage.total() == reported_usage, \
+        f"Expected {manifest_usage.total()} bytes of cloud storage usage based on manifest, but reported {reported_usage}"
 
 
 class PartitionStatusValidator:
@@ -247,28 +220,35 @@ class CloudStorageTimingStressTest(RedpandaTest, PartitionMovementMixin):
                            retention_bytes=60 * log_segment_size)
 
     def __init__(self, test_context):
-        self.si_settings = SISettings(
-            test_context,
-            log_segment_size=self.log_segment_size,
-            cloud_storage_housekeeping_interval_ms=1000,
-            cloud_storage_spillover_manifest_max_segments=10,
-            cloud_storage_segment_max_upload_interval_sec=10)
-
         extra_rp_conf = dict(
             log_compaction_interval_ms=1000,
             compacted_log_segment_size=self.log_segment_size,
             cloud_storage_idle_timeout_ms=100,
             cloud_storage_segment_size_target=4 * self.log_segment_size,
             cloud_storage_segment_size_min=2 * self.log_segment_size,
-            retention_local_target_bytes_default=10 * self.log_segment_size,
+            retention_local_target_bytes_default=2 * self.log_segment_size,
             cloud_storage_enable_segment_merging=True,
-            cloud_storage_cache_chunk_size=self.chunk_size)
+            cloud_storage_cache_chunk_size=self.chunk_size,
+            cloud_storage_spillover_manifest_size=None)
+
+        si_settings = SISettings(
+            test_context,
+            log_segment_size=self.log_segment_size,
+            cloud_storage_housekeeping_interval_ms=1000,
+            cloud_storage_spillover_manifest_max_segments=10,
+            cloud_storage_segment_max_upload_interval_sec=10)
+
+        if "googleapis" in si_settings.cloud_storage_api_endpoint:
+            # If the test is running on GCS we shouldn't retry earlier than
+            # after 1s. GCS throttles uploads if they happen once per sencond
+            # or faster (per object).
+            extra_rp_conf['cloud_storage_initial_backoff_ms'] = 1000
 
         super(CloudStorageTimingStressTest,
               self).__init__(test_context=test_context,
                              extra_rp_conf=extra_rp_conf,
                              log_level="trace",
-                             si_settings=self.si_settings)
+                             si_settings=si_settings)
 
         self.rpk = RpkTool(self.redpanda)
         self.admin = Admin(self.redpanda)
@@ -404,7 +384,6 @@ class CloudStorageTimingStressTest(RedpandaTest, PartitionMovementMixin):
         # after the partition moves.
         self._initial_revision = self._get_initial_revision()
 
-        self.register_check("cloud_storage_usage", cloud_storage_usage_check)
         self.register_check("cloud_storage_status_endpoint",
                             cloud_storage_status_endpoint_check)
 
@@ -444,6 +423,8 @@ class CloudStorageTimingStressTest(RedpandaTest, PartitionMovementMixin):
                 "redpanda_cloud_storage_jobs_local_segment_reuploads",
                 metrics_endpoint=MetricsEndpoint.PUBLIC_METRICS) > 0
 
+        assert_cloud_storage_usage(self)
+
     def register_check(self, name, check_fn):
         self.checks.append(CloudStorageCheck(name, check_fn))
 
@@ -459,6 +440,8 @@ class CloudStorageTimingStressTest(RedpandaTest, PartitionMovementMixin):
             done, not_done = concurrent.futures.wait(
                 futs, timeout=self.check_interval)
 
+            failed = []
+            incomplete = []
             failure_count = 0
             for f in done:
                 check_name = futs[f].name
@@ -466,6 +449,7 @@ class CloudStorageTimingStressTest(RedpandaTest, PartitionMovementMixin):
                     self.logger.error(
                         f"Check {check_name} threw an exception: {ex}")
                     failure_count += 1
+                    failed.append(check_name)
                 else:
                     self.logger.info(
                         f"Check {check_name} completed successfuly")
@@ -475,10 +459,11 @@ class CloudStorageTimingStressTest(RedpandaTest, PartitionMovementMixin):
                 self.logger.error(
                     f"Check {check_name} did not complete within the check interval"
                 )
+                incomplete.append(check_name)
 
             if failure_count > 0 or len(not_done) > 0:
                 raise RuntimeError(
-                    f"Failed checks: {failure_count}; Incomplete checks: {len(not_done)}"
+                    f"Failed checks: {failure_count} ({failed}); Incomplete checks: {len(not_done)} ({incomplete})"
                 )
 
             self.logger.info(f"All checks completed successfuly")
@@ -515,6 +500,7 @@ class CloudStorageTimingStressTest(RedpandaTest, PartitionMovementMixin):
             r"Error in hydraton loop: .*Connection reset by peer",
             r"failed to hydrate chunk.*Connection reset by peer",
             r"failed to hydrate chunk.*NotFound",
+            r"cluster.*Can't add segment",
         ])
     @parametrize(cleanup_policy="delete")
     @parametrize(cleanup_policy="compact,delete")

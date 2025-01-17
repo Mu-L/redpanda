@@ -7,10 +7,10 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
+#include "container/fragmented_vector.h"
 #include "kafka/protocol/wire.h"
 #include "kafka/server/group_manager.h"
 #include "kafka/server/member.h"
-#include "kafka/types.h"
 #include "utils/to_string.h"
 
 #include <seastar/core/sstring.hh>
@@ -21,8 +21,9 @@
 
 namespace kafka {
 
-static const std::vector<member_protocol> test_protos = {
-  {kafka::protocol_name("n0"), "d0"}, {kafka::protocol_name("n1"), "d1"}};
+static const chunked_vector<member_protocol> test_protos = {
+  {kafka::protocol_name("n0"), bytes::from_string("d0")},
+  {kafka::protocol_name("n1"), bytes::from_string("d1")}};
 
 static group_member get_member() {
     return group_member(
@@ -34,7 +35,7 @@ static group_member get_member() {
       std::chrono::seconds(1),
       std::chrono::milliseconds(2),
       kafka::protocol_type("p"),
-      test_protos);
+      test_protos.copy());
 }
 
 static join_group_response make_join_response() {
@@ -47,7 +48,8 @@ static join_group_response make_join_response() {
 }
 
 static sync_group_response make_sync_response() {
-    return sync_group_response(error_code::none, bytes("this is some bytes"));
+    return sync_group_response(
+      error_code::none, bytes::from_string("this is some bytes"));
 }
 
 SEASTAR_THREAD_TEST_CASE(constructor) {
@@ -69,8 +71,8 @@ SEASTAR_THREAD_TEST_CASE(assignment) {
 
     BOOST_TEST(m.assignment() == bytes());
 
-    m.set_assignment(bytes("abc"));
-    BOOST_TEST(m.assignment() == bytes("abc"));
+    m.set_assignment(bytes::from_string("abc"));
+    BOOST_TEST(m.assignment() == bytes::from_string("abc"));
 
     m.clear_assignment();
     BOOST_TEST(m.assignment() == bytes());
@@ -92,12 +94,12 @@ SEASTAR_THREAD_TEST_CASE(protocols) {
     BOOST_TEST(m.protocols() == test_protos);
 
     // and the negative test
-    auto protos = test_protos;
+    auto protos = test_protos.copy();
     protos[0].name = kafka::protocol_name("x");
     BOOST_TEST(m.protocols() != protos);
 
     // can set new protocols
-    m.set_protocols(protos);
+    m.set_protocols(protos.copy());
     BOOST_TEST(m.protocols() != test_protos);
     BOOST_TEST(m.protocols() == protos);
 }
@@ -118,10 +120,10 @@ SEASTAR_THREAD_TEST_CASE(response_futs) {
     m.set_sync_response(make_sync_response());
 
     BOOST_TEST(
-      join_response.get0().data.generation_id
+      join_response.get().data.generation_id
       == make_join_response().data.generation_id);
     BOOST_TEST(
-      sync_response.get0().data.assignment
+      sync_response.get().data.assignment
       == make_sync_response().data.assignment);
 
     BOOST_TEST(!m.is_joining());
@@ -160,13 +162,13 @@ SEASTAR_THREAD_TEST_CASE(vote_for_protocols) {
 SEASTAR_THREAD_TEST_CASE(output_stream) {
     auto m = get_member();
     auto s = fmt::format("{}", m);
-    BOOST_TEST(s.find("id={m}") != std::string::npos);
+    BOOST_TEST(s.find("id=m") != std::string::npos);
 }
 
 SEASTAR_THREAD_TEST_CASE(member_serde) {
     // serialize a member's state to iobuf
     auto m0 = get_member();
-    m0.set_assignment(bytes("assignment"));
+    m0.set_assignment(bytes::from_string("assignment"));
     auto m0_state = m0.state().copy();
     iobuf m0_iobuf;
     auto writer = kafka::protocol::encoder(m0_iobuf);
@@ -177,7 +179,7 @@ SEASTAR_THREAD_TEST_CASE(member_serde) {
       std::move(m1_state),
       m0.group_id(),
       kafka::protocol_type("p"),
-      test_protos);
+      test_protos.copy());
 
     BOOST_REQUIRE(m1.state() == m0.state());
 }

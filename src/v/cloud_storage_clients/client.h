@@ -10,11 +10,11 @@
 
 #pragma once
 
+#include "base/outcome.h"
 #include "cloud_storage_clients/configuration.h"
 #include "cloud_storage_clients/types.h"
 #include "http/client.h"
 #include "model/fundamental.h"
-#include "outcome.h"
 
 #include <seastar/core/lowres_clock.hh>
 
@@ -31,6 +31,9 @@ public:
 
     virtual ~client() = default;
 
+    virtual ss::future<result<client_self_configuration_output, error_outcome>>
+    self_configure() = 0;
+
     /// Stop the client
     virtual ss::future<> stop() = 0;
 
@@ -46,8 +49,8 @@ public:
     /// \return future that becomes ready after request was sent
     virtual ss::future<result<http::client::response_stream_ref, error_outcome>>
     get_object(
-      bucket_name const& name,
-      object_key const& key,
+      const bucket_name& name,
+      const object_key& key,
       ss::lowres_clock::duration timeout,
       bool expect_no_such_key = false,
       std::optional<http_byte_range> byte_range = std::nullopt)
@@ -65,8 +68,8 @@ public:
     /// \param timeout is a timeout of the operation
     /// \return future that becomes ready when the request is completed
     virtual ss::future<result<head_object_result, error_outcome>> head_object(
-      bucket_name const& name,
-      object_key const& key,
+      const bucket_name& name,
+      const object_key& key,
       ss::lowres_clock::duration timeout)
       = 0;
 
@@ -77,13 +80,15 @@ public:
     /// \param payload_size is a size of the object in bytes
     /// \param body is an input_stream that can be used to read body
     /// \param timeout is a timeout of the operation
+    /// \param accept_no_content accepts a 204 response as valid
     /// \return future that becomes ready when the upload is completed
     virtual ss::future<result<no_response, error_outcome>> put_object(
-      bucket_name const& name,
-      object_key const& key,
+      const bucket_name& name,
+      const object_key& key,
       size_t payload_size,
       ss::input_stream<char> body,
-      ss::lowres_clock::duration timeout)
+      ss::lowres_clock::duration timeout,
+      bool accept_no_content = false)
       = 0;
 
     struct list_bucket_item {
@@ -93,7 +98,7 @@ public:
         ss::sstring etag;
     };
     struct list_bucket_result {
-        bool is_truncated;
+        bool is_truncated = false;
         ss::sstring prefix;
         ss::sstring next_continuation_token;
         std::vector<list_bucket_item> contents;
